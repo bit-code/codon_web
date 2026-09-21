@@ -1,0 +1,179 @@
+from src.os.constants import (
+    EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP, EPOLLET,
+    EAGAIN, EWOULDBLOCK, EINTR, EPIPE, ECONNRESET
+)
+from src.os.linux import (
+    recv as c_recv,
+    send as c_send,
+    close as c_close,
+    get_errno
+)
+from src.memory.buffer import ByteBuffer
+from src.http.request import Request
+from src.http.response import Response
+from src.http.parser import HttpParser, PARSE_OK, PARSE_NEED_MORE, PARSE_ERROR
+from src.runtime.epoll import Epoll
+
+import time
+
+# 9 Explicit Connection States
+STATE_ACCEPTED: i32 = i32(0)
+STATE_READING_HEADERS: i32 = i32(1)
+STATE_READING_BODY: i32 = i32(2)
+STATE_REQUEST_READY: i32 = i32(3)
+STATE_PROCESSING: i32 = i32(4)
+STATE_WRITING: i32 = i32(5)
+STATE_WRITE_PENDING: i32 = i32(6)
+STATE_KEEP_ALIVE: i32 = i32(7)
+STATE_CLOSING: i32 = i32(8)
+STATE_CLOSED: i32 = i32(9)
+STATE_SUSPENDED: i32 = i32(10)
+
+class Connection:
+    fd: i32
+    state: i32
+    client_ip: str
+    client_port: int
+    read_buf: ByteBuffer
+    write_buf: ByteBuffer
+    request: Request
+    parser: HttpParser
+    keep_alive: bool
+    last_active_time: float
+    has_epollout: bool
+
+    def __init__(self, fd: i32, client_ip: str = "", client_port: int = 0, buffer_size: int = 4096):
+        self.fd = fd
+        self.state = STATE_ACCEPTED
+        self.client_ip = client_ip
+        self.client_port = client_port
+        self.read_buf = ByteBuffer(buffer_size)
+        self.write_buf = ByteBuffer(buffer_size)
+        self.request = Request()
+        self.parser = HttpParser()
+        self.keep_alive = True
+        self.last_active_time = time.time()
+        self.has_epollout = False
+
+    def update_activity(self) -> None:
+        self.last_active_time = time.time()
+
+    def is_idle_timeout(self, now: float, timeout_sec: float) -> bool:
+        return (now - self.last_active_time) > timeout_sec
+
+    def is_active(self) -> bool:
+        return self.state != STATE_CLOSING and self.state != STATE_CLOSED
+
+    def is_suspended(self) -> bool:
+        return self.state == STATE_SUSPENDED
+
+    def mark_suspended(self) -> None:
+        self.state = STATE_SUSPENDED
+
+    def on_readable(self) -> i32:
+        self.update_activity()
+        # Edge-Triggered drain: read until EAGAIN
+        while True:
+            # Ensure space in read buffer
+            if self.read_buf.writable_bytes() < 1024:
+                self.read_buf.ensure_writable(4096)
+            
+            wptr = self.read_buf.write_ptr()
+            wbytes = self.read_buf.writable_bytes()
+            nread = c_recv(self.fd, wptr, wbytes, i32(0))
+
+            if nread > 0:
+                self.read_buf.advance_write(nread)
+            elif nread == 0:
+                # Peer closed connection
+                self.state = STATE_CLOSING
+                return self.state
+            else:
+                err = get_errno()
+                if err == EAGAIN or err == EWOULDBLOCK:
+                    break # All current data read (ET requirement)
+                elif err == EINTR:
+                    continue # Retry on signal interrupt
+                else:
+                    self.state = STATE_CLOSING
+                    return self.state
+
+        # Run HTTP parser on read buffer
+        parse_res, consumed = self.parser.parse(self.read_buf.readable_slice(), self.request)
+        if parse_res == PARSE_OK:
+            self.read_buf.consume(consumed)
+            self.keep_alive = self.request.keep_alive
+            self.state = STATE_REQUEST_READY
+        elif parse_res == PARSE_NEED_MORE:
+            self.state = STATE_READING_HEADERS
+        else: # PARSE_ERROR
+            self.state = STATE_CLOSING
+
+        return self.state
+
+    def send_response(self, resp: Response, epoll: Epoll) -> None:
+        self.write_buf.reset()
+        resp.serialize(self.write_buf, self.keep_alive)
+        self.state = STATE_WRITING
+        self.on_writable(epoll)
+
+    def on_writable(self, epoll: Epoll) -> i32:
+        self.update_activity()
+        # Edge-Triggered send: write until EAGAIN or done
+        while self.write_buf.readable_bytes() > 0:
+            rslice = self.write_buf.readable_slice()
+            nsent = c_send(self.fd, rslice.ptr, rslice.len, i32(0))
+
+            if nsent > 0:
+                self.write_buf.consume(nsent)
+            elif nsent < 0:
+                err = get_errno()
+                if err == EAGAIN or err == EWOULDBLOCK:
+                    # Partial write: register EPOLLOUT to continue when socket is ready
+                    self.state = STATE_WRITE_PENDING
+                    if not self.has_epollout:
+                        self.has_epollout = True
+                        epoll.modify(self.fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP)
+                    return self.state
+                elif err == EINTR:
+                    continue
+                else:
+                    self.state = STATE_CLOSING
+                    return self.state
+
+        # All response data written!
+        self.request.background_tasks.run_all()
+        if self.keep_alive:
+            self.reset_for_keep_alive(epoll)
+        else:
+            self.state = STATE_CLOSING
+
+        return self.state
+
+    def reset_for_keep_alive(self, epoll: Epoll) -> None:
+        self.request.reset()
+        self.write_buf.reset()
+        self.read_buf.compact()
+        self.state = STATE_KEEP_ALIVE
+        # Only disarm EPOLLOUT if it was armed during a partial write (saves 1 syscall per request!)
+        if self.has_epollout:
+            self.has_epollout = False
+            epoll.modify(self.fd, EPOLLIN | EPOLLET | EPOLLRDHUP)
+
+        # Check if another request was already received in the read buffer (pipelining / extra packet)
+        if self.read_buf.readable_bytes() > 0:
+            parse_res, consumed = self.parser.parse(self.read_buf.readable_slice(), self.request)
+            if parse_res == PARSE_OK:
+                self.read_buf.consume(consumed)
+                self.keep_alive = self.request.keep_alive
+                self.state = STATE_REQUEST_READY
+
+    def close(self, epoll: Epoll) -> None:
+        if self.state != STATE_CLOSED and self.fd >= i32(0):
+            try:
+                epoll.remove(self.fd)
+            except:
+                pass
+            c_close(self.fd)
+            self.state = STATE_CLOSED
+            self.fd = i32(-1)

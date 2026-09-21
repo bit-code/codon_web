@@ -1,0 +1,70 @@
+from src.framework.middleware import (
+    SecurityHeadersMiddleware, RequestIdMiddleware, RateLimiterMiddleware
+)
+from src.framework.route import SimpleHandler
+from src.http.request import Request
+from src.http.response import Response
+
+def dummy_handler(req: Request) -> Response:
+    return Response.text("ok", 200)
+
+def test_security_headers():
+    mw = SecurityHeadersMiddleware()
+    handler = SimpleHandler(dummy_handler)
+    req = Request()
+    resp = mw.handle(req, handler)
+
+    headers_dict = {}
+    for i in range(len(resp.custom_headers)):
+        k, v = resp.custom_headers[i]
+        headers_dict[k] = v
+
+    assert "X-Content-Type-Options" in headers_dict
+    assert headers_dict["X-Content-Type-Options"] == "nosniff"
+    assert "X-Frame-Options" in headers_dict
+    assert headers_dict["X-Frame-Options"] == "DENY"
+    assert "X-XSS-Protection" in headers_dict
+    print("[PASS] test_security_headers")
+
+def test_request_id():
+    mw = RequestIdMiddleware()
+    handler = SimpleHandler(dummy_handler)
+    req = Request()
+    resp = mw.handle(req, handler)
+
+    assert req.get_state("request_id") == "req-1"
+    has_id = False
+    for i in range(len(resp.custom_headers)):
+        k, v = resp.custom_headers[i]
+        if k == "X-Request-ID" and v == "req-1":
+            has_id = True
+            break
+    assert has_id
+    print("[PASS] test_request_id")
+
+def test_rate_limiter():
+    limiter = RateLimiterMiddleware(max_requests=2, window_sec=10.0)
+    handler = SimpleHandler(dummy_handler)
+    req = Request()
+
+    # 1st request -> ok
+    r1 = limiter.handle(req, handler)
+    assert r1.status_code == 200
+
+    # 2nd request -> ok
+    r2 = limiter.handle(req, handler)
+    assert r2.status_code == 200
+
+    # 3rd request -> rate limited 429
+    r3 = limiter.handle(req, handler)
+    assert r3.status_code == 429
+    assert "Too Many Requests" in r3.body
+    print("[PASS] test_rate_limiter")
+
+def run():
+    test_security_headers()
+    test_request_id()
+    test_rate_limiter()
+
+if __name__ == "__main__":
+    run()

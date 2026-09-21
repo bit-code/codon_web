@@ -1,0 +1,57 @@
+from src.http.multipart import parse_multipart_form_data, UploadedFile
+from src.http.request import Request
+from src.memory.buffer import ByteBuffer
+
+def test_multipart_parsing():
+    boundary = "CodonWebBoundaryXYZ"
+    payload = (
+        "--CodonWebBoundaryXYZ\r\n"
+        "Content-Disposition: form-data; name=\"author\"\r\n\r\n"
+        "Alice Smith\r\n"
+        "--CodonWebBoundaryXYZ\r\n"
+        "Content-Disposition: form-data; name=\"avatar\"; filename=\"avatar.png\"\r\n"
+        "Content-Type: image/png\r\n\r\n"
+        "<binary-png-data>\r\n"
+        "--CodonWebBoundaryXYZ\r\n"
+        "Content-Disposition: form-data; name=\"notes\"; filename=\"notes.txt\"\r\n"
+        "Content-Type: text/plain\r\n\r\n"
+        "Some text notes\r\n"
+        "--CodonWebBoundaryXYZ--\r\n"
+    )
+
+    mp = parse_multipart_form_data(payload, boundary)
+    assert mp.get_field("author") == "Alice Smith"
+
+    av = mp.get_file("avatar")
+    assert av is not None
+    assert av.filename == "avatar.png"
+    assert av.content_type == "image/png"
+    assert av.data == "<binary-png-data>"
+    assert av.size == len("<binary-png-data>")
+
+    nt = mp.get_file("notes")
+    assert nt is not None
+    assert nt.filename == "notes.txt"
+    assert nt.data == "Some text notes"
+
+    # Integration via Request
+    buf = ByteBuffer(2048)
+    buf.append_str(payload)
+    r_slice = buf.readable_slice()
+
+    req = Request()
+    req.headers.set("Content-Type", "multipart/form-data; boundary=CodonWebBoundaryXYZ")
+    req.body = r_slice
+
+    assert req.form_param("author") == "Alice Smith"
+    f = req.file("avatar")
+    assert f is not None
+    assert f.filename == "avatar.png"
+
+    print("[PASS] test_multipart_parsing")
+
+def run():
+    test_multipart_parsing()
+
+if __name__ == "__main__":
+    run()

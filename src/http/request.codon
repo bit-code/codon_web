@@ -1,0 +1,384 @@
+from typing import Callable
+from src.memory.slice import ByteSlice
+from src.http.method import HttpMethod, METHOD_UNKNOWN
+from src.http.headers import Headers
+from src.http.json import Json
+from src.http.fast_json import FastJson, FastJsonDoc
+from src.http.background import BackgroundTasks
+from src.http.multipart import MultipartFormData, parse_multipart_form_data, UploadedFile
+from src.http.response import Response
+from src.runtime.async_context import AsyncContext, AsyncResumer
+
+def url_decode(s: str) -> str:
+    if len(s) == 0:
+        return ""
+    res = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == '+':
+            res.append(' ')
+            i += 1
+        elif c == '%' and i + 2 < n:
+            h1 = ord(s[i + 1])
+            h2 = ord(s[i + 2])
+            v1 = -1
+            v2 = -1
+            if 48 <= h1 <= 57:
+                v1 = h1 - 48
+            elif 65 <= h1 <= 70:
+                v1 = h1 - 55
+            elif 97 <= h1 <= 102:
+                v1 = h1 - 87
+            
+            if 48 <= h2 <= 57:
+                v2 = h2 - 48
+            elif 65 <= h2 <= 70:
+                v2 = h2 - 55
+            elif 97 <= h2 <= 102:
+                v2 = h2 - 87
+            
+            if v1 >= 0 and v2 >= 0:
+                byte_val = (v1 << 4) | v2
+                res.append(chr(byte_val))
+                i += 3
+            else:
+                res.append(c)
+                i += 1
+        else:
+            res.append(c)
+            i += 1
+    return "".join(res)
+
+class Request:
+    method: i32
+    path: ByteSlice
+    query: ByteSlice
+    version: ByteSlice
+    headers: Headers
+    body: ByteSlice
+    keep_alive: bool
+    path_params: dict[str, str]
+    query_params: dict[str, str]
+    parsed_query: bool
+    json_data: dict[str, str]
+    parsed_json: bool
+    json_doc_cache: Optional[FastJsonDoc]
+    cookies: dict[str, str]
+    parsed_cookies: bool
+    form_params: dict[str, str]
+    parsed_form: bool
+    state: dict[str, str]
+    background_tasks: BackgroundTasks
+    multipart: MultipartFormData
+    parsed_multipart: bool
+    dep_cache_str: dict[str, str]
+    fd: i32
+    async_resumer: Optional[AsyncResumer]
+    async_ctx: Optional[AsyncContext]
+
+    def __init__(self):
+        self.method = METHOD_UNKNOWN
+        self.path = ByteSlice(Ptr[byte](0), 0)
+        self.query = ByteSlice(Ptr[byte](0), 0)
+        self.version = ByteSlice(Ptr[byte](0), 0)
+        self.headers = Headers()
+        self.body = ByteSlice(Ptr[byte](0), 0)
+        self.keep_alive = True
+        self.path_params = {}
+        self.query_params = {}
+        self.parsed_query = False
+        self.json_data = {}
+        self.parsed_json = False
+        self.json_doc_cache = None
+        self.cookies = {}
+        self.parsed_cookies = False
+        self.form_params = {}
+        self.parsed_form = False
+        self.state = {}
+        self.background_tasks = BackgroundTasks()
+        self.multipart = MultipartFormData()
+        self.parsed_multipart = False
+        self.dep_cache_str = {}
+        self.fd = i32(-1)
+        self.async_resumer = None
+        self.async_ctx = None
+
+    def path_str(self) -> str:
+        return self.path.to_str()
+
+    def query_str(self) -> str:
+        return self.query.to_str()
+
+    def body_str(self) -> str:
+        return self.body.to_str()
+
+    def param(self, name: str) -> str:
+        if name in self.path_params:
+            return self.path_params[name]
+        return ""
+
+    def param_int(self, name: str) -> int:
+        val_str = self.param(name)
+        if len(val_str) == 0:
+            return 0
+        val = 0
+        for i in range(len(val_str)):
+            b = ord(val_str[i])
+            if 48 <= b <= 57:
+                val = val * 10 + (b - 48)
+        return val
+
+    def _ensure_query_parsed(self) -> None:
+        if self.parsed_query:
+            return
+        self.parsed_query = True
+        q = self.query_str()
+        if len(q) == 0:
+            return
+        
+        pairs = q.split("&")
+        for i in range(len(pairs)):
+            p = pairs[i]
+            eq = p.find("=")
+            if eq >= 0:
+                k = url_decode(p[:eq])
+                v = url_decode(p[eq + 1:])
+                self.query_params[k] = v
+            else:
+                self.query_params[url_decode(p)] = ""
+
+    def query_param(self, name: str, default_val: str = "") -> str:
+        self._ensure_query_parsed()
+        if name in self.query_params:
+            return self.query_params[name]
+        return default_val
+
+    def query_param_int(self, name: str, default_val: int = 0) -> int:
+        s = self.query_param(name, "")
+        if len(s) == 0:
+            return default_val
+        val = 0
+        for i in range(len(s)):
+            b = ord(s[i])
+            if 48 <= b <= 57:
+                val = val * 10 + (b - 48)
+            else:
+                return default_val
+        return val
+
+    def header(self, name: str, default_val: str = "") -> str:
+        val_slice = self.headers.get(name)
+        if val_slice.len == 0:
+            return default_val
+        return val_slice.to_str()
+
+    def bearer_token(self) -> str:
+        auth = self.header("Authorization")
+        if auth.startswith("Bearer ") and len(auth) > 7:
+            return auth[7:].strip()
+        return ""
+
+    def _ensure_cookies_parsed(self) -> None:
+        if self.parsed_cookies:
+            return
+        self.parsed_cookies = True
+        raw = self.header("Cookie")
+        if len(raw) == 0:
+            return
+        parts = raw.split(";")
+        for i in range(len(parts)):
+            item = parts[i].strip()
+            if len(item) == 0:
+                continue
+            eq = item.find("=")
+            if eq >= 0:
+                k = item[:eq].strip()
+                v = item[eq + 1:].strip()
+                self.cookies[k] = v
+            else:
+                self.cookies[item] = ""
+
+    def cookie(self, name: str, default_val: str = "") -> str:
+        self._ensure_cookies_parsed()
+        if name in self.cookies:
+            return self.cookies[name]
+        return default_val
+
+    def _ensure_multipart_parsed(self) -> None:
+        if self.parsed_multipart:
+            return
+        self.parsed_multipart = True
+        ct = self.header("Content-Type")
+        b_idx = ct.find("boundary=")
+        if b_idx >= 0:
+            boundary = ct[b_idx + 9:].strip()
+            if boundary.startswith('"') and boundary.endswith('"') and len(boundary) >= 2:
+                boundary = boundary[1:-1]
+            self.multipart = parse_multipart_form_data(self.body_str(), boundary)
+            # Integrate regular form fields into form_params
+            for k, v in self.multipart.fields.items():
+                self.form_params[k] = v
+
+    def file(self, name: str) -> Optional[UploadedFile]:
+        self._ensure_multipart_parsed()
+        return self.multipart.get_file(name)
+
+    def files(self, name: str) -> list[UploadedFile]:
+        self._ensure_multipart_parsed()
+        return self.multipart.get_files(name)
+
+    def _ensure_form_parsed(self) -> None:
+        if self.parsed_form:
+            return
+        self.parsed_form = True
+        # Check if multipart first
+        ct = self.header("Content-Type")
+        if "multipart/form-data" in ct:
+            self._ensure_multipart_parsed()
+            return
+
+        b = self.body_str()
+        if len(b) == 0:
+            return
+        pairs = b.split("&")
+        for i in range(len(pairs)):
+            p = pairs[i]
+            eq = p.find("=")
+            if eq >= 0:
+                k = url_decode(p[:eq])
+                v = url_decode(p[eq + 1:])
+                self.form_params[k] = v
+            else:
+                self.form_params[url_decode(p)] = ""
+
+    def form_param(self, name: str, default_val: str = "") -> str:
+        self._ensure_form_parsed()
+        if name in self.form_params:
+            return self.form_params[name]
+        return default_val
+
+    def form_param_int(self, name: str, default_val: int = 0) -> int:
+        s = self.form_param(name, "")
+        if len(s) == 0:
+            return default_val
+        val = 0
+        for i in range(len(s)):
+            b = ord(s[i])
+            if 48 <= b <= 57:
+                val = val * 10 + (b - 48)
+            else:
+                return default_val
+        return val
+
+    def json(self) -> dict[str, str]:
+        if not self.parsed_json:
+            self.parsed_json = True
+            raw = self.body_str()
+            self.json_data = FastJson.parse_to_dict(raw)
+        return self.json_data
+
+    def json_doc(self) -> FastJsonDoc:
+        if self.json_doc_cache is None:
+            self.json_doc_cache = FastJson.loads(self.body_str())
+        return self.json_doc_cache
+
+    def set_state(self, key: str, val: str) -> None:
+        self.state[key] = val
+
+    def get_state(self, key: str, default_val: str = "") -> str:
+        if key in self.state:
+            return self.state[key]
+        return default_val
+
+    def depends_str(self, key: str, provider: Callable[[Request], str]) -> str:
+        if key in self.dep_cache_str:
+            return self.dep_cache_str[key]
+        val = provider(self)
+        self.dep_cache_str[key] = val
+        return val
+
+    def client_ip(self) -> str:
+        x_forwarded = self.header("X-Forwarded-For")
+        if len(x_forwarded) > 0:
+            comma = x_forwarded.find(",")
+            if comma >= 0:
+                return x_forwarded[:comma].strip()
+            return x_forwarded.strip()
+        x_real = self.header("X-Real-IP")
+        if len(x_real) > 0:
+            return x_real.strip()
+        return "127.0.0.1"
+
+    def scheme(self) -> str:
+        proto = self.header("X-Forwarded-Proto")
+        if len(proto) > 0:
+            return proto.lower()
+        return "http"
+
+    def host(self) -> str:
+        h = self.header("Host")
+        if len(h) > 0:
+            return h
+        return "localhost"
+
+    def base_url(self) -> str:
+        return self.scheme() + "://" + self.host()
+
+    def url(self) -> str:
+        res = self.base_url() + self.path_str()
+        q = self.query_str()
+        if len(q) > 0:
+            res = res + "?" + q
+        return res
+
+    def content_type(self) -> str:
+        return self.header("Content-Type")
+
+    def content_length(self) -> int:
+        cl = self.header("Content-Length")
+        if len(cl) == 0:
+            return 0
+        val = 0
+        for i in range(len(cl)):
+            b = ord(cl[i])
+            if 48 <= b <= 57:
+                val = val * 10 + (b - 48)
+            else:
+                return 0
+        return val
+
+    def reset(self) -> None:
+        self.method = METHOD_UNKNOWN
+        self.path = ByteSlice(Ptr[byte](0), 0)
+        self.query = ByteSlice(Ptr[byte](0), 0)
+        self.version = ByteSlice(Ptr[byte](0), 0)
+        self.headers.clear()
+        self.body = ByteSlice(Ptr[byte](0), 0)
+        self.keep_alive = True
+        self.path_params.clear()
+        self.query_params.clear()
+        self.parsed_query = False
+        self.json_data.clear()
+        self.parsed_json = False
+        if self.json_doc_cache is not None:
+            self.json_doc_cache.close()
+            self.json_doc_cache = None
+        self.cookies.clear()
+        self.parsed_cookies = False
+        self.form_params.clear()
+        self.parsed_form = False
+        self.state.clear()
+        self.background_tasks.clear()
+        self.multipart = MultipartFormData()
+        self.parsed_multipart = False
+        self.dep_cache_str.clear()
+        self.fd = i32(-1)
+        self.async_resumer = None
+        self.async_ctx = None
+
+    def defer(self) -> Tuple[Optional[AsyncContext], Response]:
+        if self.async_ctx is None:
+            self.async_ctx = AsyncContext(self.fd, self.async_resumer)
+        return (self.async_ctx, Response.defer())

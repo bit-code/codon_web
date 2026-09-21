@@ -1,0 +1,20 @@
+from src.os.socket import Socket
+
+s = Socket.create_tcp()
+print("TCP socket created with fd:", s.fd)
+assert s.fd >= i32(0)
+s.set_reuse_addr(True)
+s.set_reuse_port(True)
+s.set_tcp_nodelay(True)
+s.bind("127.0.0.1", 19876)
+s.listen(128)
+print("Bound and listening on 127.0.0.1:19876")
+
+# Non-blocking accept should return fd == -1 immediately
+client_fd, ip, port = s.accept_nonblocking()
+print("Non-blocking accept result fd:", client_fd)
+assert client_fd == i32(-1)
+
+s.close()
+print("Socket successfully closed, is_closed:", s.is_closed)
+assert s.is_closed

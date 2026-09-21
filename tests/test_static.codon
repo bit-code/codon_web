@@ -1,0 +1,50 @@
+from src.framework.static import StaticFilesHandler
+from src.http.request import Request
+from src.http.response import Response
+
+def test_static_files():
+    # Setup a test static directory and file
+    test_dir = "tests/static_fixture"
+    test_file = test_dir + "/hello.txt"
+    try:
+        with open(test_file, "w") as f:
+            f.write("Hello from static file!")
+    except:
+        # If directory doesn't exist, create it
+        import os
+        try:
+            os.system("mkdir -p tests/static_fixture")
+            with open(test_file, "w") as f:
+                f.write("Hello from static file!")
+        except:
+            pass
+
+    handler = StaticFilesHandler(test_dir, cache_control="public, max-age=7200")
+
+    # 1. Normal file request
+    req = Request()
+    req.path_params["*"] = "hello.txt"
+    resp = handler.handle(req)
+    assert resp.status_code == 200
+    assert resp.body == "Hello from static file!"
+    assert resp.content_type == "text/plain; charset=utf-8"
+
+    # 2. Path traversal attack attempt
+    req_bad = Request()
+    req_bad.path_params["*"] = "../../../etc/passwd"
+    resp_bad = handler.handle(req_bad)
+    assert resp_bad.status_code == 403
+
+    # 3. Not found file
+    req_404 = Request()
+    req_404.path_params["*"] = "does_not_exist.txt"
+    resp_404 = handler.handle(req_404)
+    assert resp_404.status_code == 404
+
+    print("[PASS] test_static_files")
+
+def run():
+    test_static_files()
+
+if __name__ == "__main__":
+    run()

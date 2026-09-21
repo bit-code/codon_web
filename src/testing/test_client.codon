@@ -1,0 +1,270 @@
+# FastAPI-Style In-Memory TestClient for CodonWeb
+# Provides high-performance, socketless end-to-end testing of routes,
+# middlewares, dependencies, exception handlers, and background tasks.
+
+from typing import Optional, Callable
+from src.framework.app import App
+from src.framework.route import RouteHandler
+from src.framework.router import RouterAdapter
+from src.framework.middleware import build_middleware_pipeline
+from src.http.request import Request
+from src.http.response import Response
+from src.http.method import (
+    METHOD_GET, METHOD_POST, METHOD_PUT, METHOD_DELETE,
+    METHOD_HEAD, METHOD_OPTIONS, METHOD_PATCH
+)
+from src.http.json import Json
+from src.memory.slice import ByteSlice
+
+class TestResponse:
+    status_code: int
+    body: str
+    text: str
+    headers: dict[str, str]
+    cookies: dict[str, str]
+    is_success: bool
+    is_client_error: bool
+    is_server_error: bool
+
+    def __init__(
+        self,
+        status_code: int,
+        body: str,
+        headers: dict[str, str],
+        cookies: dict[str, str]
+    ):
+        self.status_code = status_code
+        self.body = body
+        self.text = body
+        self.headers = headers
+        self.cookies = cookies
+        self.is_success = (status_code >= 200 and status_code < 300)
+        self.is_client_error = (status_code >= 400 and status_code < 500)
+        self.is_server_error = (status_code >= 500)
+
+    def json(self) -> dict[str, str]:
+        return Json.parse_object(self.body)
+
+    def header(self, name: str, default_val: str = "") -> str:
+        key = name.lower()
+        if key in self.headers:
+            return self.headers[key]
+        return default_val
+
+    def cookie(self, name: str, default_val: str = "") -> str:
+        if name in self.cookies:
+            return self.cookies[name]
+        return default_val
+
+class TestClient:
+    app: App
+    pipeline: RouteHandler
+    cookies: dict[str, str]
+
+    def __init__(self, app: App):
+        self.app = app
+        self.cookies = {}
+        # Ensure OpenAPI documentation endpoints are mounted
+        app.mount_openapi_routes()
+        # Compile middleware onion pipeline once
+        base_adapter = RouterAdapter(app.router.radix)
+        self.pipeline = build_middleware_pipeline(app.middlewares, base_adapter)
+
+    def __enter__(self) -> TestClient:
+        # Execute startup lifecycle hooks
+        for i in range(len(self.app.startup_hooks)):
+            hook = self.app.startup_hooks[i]
+            hook()
+        return self
+
+    def __exit__(self) -> None:
+        # Execute shutdown lifecycle hooks
+        for i in range(len(self.app.shutdown_hooks)):
+            hook = self.app.shutdown_hooks[i]
+            hook()
+
+    def request(
+        self,
+        method: i32,
+        url: str,
+        body: str = "",
+        json_body: str = "",
+        headers: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str]] = None,
+        params: Optional[dict[str, str]] = None
+    ) -> TestResponse:
+        # 1. Parse URL, Path, and Query String
+        raw_url = url
+        path_only = raw_url
+        query_str = ""
+
+        q_idx = raw_url.find("?")
+        if q_idx >= 0:
+            path_only = raw_url[:q_idx]
+            query_str = raw_url[q_idx + 1:]
+
+        if params is not None and len(params) > 0:
+            extra_parts = list[str]()
+            for k in params:
+                extra_parts.append(k + "=" + params[k])
+            extra_query = "&".join(extra_parts)
+            if len(query_str) > 0:
+                query_str = query_str + "&" + extra_query
+            else:
+                query_str = extra_query
+
+        # 2. Determine final body content
+        final_body = body
+        content_type = ""
+        if len(json_body) > 0:
+            final_body = json_body
+            content_type = "application/json"
+
+        # 3. Construct Request object with memory safety
+        req = Request()
+        req.method = method
+        req.path = ByteSlice(path_only.c_str(), len(path_only))
+        req.query = ByteSlice(query_str.c_str(), len(query_str))
+        req.body = ByteSlice(final_body.c_str(), len(final_body))
+
+        # 4. Inject Headers
+        pinned_strings = list[str]()
+
+        def set_req_header(name: str, val: str):
+            pinned_strings.append(name)
+            pinned_strings.append(val)
+            req.headers.set(name, val)
+
+        set_req_header("Host", "testserver")
+        set_req_header("User-Agent", "CodonWeb-TestClient/1.0")
+
+        if len(content_type) > 0:
+            set_req_header("Content-Type", content_type)
+        if len(final_body) > 0:
+            set_req_header("Content-Length", str(len(final_body)))
+
+        if headers is not None:
+            for k in headers:
+                set_req_header(k, headers[k])
+
+        # 5. Inject Cookies (Cookie Jar + Request Cookies)
+        merged_cookies = dict[str, str]()
+        for ck in self.cookies:
+            merged_cookies[ck] = self.cookies[ck]
+        if cookies is not None:
+            for ck in cookies:
+                merged_cookies[ck] = cookies[ck]
+
+        if len(merged_cookies) > 0:
+            cookie_parts = list[str]()
+            for ck in merged_cookies:
+                cookie_parts.append(ck + "=" + merged_cookies[ck])
+            cookie_header_val = "; ".join(cookie_parts)
+            set_req_header("Cookie", cookie_header_val)
+
+        # 6. Dispatch through complete middleware pipeline
+        resp = self.pipeline.handle(req)
+
+        # 7. Execute registered Post-Response Background Tasks
+        for i in range(len(req.background_tasks.tasks)):
+            bg_task = req.background_tasks.tasks[i]
+            bg_task()
+
+        # 8. Collect Response Headers & parse Set-Cookie into Cookie Jar
+        resp_headers = dict[str, str]()
+        resp_cookies = dict[str, str]()
+        resp_headers["content-type"] = resp.content_type
+
+        for i in range(len(resp.custom_headers)):
+            hk, hv = resp.custom_headers[i]
+            resp_headers[hk.lower()] = hv
+
+            if hk.lower() == "set-cookie":
+                # Parse cookie name and value (e.g. "session=abc; Path=/; HttpOnly")
+                semi_idx = hv.find(";")
+                pair = hv[:semi_idx] if semi_idx >= 0 else hv
+                eq_idx = pair.find("=")
+                if eq_idx >= 0:
+                    c_name = pair[:eq_idx].strip()
+                    c_val = pair[eq_idx + 1:].strip()
+                    # Strip quotes if wrapped
+                    if c_val.startswith("\"") and c_val.endswith("\"") and len(c_val) >= 2:
+                        c_val = c_val[1:-1]
+                    resp_cookies[c_name] = c_val
+                    self.cookies[c_name] = c_val
+
+        return TestResponse(
+            status_code=resp.status_code,
+            body=resp.body,
+            headers=resp_headers,
+            cookies=resp_cookies
+        )
+
+    def get(
+        self,
+        url: str,
+        headers: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str]] = None,
+        params: Optional[dict[str, str]] = None
+    ) -> TestResponse:
+        return self.request(METHOD_GET, url, headers=headers, cookies=cookies, params=params)
+
+    def post(
+        self,
+        url: str,
+        body: str = "",
+        json: str = "",
+        headers: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str]] = None,
+        params: Optional[dict[str, str]] = None
+    ) -> TestResponse:
+        return self.request(METHOD_POST, url, body=body, json_body=json, headers=headers, cookies=cookies, params=params)
+
+    def put(
+        self,
+        url: str,
+        body: str = "",
+        json: str = "",
+        headers: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str]] = None,
+        params: Optional[dict[str, str]] = None
+    ) -> TestResponse:
+        return self.request(METHOD_PUT, url, body=body, json_body=json, headers=headers, cookies=cookies, params=params)
+
+    def delete(
+        self,
+        url: str,
+        headers: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str]] = None,
+        params: Optional[dict[str, str]] = None
+    ) -> TestResponse:
+        return self.request(METHOD_DELETE, url, headers=headers, cookies=cookies, params=params)
+
+    def patch(
+        self,
+        url: str,
+        body: str = "",
+        json: str = "",
+        headers: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str]] = None,
+        params: Optional[dict[str, str]] = None
+    ) -> TestResponse:
+        return self.request(METHOD_PATCH, url, body=body, json_body=json, headers=headers, cookies=cookies, params=params)
+
+    def head(
+        self,
+        url: str,
+        headers: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str]] = None,
+        params: Optional[dict[str, str]] = None
+    ) -> TestResponse:
+        return self.request(METHOD_HEAD, url, headers=headers, cookies=cookies, params=params)
+
+    def options(
+        self,
+        url: str,
+        headers: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str]] = None,
+        params: Optional[dict[str, str]] = None
+    ) -> TestResponse:
+        return self.request(METHOD_OPTIONS, url, headers=headers, cookies=cookies, params=params)

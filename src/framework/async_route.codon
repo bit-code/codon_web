@@ -1,0 +1,34 @@
+# Industrial-grade Async Route Handler for CodonWeb
+# Seamlessly bridges coroutine async handlers with the native EventLoop suspend/resume engine
+
+from typing import Callable, Optional
+from asyncio import Coroutine
+from src.http.request import Request
+from src.http.response import Response
+from src.http.exceptions import HTTPException
+from src.framework.route import RouteHandler
+from src.runtime.async_context import AsyncContext
+from src.core.async.loop import create_task
+
+async def _dispatch_async_route(fn: Callable[[Request], Coroutine[Response]], req: Request, ctx: AsyncContext):
+    try:
+        resp = await fn(req)
+        ctx.send(resp)
+    except HTTPException as he:
+        ctx.send(Response.json('{"code":' + str(he.status_code) + ',"error":"' + he.detail + '"}', he.status_code))
+    except Exception as e:
+        ctx.send(Response.json('{"code":500,"error":"Internal Server Error"}', 500))
+
+class AsyncRouteHandler(RouteHandler):
+    async_fn: Callable[[Request], Coroutine[Response]]
+
+    def __init__(self, async_fn: Callable[[Request], Coroutine[Response]]):
+        self.async_fn = async_fn
+
+    def handle(self, req: Request) -> Response:
+        ctx_opt, deferred_resp = req.defer()
+        if ctx_opt is None:
+            return Response.json('{"code":500,"error":"Async context unavailable"}', 500)
+        ctx = ctx_opt
+        create_task(_dispatch_async_route(self.async_fn, req, ctx))
+        return deferred_resp

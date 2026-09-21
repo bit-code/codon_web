@@ -1,0 +1,85 @@
+from src.http.streaming import ChunkedEncoder, ServerSentEvent, _to_hex_str
+from src.http.response import Response
+from src.memory.buffer import ByteBuffer
+
+def test_hex_conversion():
+    assert _to_hex_str(0) == "0"
+    assert _to_hex_str(5) == "5"
+    assert _to_hex_str(16) == "10"
+    assert _to_hex_str(26) == "1a"
+    assert _to_hex_str(255) == "ff"
+    print("[PASS] test_hex_conversion")
+
+def test_chunked_encoder():
+    c1 = ChunkedEncoder.encode_chunk("hello")
+    assert c1 == "5\r\nhello\r\n"
+
+    c_end = ChunkedEncoder.end_chunk()
+    assert c_end == "0\r\n\r\n"
+
+    full = ChunkedEncoder.encode_all(["part1", "part2"])
+    assert full == "5\r\npart1\r\n5\r\npart2\r\n0\r\n\r\n"
+    print("[PASS] test_chunked_encoder")
+
+def test_server_sent_event():
+    # 1. Simple data event
+    sse1 = ServerSentEvent("ping")
+    assert sse1.format() == "data: ping\n\n"
+
+    # 2. Rich SSE event
+    sse2 = ServerSentEvent(
+        data="Line 1\nLine 2",
+        event="update",
+        id="msg_42",
+        retry=5000
+    )
+    formatted = sse2.format()
+    assert "event: update\n" in formatted
+    assert "id: msg_42\n" in formatted
+    assert "retry: 5000\n" in formatted
+    assert "data: Line 1\ndata: Line 2\n\n" in formatted
+    print("[PASS] test_server_sent_event")
+
+def test_streaming_response():
+    resp = Response.stream(["chunkA", "chunkB"], content_type="text/plain")
+    assert resp.is_chunked
+    assert resp.status_code == 200
+
+    buf = ByteBuffer(1024)
+    resp.serialize(buf, keep_alive=True)
+    serialized = buf.to_str()
+
+    assert "Transfer-Encoding: chunked" in serialized
+    assert "Content-Length" not in serialized
+    assert "6\r\nchunkA\r\n6\r\nchunkB\r\n0\r\n\r\n" in serialized
+    print("[PASS] test_streaming_response")
+
+def test_event_stream_response():
+    events = [
+        ServerSentEvent(data="token1", event="message"),
+        ServerSentEvent(data="token2", event="message")
+    ]
+    resp = Response.event_stream(events)
+    assert resp.is_chunked
+    assert resp.content_type == "text/event-stream; charset=utf-8"
+
+    buf = ByteBuffer(2048)
+    resp.serialize(buf, keep_alive=True)
+    serialized = buf.to_str()
+
+    assert "Transfer-Encoding: chunked" in serialized
+    assert "Content-Type: text/event-stream; charset=utf-8" in serialized
+    assert "Cache-Control: no-cache" in serialized
+    assert "event: message" in serialized
+    assert "data: token1" in serialized
+    print("[PASS] test_event_stream_response")
+
+def run():
+    test_hex_conversion()
+    test_chunked_encoder()
+    test_server_sent_event()
+    test_streaming_response()
+    test_event_stream_response()
+
+if __name__ == "__main__":
+    run()

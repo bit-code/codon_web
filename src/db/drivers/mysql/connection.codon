@@ -1,0 +1,417 @@
+# MySQL Connection and Cursor Implementation (Pure Wire Protocol)
+
+from src.os.socket import Socket
+from src.db.errors import (
+    DatabaseError, InterfaceError, OperationalError, ProgrammingError
+)
+from src.db.types import FieldInfo, Row
+from src.db.drivers.mysql.constants import (
+    COM_QUIT, COM_QUERY, COM_PING,
+    PACKET_OK, PACKET_EOF, PACKET_ERR,
+    DEFAULT_CLIENT_CAPABILITIES,
+    CHARSET_UTF8MB4_GENERAL_CI
+)
+from src.db.drivers.mysql.packet import PacketReader, PacketWriter
+from src.db.drivers.mysql.auth import (
+    scramble_caching_sha2, scramble_native_password
+)
+
+class MySQLCursor[Conn]:
+    _conn: Conn
+    _rows: List[Row]
+    _row_idx: int
+    _fields: List[FieldInfo]
+    _field_names: List[str]
+    _affected_rows: int
+    _last_insert_id: int
+
+    def __init__(self, conn: Conn):
+        self._conn = conn
+        self._rows = List[Row]()
+        self._row_idx = 0
+        self._fields = List[FieldInfo]()
+        self._field_names = List[str]()
+        self._affected_rows = 0
+        self._last_insert_id = 0
+
+    @property
+    def rowcount(self) -> int:
+        if len(self._rows) > 0:
+            return len(self._rows)
+        return self._affected_rows
+
+    @property
+    def lastrowid(self) -> int:
+        return self._last_insert_id
+
+    @property
+    def description(self) -> List[FieldInfo]:
+        return self._fields
+
+    def _reset(self) -> None:
+        self._rows.clear()
+        self._row_idx = 0
+        self._fields.clear()
+        self._field_names.clear()
+        self._affected_rows = 0
+        self._last_insert_id = 0
+
+    def execute(self, sql: str) -> int:
+        self._reset()
+        if self._conn is None or self._conn.is_closed:
+            raise InterfaceError("Cannot execute on closed MySQL connection")
+
+        sock_fd = self._conn.sock.fd
+        writer = self._conn.writer
+        reader = self._conn.reader
+
+        # 1. Send COM_QUERY packet (0x03)
+        writer.reset()
+        writer.write_uint8(COM_QUERY)
+        writer.write_str(sql)
+        if not writer.send_to_socket(sock_fd, 0):
+            raise OperationalError("Failed to send query to MySQL server")
+
+        # 2. Read first response packet
+        if not reader.read_from_socket(sock_fd):
+            raise OperationalError("Connection lost while reading query response")
+
+        # Check for error
+        if reader.is_err():
+            err_code = reader.get_err_code()
+            err_msg = reader.get_err_message()
+            raise ProgrammingError(f"MySQL Error [{err_code}]: {err_msg}")
+
+        # Check for OK packet (INSERT, UPDATE, DELETE, etc.)
+        if reader.is_ok():
+            reader.advance(1) # Skip 0x00
+            self._affected_rows = reader.read_length_encoded_int()
+            self._last_insert_id = reader.read_length_encoded_int()
+            return self._affected_rows
+
+        # 3. Handle Result Set (SELECT, SHOW, etc.)
+        col_count = reader.read_length_encoded_int()
+        if col_count <= 0:
+            return 0
+
+        # Read Column Definition Packets
+        for i in range(col_count):
+            if not reader.read_from_socket(sock_fd):
+                raise OperationalError("Lost connection reading column definitions")
+            if reader.is_err():
+                raise ProgrammingError("Error reading column definition: " + reader.get_err_message())
+
+            _catalog = reader.read_length_encoded_str()
+            _schema = reader.read_length_encoded_str()
+            table = reader.read_length_encoded_str()
+            _org_table = reader.read_length_encoded_str()
+            name = reader.read_length_encoded_str()
+            _org_name = reader.read_length_encoded_str()
+            _fixed_len = reader.read_length_encoded_int()
+
+            _charset = reader.read_uint16()
+            _col_len = reader.read_uint32()
+            col_type = reader.read_uint8()
+            flags = reader.read_uint16()
+            decimals = reader.read_uint8()
+
+            col_name = name if name is not None else f"col_{i}"
+            tbl_name = table if table is not None else ""
+            field = FieldInfo(col_name, tbl_name, col_type, flags, decimals)
+            self._fields.append(field)
+            self._field_names.append(col_name)
+
+        # Read EOF packet (or intermediate OK packet in MySQL 8.0 with CLIENT_DEPRECATE_EOF)
+        if not reader.read_from_socket(sock_fd):
+            raise OperationalError("Lost connection reading column EOF")
+        if reader.is_err():
+            raise ProgrammingError("Error on column EOF: " + reader.get_err_message())
+
+        # 4. Read Data Row Packets
+        while True:
+            if not reader.read_from_socket(sock_fd):
+                raise OperationalError("Lost connection reading result row")
+
+            # Check for EOF or ERR or OK (end of rows)
+            if reader.is_eof() or reader.is_ok():
+                break
+            if reader.is_err():
+                raise ProgrammingError("Error during row stream: " + reader.get_err_message())
+
+            # Decode row cells
+            row_values = List[Optional[str]]()
+            for _ in range(col_count):
+                val = reader.read_length_encoded_str()
+                row_values.append(val)
+
+            row = Row(list(self._field_names), row_values)
+            self._rows.append(row)
+
+        return len(self._rows)
+
+    def fetchone(self) -> Optional[Row]:
+        if self._row_idx >= len(self._rows):
+            return None
+        r = self._rows[self._row_idx]
+        self._row_idx += 1
+        return r
+
+    def fetchall(self) -> List[Row]:
+        if self._row_idx == 0:
+            self._row_idx = len(self._rows)
+            return self._rows
+        res = List[Row]()
+        while self._row_idx < len(self._rows):
+            res.append(self._rows[self._row_idx])
+            self._row_idx += 1
+        return res
+
+    def close(self) -> None:
+        self._reset()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self):
+        self.close()
+
+
+class MySQLConnection:
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+    charset: str
+    autocommit: bool
+    connect_timeout: int
+
+    sock: Socket
+    reader: PacketReader
+    writer: PacketWriter
+    is_closed: bool
+
+    server_version: str
+    connection_id: int
+    auth_plugin: str
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 3306,
+        user: str = "root",
+        password: str = "",
+        database: str = "",
+        charset: str = "utf8mb4",
+        autocommit: bool = True,
+        connect_timeout: int = 10
+    ):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.database = database
+        self.charset = charset
+        self.autocommit = autocommit
+        self.connect_timeout = connect_timeout
+
+        self.sock = Socket()
+        self.reader = PacketReader()
+        self.writer = PacketWriter()
+        self.is_closed = True
+
+        self.server_version = ""
+        self.connection_id = 0
+        self.auth_plugin = ""
+
+        self._connect()
+
+    def _connect(self) -> None:
+        self.sock = Socket.create_tcp_client(blocking=True)
+        self.sock.set_tcp_nodelay(True)
+
+        if not self.sock.connect(self.host, self.port):
+            self.sock.close()
+            raise OperationalError(f"Cannot connect to MySQL server at {self.host}:{self.port}")
+
+        self.is_closed = False
+
+        # 1. Read Initial Handshake Packet v10
+        if not self.reader.read_from_socket(self.sock.fd):
+            self.close()
+            raise OperationalError("Failed to receive MySQL handshake packet")
+
+        if self.reader.is_err():
+            msg = self.reader.get_err_message()
+            self.close()
+            raise OperationalError(f"MySQL handshake error: {msg}")
+
+        proto_ver = self.reader.read_uint8()
+        if proto_ver != 10:
+            self.close()
+            raise OperationalError(f"Unsupported MySQL protocol version: {proto_ver}")
+
+        self.server_version = self.reader.read_null_terminated_str()
+        self.connection_id = self.reader.read_uint32()
+
+        # Read first 8 bytes of salt
+        salt = self.reader.read_bytes(8)
+        self.reader.read_uint8() # filler 0x00
+
+        _cap_low = self.reader.read_uint16()
+        _server_charset = self.reader.read_uint8()
+        _status_flags = self.reader.read_uint16()
+        _cap_high = self.reader.read_uint16()
+        auth_data_len = self.reader.read_uint8()
+        self.reader.advance(10) # 10 reserved bytes
+
+        # Read second part of salt (length = max(12, auth_data_len - 8))
+        salt2_len = 12
+        if auth_data_len > 8:
+            salt2_len = auth_data_len - 8
+        salt2 = self.reader.read_bytes(salt2_len)
+        for b in salt2:
+            if b == byte(0):
+                break
+            salt.append(b)
+
+        # Read auth plugin name if present
+        if self.reader.has_more():
+            self.auth_plugin = self.reader.read_null_terminated_str()
+        if len(self.auth_plugin) == 0:
+            self.auth_plugin = "caching_sha2_password"
+
+        # 2. Build and Send HandshakeResponse41
+        auth_resp = List[byte]()
+        if self.auth_plugin == "mysql_native_password":
+            auth_resp = scramble_native_password(self.password, salt)
+        else:
+            auth_resp = scramble_caching_sha2(self.password, salt)
+
+        client_caps = DEFAULT_CLIENT_CAPABILITIES
+        max_pkt = 16777216 # 16MB
+        charset_id = CHARSET_UTF8MB4_GENERAL_CI
+
+        self.writer.reset()
+        self.writer.write_uint32(client_caps)
+        self.writer.write_uint32(max_pkt)
+        self.writer.write_uint8(charset_id)
+
+        # 23 reserved zero bytes
+        for _ in range(23):
+            self.writer.write_uint8(0)
+
+        # Username
+        self.writer.write_null_terminated_str(self.user)
+
+        # Auth data (length-encoded)
+        self.writer.write_uint8(len(auth_resp))
+        self.writer.write_bytes(auth_resp)
+
+        # Database
+        self.writer.write_null_terminated_str(self.database)
+
+        # Plugin name
+        self.writer.write_null_terminated_str(self.auth_plugin)
+
+        if not self.writer.send_to_socket(self.sock.fd, 1):
+            self.close()
+            raise OperationalError("Failed to send HandshakeResponse to MySQL")
+
+        # 3. Read Auth Response (seq_id = 2)
+        if not self.reader.read_from_socket(self.sock.fd):
+            self.close()
+            raise OperationalError("Lost connection reading authentication reply")
+
+        if self.reader.is_err():
+            code = self.reader.get_err_code()
+            msg = self.reader.get_err_message()
+            self.close()
+            raise OperationalError(f"Authentication failed [{code}]: {msg}")
+
+        # Check for fast auth response (0x01 0x03) in caching_sha2_password
+        if self.reader.length >= 2 and int(self.reader.data[0]) == 0x01:
+            step = int(self.reader.data[1])
+            if step == 0x03: # Fast auth success! Read next OK packet
+                if not self.reader.read_from_socket(self.sock.fd):
+                    self.close()
+                    raise OperationalError("Lost connection waiting for OK packet after fast auth")
+                if self.reader.is_err():
+                    msg = self.reader.get_err_message()
+                    self.close()
+                    raise OperationalError(f"Auth verification error: {msg}")
+            elif step == 0x04:
+                # Full auth request
+                self.close()
+                raise OperationalError(
+                    "caching_sha2_password requested full RSA auth. "
+                    "Ensure user password hash is cached or configure mysql_native_password."
+                )
+
+        if not self.reader.is_ok():
+            self.close()
+            raise OperationalError("Expected OK packet after authentication")
+
+    def ping(self, reconnect: bool = True) -> bool:
+        if self.is_closed:
+            if reconnect:
+                try:
+                    self._connect()
+                    return True
+                except:
+                    return False
+            return False
+
+        self.writer.reset()
+        self.writer.write_uint8(COM_PING)
+        if not self.writer.send_to_socket(self.sock.fd, 0):
+            self.close()
+            if reconnect:
+                try:
+                    self._connect()
+                    return True
+                except:
+                    return False
+            return False
+
+        if not self.reader.read_from_socket(self.sock.fd) or not self.reader.is_ok():
+            self.close()
+            if reconnect:
+                try:
+                    self._connect()
+                    return True
+                except:
+                    return False
+            return False
+
+        return True
+
+    def cursor(self) -> MySQLCursor[MySQLConnection]:
+        if self.is_closed:
+            raise InterfaceError("Cannot create cursor on closed connection")
+        return MySQLCursor[MySQLConnection](self)
+
+    def commit(self) -> None:
+        cur = self.cursor()
+        cur.execute("COMMIT")
+        cur.close()
+
+    def rollback(self) -> None:
+        cur = self.cursor()
+        cur.execute("ROLLBACK")
+        cur.close()
+
+    def close(self) -> None:
+        if not self.is_closed:
+            if self.sock.fd >= i32(0):
+                self.writer.reset()
+                self.writer.write_uint8(COM_QUIT)
+                self.writer.send_to_socket(self.sock.fd, 0)
+                self.sock.close()
+            self.is_closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self):
+        self.close()

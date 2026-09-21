@@ -1,0 +1,34 @@
+# RFC 6455 WebSocket Handshake Protocol Engine for CodonWeb
+
+from src.http.request import Request
+from src.http.response import Response
+from src.ws.crypto import sha1_str, base64_encode
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+def compute_websocket_accept(key: str) -> str:
+    combined = key + WS_GUID
+    digest = sha1_str(combined)
+    return base64_encode(digest)
+
+def is_websocket_upgrade(req: Request) -> bool:
+    up = req.header("Upgrade")
+    if up.lower() != "websocket":
+        return False
+    conn = req.header("Connection")
+    if "upgrade" not in conn.lower():
+        return False
+    key = req.header("Sec-WebSocket-Key")
+    if len(key) == 0:
+        return False
+    return True
+
+def create_handshake_response(key: str, subprotocol: str = "") -> Response:
+    accept_key = compute_websocket_accept(key)
+    resp = Response(body="", status_code=101, content_type="")
+    resp.set_header("Upgrade", "websocket")
+    resp.set_header("Connection", "Upgrade")
+    resp.set_header("Sec-WebSocket-Accept", accept_key)
+    if len(subprotocol) > 0:
+        resp.set_header("Sec-WebSocket-Protocol", subprotocol)
+    return resp

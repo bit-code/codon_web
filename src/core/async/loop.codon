@@ -1,0 +1,240 @@
+import time
+from typing import Optional
+import asyncio
+from asyncio import (
+    EventLoop as BaseEventLoop,
+    Future,
+    Task,
+    get_event_loop as get_base_loop,
+    set_event_loop as set_base_loop,
+    _EnterLoop
+)
+from src.runtime.epoll import Epoll, EpollEvent
+from src.os.constants import (
+    EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP, EPOLLET
+)
+
+async def _async_callback_wrapper(cb):
+    cb()
+
+class FdCallback:
+    coro: cobj
+
+    def __init__(self, coro: cobj = cobj()):
+        self.coro = coro
+
+    def run(self):
+        if bool(self.coro):
+            g = Generator[None](self.coro)
+            g.__resume__()
+
+class FdHandler:
+    read_cb: Optional[FdCallback]
+    write_cb: Optional[FdCallback]
+    events: u32
+
+    def __init__(self):
+        self.read_cb = None
+        self.write_cb = None
+        self.events = u32(0)
+
+class EpollEventLoop:
+    base_loop: BaseEventLoop
+    epoll: Epoll
+    handlers: dict[int, FdHandler]
+    is_running: bool
+
+    def __init__(self, base_loop: Optional[BaseEventLoop] = None, max_events: int = 1024, epoll: Optional[Epoll] = None):
+        if base_loop is None:
+            self.base_loop = get_base_loop()
+        else:
+            self.base_loop = base_loop
+        if epoll is None:
+            self.epoll = Epoll(max_events)
+        else:
+            self.epoll = epoll
+        self.handlers = {}
+        self.is_running = False
+
+    def has_fd_handler(self, fd: int) -> bool:
+        """Check whether a given file descriptor is registered in the async I/O handlers."""
+        return fd in self.handlers
+
+    def handle_fd_event(self, fd: int, ev_mask: u32) -> None:
+        """Dispatch ready I/O event to registered coroutine reader/writer callbacks."""
+        if fd in self.handlers:
+            h = self.handlers[fd]
+            if (ev_mask & u32(EPOLLOUT)) != u32(0) and h.write_cb is not None:
+                h.write_cb.run()
+            if (ev_mask & u32(EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != u32(0) and h.read_cb is not None:
+                h.read_cb.run()
+
+    def has_pending_tasks(self) -> bool:
+        """Check whether there are ready coroutines waiting in the base loop work queue."""
+        return not self.base_loop._work_empty()
+
+    def step(self) -> None:
+        """Advance coroutine scheduler by one step if work is ready."""
+        loop = self.base_loop
+        with _EnterLoop(loop):
+            if not loop._work_empty():
+                loop._step()
+
+    def add_reader(self, fd: int, callback) -> None:
+        """Register a callback to be invoked when file descriptor `fd` is ready for reading."""
+        c = _async_callback_wrapper(callback)
+        cb_item = FdCallback(c.__raw__())
+        if fd not in self.handlers:
+            h = FdHandler()
+            h.read_cb = cb_item
+            h.events = u32(EPOLLIN | EPOLLRDHUP)
+            self.handlers[fd] = h
+            self.epoll.add(i32(fd), h.events)
+        else:
+            h = self.handlers[fd]
+            h.read_cb = cb_item
+            h.events = u32(h.events | u32(EPOLLIN | EPOLLRDHUP))
+            self.epoll.modify(i32(fd), h.events)
+
+    def remove_reader(self, fd: int) -> None:
+        """Unregister reading callback for file descriptor `fd`."""
+        if fd in self.handlers:
+            h = self.handlers[fd]
+            h.read_cb = None
+            h.events = u32(h.events & (~u32(EPOLLIN | EPOLLRDHUP)))
+            if h.write_cb is None:
+                self.epoll.remove(i32(fd))
+                del self.handlers[fd]
+            else:
+                self.epoll.modify(i32(fd), h.events)
+
+    def add_writer(self, fd: int, callback) -> None:
+        """Register a callback to be invoked when file descriptor `fd` is ready for writing."""
+        c = _async_callback_wrapper(callback)
+        cb_item = FdCallback(c.__raw__())
+        if fd not in self.handlers:
+            h = FdHandler()
+            h.write_cb = cb_item
+            h.events = u32(EPOLLOUT)
+            self.handlers[fd] = h
+            self.epoll.add(i32(fd), h.events)
+        else:
+            h = self.handlers[fd]
+            h.write_cb = cb_item
+            h.events = u32(h.events | u32(EPOLLOUT))
+            self.epoll.modify(i32(fd), h.events)
+
+    def remove_writer(self, fd: int) -> None:
+        """Unregister writing callback for file descriptor `fd`."""
+        if fd in self.handlers:
+            h = self.handlers[fd]
+            h.write_cb = None
+            h.events = u32(h.events & (~u32(EPOLLOUT)))
+            if h.read_cb is None:
+                self.epoll.remove(i32(fd))
+                del self.handlers[fd]
+            else:
+                self.epoll.modify(i32(fd), h.events)
+
+    def poll_io(self, timeout_ms: int = 0) -> int:
+        """Wait for I/O events using Linux Epoll and execute ready handlers."""
+        if len(self.handlers) == 0:
+            return 0
+        events = self.epoll.wait(timeout_ms)
+        n = len(events)
+        for i in range(n):
+            ev = events[i]
+            fd = int(ev.fd)
+            if fd in self.handlers:
+                h = self.handlers[fd]
+                ev_mask = ev.events
+                # Priority: writable first, then readable/error
+                if (ev_mask & u32(EPOLLOUT)) != u32(0) and h.write_cb is not None:
+                    h.write_cb.run()
+                if (ev_mask & u32(EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != u32(0) and h.read_cb is not None:
+                    h.read_cb.run()
+        return n
+
+    def call_later(self, delay: float, callback, *args):
+        """Schedule a callback to be called after `delay` seconds."""
+        return self.base_loop.call_later(delay, callback, *args)
+
+    def call_soon(self, callback, *args):
+        """Schedule a callback to be called on the next iteration."""
+        return self.base_loop.call_soon(callback, *args)
+
+    def create_future(self, T: type = NoneType):
+        """Create a standard typed asyncio.Future."""
+        return self.base_loop.create_future(T)
+
+    def create_task(self, coro, name: Optional[str] = None):
+        """Wrap a coroutine into an asyncio.Task and schedule it."""
+        return self.base_loop.create_task(coro, name=name)
+
+    def run_until_complete(self, task):
+        """Run the event loop with Epoll multiplexing until `task` finishes."""
+        loop = self.base_loop
+        self.is_running = True
+        with _EnterLoop(loop):
+            while not task.done():
+                # 1. If work is ready in queue, run it immediately without I/O wait
+                if not loop._work_empty():
+                    loop._step()
+                    if task.done():
+                        break
+                    continue
+
+                # 2. Work queue is empty: tasks are suspended waiting on I/O or timers.
+                timeout_ms = 0
+                now = time.time()
+                if loop._timers_len > 0:
+                    dt = loop._timers[0].when - now
+                    if dt <= 0.0:
+                        loop._step()
+                        continue
+                    timeout_ms = min(10, max(1, int(dt * 1000.0)))
+                else:
+                    timeout_ms = 5 if len(self.handlers) > 0 else 0
+
+                # 3. Poll Epoll directly to wake up waiting tasks
+                n_events = self.poll_io(timeout_ms)
+                if n_events == 0 and loop._timers_len == 0 and len(self.handlers) == 0:
+                    time.sleep(0.001)
+
+            self.is_running = False
+            return task.result()
+
+    def run_one_iteration(self, max_timeout_ms: int = 5) -> None:
+        """Single non-blocking or bounded step for integration into external loops."""
+        loop = self.base_loop
+        with _EnterLoop(loop):
+            loop._step()
+            timeout = max_timeout_ms if len(self.handlers) > 0 else 0
+            n_events = self.poll_io(timeout)
+            if n_events > 0:
+                loop._step()
+
+_default_loop: Optional[EpollEventLoop] = None
+
+def get_event_loop() -> EpollEventLoop:
+    """Return the global EpollEventLoop instance for current thread."""
+    global _default_loop
+    if _default_loop is None:
+        _default_loop = EpollEventLoop()
+    return _default_loop
+
+def set_event_loop(loop: EpollEventLoop) -> None:
+    """Set the current global EpollEventLoop instance."""
+    global _default_loop
+    _default_loop = loop
+    set_base_loop(loop.base_loop)
+
+def run(coro):
+    """Execute a top-level coroutine to completion using the EpollEventLoop."""
+    loop = get_event_loop()
+    task = loop.create_task(coro)
+    return loop.run_until_complete(task)
+
+def create_task(coro, name: Optional[str] = None):
+    """Convenience shortcut to create an asynchronous task on the current loop."""
+    return get_event_loop().create_task(coro, name=name)

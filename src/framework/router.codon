@@ -1,0 +1,36 @@
+from src.http.request import Request
+from src.http.response import Response
+from src.runtime.event_loop import RequestHandler
+from src.framework.radix import RadixRouter
+from src.framework.route import RouteHandler
+from src.http.method import (
+    METHOD_GET, METHOD_POST, METHOD_PUT, METHOD_DELETE,
+    METHOD_HEAD, METHOD_OPTIONS, METHOD_PATCH
+)
+
+class RouterAdapter(RouteHandler):
+    router: RadixRouter
+
+    def __init__(self, router: RadixRouter):
+        self.router = router
+
+    def handle(self, req: Request) -> Response:
+        return self.router.dispatch(req)
+
+class Router:
+    radix: RadixRouter
+
+    def __init__(self):
+        self.radix = RadixRouter()
+
+    def add(self, method: i32, path: str, handler: RouteHandler) -> None:
+        self.radix.add_route(method, path, handler)
+
+    def set_not_found_handler(self, handler: RouteHandler) -> None:
+        self.radix.not_found_handler = handler
+
+    def set_method_not_allowed_handler(self, handler: RouteHandler) -> None:
+        self.radix.method_not_allowed_handler = handler
+
+    def dispatch(self, req: Request) -> Response:
+        return self.radix.dispatch(req)

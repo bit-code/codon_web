@@ -1,0 +1,154 @@
+# Pure Codon High-Performance Crypto Primitives for WebSocket (RFC 6455) & Security
+
+# 1. Base64 Encoding and Decoding
+_B64_TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+def base64_encode(data: list[byte]) -> str:
+    n = len(data)
+    if n == 0:
+        return ""
+    res = list[str]()
+    i = 0
+    while i < n:
+        b0 = int(data[i])
+        b1 = int(data[i + 1]) if i + 1 < n else 0
+        b2 = int(data[i + 2]) if i + 2 < n else 0
+        triple = (b0 << 16) | (b1 << 8) | b2
+
+        res.append(_B64_TABLE[(triple >> 18) & 0x3F])
+        res.append(_B64_TABLE[(triple >> 12) & 0x3F])
+        if i + 1 < n:
+            res.append(_B64_TABLE[(triple >> 6) & 0x3F])
+        else:
+            res.append('=')
+        if i + 2 < n:
+            res.append(_B64_TABLE[triple & 0x3F])
+        else:
+            res.append('=')
+        i += 3
+    return "".join(res)
+
+def base64_decode(s: str) -> list[byte]:
+    lookup = dict[int, int]()
+    for idx in range(len(_B64_TABLE)):
+        lookup[ord(_B64_TABLE[idx])] = idx
+
+    buf = 0
+    bits = 0
+    res = list[byte]()
+
+    for i in range(len(s)):
+        c = s[i]
+        if c == '=':
+            break
+        code = ord(c)
+        if code in lookup:
+            buf = (buf << 6) | lookup[code]
+            bits += 6
+            if bits >= 8:
+                bits -= 8
+                byte_val = (buf >> bits) & 0xFF
+                res.append(byte(byte_val))
+
+    return res
+
+# 2. Pure Codon RFC 3174 SHA-1 Implementation
+def _rotl32(v: int, bits: int) -> int:
+    return ((v << bits) | (v >> (32 - bits))) & 0xFFFFFFFF
+
+def sha1(data: list[byte]) -> list[byte]:
+    h0 = 0x67452301
+    h1 = 0xEFCDAB89
+    h2 = 0x98BADCFE
+    h3 = 0x10325476
+    h4 = 0xC3D2E1F0
+
+    orig_len_bytes = len(data)
+    orig_len_bits = orig_len_bytes * 8
+
+    # Pad message
+    padded = list[byte]()
+    for i in range(orig_len_bytes):
+        padded.append(data[i])
+    padded.append(byte(0x80))
+
+    while (len(padded) % 64) != 56:
+        padded.append(byte(0x00))
+
+    # Append 64-bit length in big-endian
+    for shift in range(56, -8, -8):
+        padded.append(byte((orig_len_bits >> shift) & 0xFF))
+
+    # Process 512-bit (64-byte) chunks
+    num_chunks = len(padded) // 64
+    w = [0] * 80
+
+    for chunk_idx in range(num_chunks):
+        base_offset = chunk_idx * 64
+        for i in range(16):
+            idx = base_offset + (i * 4)
+            b0 = int(padded[idx])
+            b1 = int(padded[idx + 1])
+            b2 = int(padded[idx + 2])
+            b3 = int(padded[idx + 3])
+            w[i] = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+        for i in range(16, 80):
+            w[i] = _rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1)
+
+        a = h0
+        b = h1
+        c = h2
+        d = h3
+        e = h4
+
+        for i in range(80):
+            if i < 20:
+                f = (b & c) | ((~b) & d)
+                k = 0x5A827999
+            elif i < 40:
+                f = b ^ c ^ d
+                k = 0x6ED9EBA1
+            elif i < 60:
+                f = (b & c) | (b & d) | (c & d)
+                k = 0x8F1BBCDC
+            else:
+                f = b ^ c ^ d
+                k = 0xCA62C1D6
+
+            temp = (_rotl32(a, 5) + f + e + k + w[i]) & 0xFFFFFFFF
+            e = d
+            d = c
+            c = _rotl32(b, 30)
+            b = a
+            a = temp
+
+        h0 = (h0 + a) & 0xFFFFFFFF
+        h1 = (h1 + b) & 0xFFFFFFFF
+        h2 = (h2 + c) & 0xFFFFFFFF
+        h3 = (h3 + d) & 0xFFFFFFFF
+        h4 = (h4 + e) & 0xFFFFFFFF
+
+    out = list[byte]()
+    for h in [h0, h1, h2, h3, h4]:
+        out.append(byte((h >> 24) & 0xFF))
+        out.append(byte((h >> 16) & 0xFF))
+        out.append(byte((h >> 8) & 0xFF))
+        out.append(byte(h & 0xFF))
+    return out
+
+def sha1_str(s: str) -> list[byte]:
+    data = list[byte]()
+    for i in range(len(s)):
+        data.append(byte(ord(s[i])))
+    return sha1(data)
+
+def sha1_hex(s: str) -> str:
+    h = sha1_str(s)
+    hex_chars = "0123456789abcdef"
+    res = list[str]()
+    for i in range(len(h)):
+        v = int(h[i])
+        res.append(hex_chars[(v >> 4) & 0xF])
+        res.append(hex_chars[v & 0xF])
+    return "".join(res)

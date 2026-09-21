@@ -1,0 +1,192 @@
+# Industrial-grade Asynchronous MySQL Connection Pool
+
+from typing import Optional, List
+import asyncio
+from asyncio import Future
+from src.core.async.loop import get_event_loop
+from src.db.drivers.mysql.async_connection import AsyncMySQLConnection, AsyncMySQLCursor, connect_async
+from src.db.errors import OperationalError
+
+class AsyncPooledConnection:
+    _pool: Optional[cobj] # raw pool pointer to avoid circular type ref
+    _conn: AsyncMySQLConnection
+    _is_returned: bool
+
+    def __init__(self, conn: AsyncMySQLConnection, pool_ptr: cobj):
+        self._conn = conn
+        self._pool = pool_ptr
+        self._is_returned = False
+
+    def cursor(self) -> AsyncMySQLCursor[AsyncMySQLConnection]:
+        return self._conn.cursor()
+
+    async def ping(self) -> bool:
+        return await self._conn.ping()
+
+    @property
+    def is_closed(self) -> bool:
+        return self._conn.is_closed
+
+    @property
+    def server_version(self) -> str:
+        return self._conn.server_version
+
+    @property
+    def connection_id(self) -> int:
+        return self._conn.connection_id
+
+
+class AsyncMySQLPool:
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+    charset: str
+    min_size: int
+    max_size: int
+    _available: List[AsyncMySQLConnection]
+    _in_use_count: int
+    _waiters: List[Future[AsyncMySQLConnection]]
+    _is_closed: bool
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 3306,
+        user: str = "root",
+        password: str = "",
+        database: str = "",
+        charset: str = "utf8mb4",
+        min_size: int = 4,
+        max_size: int = 32
+    ):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.database = database
+        self.charset = charset
+        self.min_size = min_size
+        self.max_size = max_size if max_size >= min_size else min_size
+        self._available = List[AsyncMySQLConnection]()
+        self._in_use_count = 0
+        self._waiters = List[Future[AsyncMySQLConnection]]()
+        self._is_closed = False
+
+    async def init_pool(self):
+        """Pre-warms the connection pool up to min_size asynchronously."""
+        for _ in range(self.min_size):
+            conn = await connect_async(
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                password=self.password,
+                database=self.database,
+                charset=self.charset
+            )
+            self._available.append(conn)
+
+    async def acquire(self):
+        """
+        Asynchronously acquires a connection.
+        If all connections are busy, non-blockingly waits until a connection is returned.
+        """
+        if self._is_closed:
+            raise OperationalError("Cannot acquire from closed AsyncMySQLPool")
+
+        loop = get_event_loop()
+
+        # 1. Try to get existing idle connection
+        while len(self._available) > 0:
+            conn = self._available.pop()
+            if not conn.is_closed:
+                self._in_use_count += 1
+                return conn
+
+        # 2. Can we create a new physical connection?
+        if (len(self._available) + self._in_use_count) < self.max_size:
+            self._in_use_count += 1
+            try:
+                conn = await connect_async(
+                    host=self.host,
+                    port=self.port,
+                    user=self.user,
+                    password=self.password,
+                    database=self.database,
+                    charset=self.charset
+                )
+                return conn
+            except:
+                self._in_use_count -= 1
+                raise
+
+        # 3. Pool is exhausted: suspend coroutine and wait non-blockingly on Future
+        fut = loop.create_future(AsyncMySQLConnection)
+        self._waiters.append(fut)
+        conn = await fut
+        self._in_use_count += 1
+        return conn
+
+    def release(self, conn: AsyncMySQLConnection) -> None:
+        """Returns a connection back to the pool, notifying waiters non-blockingly."""
+        self._in_use_count = max(0, self._in_use_count - 1)
+
+        if self._is_closed or conn.is_closed:
+            conn.close()
+            return
+
+        # If there are suspended requests waiting for a connection, wake up the first waiter
+        if len(self._waiters) > 0:
+            waiter = self._waiters.pop(0)
+            waiter.set_result(conn)
+        else:
+            self._available.append(conn)
+
+    def connection(self):
+        return AsyncConnectionContext(self)
+
+    def available_count(self) -> int:
+        return len(self._available)
+
+    def in_use_count(self) -> int:
+        return self._in_use_count
+
+    def close(self) -> None:
+        """Closes all idle physical connections in the pool."""
+        self._is_closed = True
+        while len(self._available) > 0:
+            conn = self._available.pop()
+            conn.close()
+
+class AsyncConnectionContext:
+    _pool: AsyncMySQLPool
+    _conn: Optional[AsyncMySQLConnection]
+
+    def __init__(self, pool: AsyncMySQLPool):
+        self._pool = pool
+        self._conn = None
+
+    async def __aenter__(self):
+        conn = await self._pool.acquire()
+        self._conn = conn
+        return conn
+
+    async def __aexit__(self):
+        if self._conn is not None:
+            c = self._conn
+            self._pool.release(c)
+
+    @property
+    def conn(self) -> AsyncMySQLConnection:
+        assert self._conn is not None, "Connection not acquired or already released"
+        return self._conn
+
+    def cursor(self):
+        assert self._conn is not None, "Connection not acquired or already released"
+        return self._conn.cursor()
+
+    async def ping(self) -> bool:
+        assert self._conn is not None, "Connection not acquired or already released"
+        return await self._conn.ping()
+

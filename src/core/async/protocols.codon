@@ -1,0 +1,11 @@
+from typing import Optional
+
+class AsyncDriver:
+    """Base interface for all industrial-grade asynchronous database/network drivers."""
+    def close(self) -> None:
+        pass
+
+class AsyncResource:
+    """Context-manager compatible async resource."""
+    def close(self) -> None:
+        pass

@@ -1,0 +1,263 @@
+# Native SQLite Driver Implementation for Codon via libsqlite3
+
+from C import dlopen(Ptr[byte], i32) -> Ptr[byte]
+from C import dlsym(Ptr[byte], Ptr[byte]) -> Ptr[byte]
+from src.db.errors import OperationalError, InterfaceError, ProgrammingError
+from src.db.types import FieldInfo, Row
+
+class SQLiteEngine:
+    _handle: Ptr[byte]
+    open_fn: Function[Tuple[Ptr[byte], Ptr[Ptr[byte]]], i32]
+    close_fn: Function[Tuple[Ptr[byte]], i32]
+    prepare_fn: Function[Tuple[Ptr[byte], Ptr[byte], i32, Ptr[Ptr[byte]], Ptr[Ptr[byte]]], i32]
+    step_fn: Function[Tuple[Ptr[byte]], i32]
+    finalize_fn: Function[Tuple[Ptr[byte]], i32]
+    col_count_fn: Function[Tuple[Ptr[byte]], i32]
+    col_name_fn: Function[Tuple[Ptr[byte], i32], Ptr[byte]]
+    col_type_fn: Function[Tuple[Ptr[byte], i32], i32]
+    col_text_fn: Function[Tuple[Ptr[byte], i32], Ptr[byte]]
+    col_bytes_fn: Function[Tuple[Ptr[byte], i32], i32]
+    changes_fn: Function[Tuple[Ptr[byte]], i32]
+    last_rowid_fn: Function[Tuple[Ptr[byte]], int]
+    errmsg_fn: Function[Tuple[Ptr[byte]], Ptr[byte]]
+
+    def __init__(self):
+        candidates = [
+            "libsqlite3.so.0",
+            "libsqlite3.so",
+            "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0",
+            "/lib/x86_64-linux-gnu/libsqlite3.so.0"
+        ]
+        handle = Ptr[byte]()
+        for lib in candidates:
+            handle = dlopen(lib.c_str(), i32(2)) # RTLD_NOW
+            if handle:
+                break
+        if not handle:
+            raise OperationalError("Failed to dynamically load libsqlite3.so")
+        self._handle = handle
+
+        self.open_fn = Function[Tuple[Ptr[byte], Ptr[Ptr[byte]]], i32](dlsym(handle, "sqlite3_open".c_str()))
+        self.close_fn = Function[Tuple[Ptr[byte]], i32](dlsym(handle, "sqlite3_close".c_str()))
+        self.prepare_fn = Function[Tuple[Ptr[byte], Ptr[byte], i32, Ptr[Ptr[byte]], Ptr[Ptr[byte]]], i32](dlsym(handle, "sqlite3_prepare_v2".c_str()))
+        self.step_fn = Function[Tuple[Ptr[byte]], i32](dlsym(handle, "sqlite3_step".c_str()))
+        self.finalize_fn = Function[Tuple[Ptr[byte]], i32](dlsym(handle, "sqlite3_finalize".c_str()))
+        self.col_count_fn = Function[Tuple[Ptr[byte]], i32](dlsym(handle, "sqlite3_column_count".c_str()))
+        self.col_name_fn = Function[Tuple[Ptr[byte], i32], Ptr[byte]](dlsym(handle, "sqlite3_column_name".c_str()))
+        self.col_type_fn = Function[Tuple[Ptr[byte], i32], i32](dlsym(handle, "sqlite3_column_type".c_str()))
+        self.col_text_fn = Function[Tuple[Ptr[byte], i32], Ptr[byte]](dlsym(handle, "sqlite3_column_text".c_str()))
+        self.col_bytes_fn = Function[Tuple[Ptr[byte], i32], i32](dlsym(handle, "sqlite3_column_bytes".c_str()))
+        self.changes_fn = Function[Tuple[Ptr[byte]], i32](dlsym(handle, "sqlite3_changes".c_str()))
+        self.last_rowid_fn = Function[Tuple[Ptr[byte]], int](dlsym(handle, "sqlite3_last_insert_rowid".c_str()))
+        self.errmsg_fn = Function[Tuple[Ptr[byte]], Ptr[byte]](dlsym(handle, "sqlite3_errmsg".c_str()))
+
+_sqlite_engine: Optional[SQLiteEngine] = None
+
+def c_str_to_str(ptr: Ptr[byte]) -> str:
+    if not ptr:
+        return ""
+    length = 0
+    while ptr[length] != byte(0):
+        length += 1
+    p_new = Ptr[byte](length)
+    for i in range(length):
+        p_new[i] = ptr[i]
+    return str(p_new, length)
+
+def get_sqlite_engine() -> SQLiteEngine:
+    global _sqlite_engine
+    if _sqlite_engine is None:
+        _sqlite_engine = SQLiteEngine()
+    return _sqlite_engine
+
+
+class SQLiteCursor[Conn]:
+    _conn: Conn
+    _rows: List[Row]
+    _row_idx: int
+    _fields: List[FieldInfo]
+    _field_names: List[str]
+    _affected_rows: int
+    _last_insert_id: int
+
+    def __init__(self, conn: Conn):
+        self._conn = conn
+        self._rows = List[Row]()
+        self._row_idx = 0
+        self._fields = List[FieldInfo]()
+        self._field_names = List[str]()
+        self._affected_rows = 0
+        self._last_insert_id = 0
+
+    @property
+    def rowcount(self) -> int:
+        if len(self._rows) > 0:
+            return len(self._rows)
+        return self._affected_rows
+
+    @property
+    def lastrowid(self) -> int:
+        return self._last_insert_id
+
+    @property
+    def description(self) -> List[FieldInfo]:
+        return self._fields
+
+    def _reset(self) -> None:
+        self._rows.clear()
+        self._row_idx = 0
+        self._fields.clear()
+        self._field_names.clear()
+        self._affected_rows = 0
+        self._last_insert_id = 0
+
+    def execute(self, sql: str) -> int:
+        self._reset()
+        if self._conn.is_closed:
+            raise InterfaceError("Cannot execute on closed SQLite connection")
+
+        engine = get_sqlite_engine()
+        db = self._conn.db_handle
+
+        stmt_ptr = Ptr[Ptr[byte]](1)
+        tail_ptr = Ptr[Ptr[byte]](1)
+
+        rc = engine.prepare_fn(db, sql.c_str(), i32(len(sql)), stmt_ptr, tail_ptr)
+        if rc != i32(0):
+            err_p = engine.errmsg_fn(db)
+            err_msg = c_str_to_str(err_p) if err_p else "Unknown prepare error"
+            raise ProgrammingError("SQLite Prepare Error: " + err_msg)
+
+        stmt = stmt_ptr[0]
+        if not stmt:
+            return 0
+
+        # Step through results
+        first_step = True
+        num_cols = 0
+
+        while True:
+            step_rc = engine.step_fn(stmt)
+            if step_rc == i32(100): # SQLITE_ROW
+                if first_step:
+                    first_step = False
+                    num_cols = int(engine.col_count_fn(stmt))
+                    for i in range(num_cols):
+                        name_p = engine.col_name_fn(stmt, i32(i))
+                        col_name = c_str_to_str(name_p) if name_p else f"col_{i}"
+                        col_type = int(engine.col_type_fn(stmt, i32(i)))
+                        self._field_names.append(col_name)
+                        self._fields.append(FieldInfo(col_name, "", col_type, 0, 0))
+
+                # Read row values
+                row_vals = List[Optional[str]]()
+                for i in range(num_cols):
+                    col_t = int(engine.col_type_fn(stmt, i32(i)))
+                    if col_t == 5: # SQLITE_NULL
+                        row_vals.append(None)
+                    else:
+                        text_p = engine.col_text_fn(stmt, i32(i))
+                        byte_len = int(engine.col_bytes_fn(stmt, i32(i)))
+                        if text_p and byte_len > 0:
+                            p_new = Ptr[byte](byte_len)
+                            for j in range(byte_len):
+                                p_new[j] = text_p[j]
+                            s = str(p_new, byte_len)
+                            row_vals.append(s)
+                        else:
+                            row_vals.append("")
+                row = Row(self._field_names, row_vals)
+                self._rows.append(row)
+
+            elif step_rc == i32(101): # SQLITE_DONE
+                break
+            else:
+                err_p = engine.errmsg_fn(db)
+                err_msg = c_str_to_str(err_p) if err_p else "Unknown step error"
+                engine.finalize_fn(stmt)
+                raise OperationalError("SQLite Step Error: " + err_msg)
+
+        engine.finalize_fn(stmt)
+        self._affected_rows = int(engine.changes_fn(db))
+        self._last_insert_id = engine.last_rowid_fn(db)
+        return len(self._rows) if len(self._rows) > 0 else self._affected_rows
+
+    def fetchone(self) -> Optional[Row]:
+        if self._row_idx >= len(self._rows):
+            return None
+        r = self._rows[self._row_idx]
+        self._row_idx += 1
+        return r
+
+    def fetchall(self) -> List[Row]:
+        if self._row_idx == 0:
+            self._row_idx = len(self._rows)
+            return self._rows
+        res = List[Row]()
+        while self._row_idx < len(self._rows):
+            res.append(self._rows[self._row_idx])
+            self._row_idx += 1
+        return res
+
+    def close(self) -> None:
+        self._reset()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self):
+        self.close()
+
+
+class SQLiteConnection:
+    database: str
+    db_handle: Ptr[byte]
+    is_closed: bool
+
+    def __init__(self, database: str = ":memory:"):
+        self.database = database
+        self.is_closed = True
+        self.db_handle = Ptr[byte]()
+        self._connect()
+
+    def _connect(self) -> None:
+        engine = get_sqlite_engine()
+        db_ptr = Ptr[Ptr[byte]](1)
+        rc = engine.open_fn(self.database.c_str(), db_ptr)
+        if rc != i32(0):
+            err_p = engine.errmsg_fn(db_ptr[0]) if db_ptr[0] else Ptr[byte]()
+            err_msg = c_str_to_str(err_p) if err_p else "Failed to open SQLite database"
+            if db_ptr[0]:
+                engine.close_fn(db_ptr[0])
+            raise OperationalError(f"Cannot open SQLite database '{self.database}': {err_msg}")
+
+        self.db_handle = db_ptr[0]
+        self.is_closed = False
+
+    def cursor(self) -> SQLiteCursor[SQLiteConnection]:
+        if self.is_closed:
+            raise InterfaceError("Cannot create cursor on closed SQLite connection")
+        return SQLiteCursor[SQLiteConnection](self)
+
+    def commit(self) -> None:
+        cur = self.cursor()
+        cur.execute("COMMIT")
+        cur.close()
+
+    def rollback(self) -> None:
+        cur = self.cursor()
+        cur.execute("ROLLBACK")
+        cur.close()
+
+    def close(self) -> None:
+        if not self.is_closed and self.db_handle:
+            engine = get_sqlite_engine()
+            engine.close_fn(self.db_handle)
+            self.db_handle = Ptr[byte]()
+            self.is_closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self):
+        self.close()

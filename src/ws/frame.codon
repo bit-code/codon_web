@@ -1,0 +1,120 @@
+# RFC 6455 WebSocket Frame Parser and Builder for CodonWeb
+
+WS_OPCODE_CONTINUATION = 0x0
+WS_OPCODE_TEXT = 0x1
+WS_OPCODE_BINARY = 0x2
+WS_OPCODE_CLOSE = 0x8
+WS_OPCODE_PING = 0x9
+WS_OPCODE_PONG = 0xA
+
+class WSFrame:
+    fin: bool
+    opcode: int
+    payload_str: str
+    payload_bytes: list[byte]
+
+    def __init__(self, fin: bool, opcode: int, payload_str: str, payload_bytes: list[byte]):
+        self.fin = fin
+        self.opcode = opcode
+        self.payload_str = payload_str
+        self.payload_bytes = payload_bytes
+
+    def is_text(self) -> bool:
+        return self.opcode == WS_OPCODE_TEXT
+
+    def is_binary(self) -> bool:
+        return self.opcode == WS_OPCODE_BINARY
+
+    def is_close(self) -> bool:
+        return self.opcode == WS_OPCODE_CLOSE
+
+    def is_ping(self) -> bool:
+        return self.opcode == WS_OPCODE_PING
+
+    def is_pong(self) -> bool:
+        return self.opcode == WS_OPCODE_PONG
+
+def encode_text_frame(text: str, is_server: bool = True) -> list[byte]:
+    payload = list[byte]()
+    for i in range(len(text)):
+        payload.append(byte(ord(text[i])))
+    return encode_frame(WS_OPCODE_TEXT, payload, is_server)
+
+def encode_frame(opcode: int, payload: list[byte], is_server: bool = True) -> list[byte]:
+    frame = list[byte]()
+    # FIN=1 | opcode
+    b0 = 0x80 | (opcode & 0x0F)
+    frame.append(byte(b0))
+
+    payload_len = len(payload)
+    mask_bit = 0x00 if is_server else 0x80
+
+    if payload_len <= 125:
+        frame.append(byte(mask_bit | payload_len))
+    elif payload_len <= 65535:
+        frame.append(byte(mask_bit | 126))
+        frame.append(byte((payload_len >> 8) & 0xFF))
+        frame.append(byte(payload_len & 0xFF))
+    else:
+        frame.append(byte(mask_bit | 127))
+        for shift in range(56, -8, -8):
+            frame.append(byte((payload_len >> shift) & 0xFF))
+
+    # Append unmasked payload for server-to-client frames
+    for i in range(payload_len):
+        frame.append(payload[i])
+
+    return frame
+
+def decode_frame(raw: list[byte]) -> WSFrame:
+    if len(raw) < 2:
+        return WSFrame(True, WS_OPCODE_CLOSE, "", list[byte]())
+
+    b0 = int(raw[0])
+    b1 = int(raw[1])
+
+    fin = (b0 & 0x80) != 0
+    opcode = b0 & 0x0F
+    is_masked = (b1 & 0x80) != 0
+    len_field = b1 & 0x7F
+
+    offset = 2
+    payload_len = 0
+
+    if len_field <= 125:
+        payload_len = len_field
+    elif len_field == 126:
+        if len(raw) < 4:
+            return WSFrame(True, WS_OPCODE_CLOSE, "", list[byte]())
+        payload_len = (int(raw[2]) << 8) | int(raw[3])
+        offset = 4
+    elif len_field == 127:
+        if len(raw) < 10:
+            return WSFrame(True, WS_OPCODE_CLOSE, "", list[byte]())
+        for i in range(8):
+            payload_len = (payload_len << 8) | int(raw[2 + i])
+        offset = 10
+
+    mask_key = [0, 0, 0, 0]
+    if is_masked:
+        if len(raw) < offset + 4:
+            return WSFrame(True, WS_OPCODE_CLOSE, "", list[byte]())
+        mask_key[0] = int(raw[offset])
+        mask_key[1] = int(raw[offset + 1])
+        mask_key[2] = int(raw[offset + 2])
+        mask_key[3] = int(raw[offset + 3])
+        offset += 4
+
+    payload_bytes = list[byte]()
+    chars = list[str]()
+
+    for i in range(payload_len):
+        if offset + i >= len(raw):
+            break
+        b = int(raw[offset + i])
+        if is_masked:
+            b = b ^ mask_key[i % 4]
+        payload_bytes.append(byte(b))
+        chars.append(chr(b))
+
+    return WSFrame(fin, opcode, "".join(chars), payload_bytes)

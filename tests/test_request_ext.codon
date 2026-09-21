@@ -1,0 +1,38 @@
+from src.http.request import Request
+from src.memory.slice import ByteSlice
+from src.http.headers import Headers
+
+req = Request()
+
+# 1. Test Query String Parsing
+q = "page=2&limit=50&filter=active&empty="
+req.query = ByteSlice(q.c_str(), len(q))
+
+assert req.query_param("page") == "2"
+assert req.query_param_int("page") == 2
+assert req.query_param_int("limit") == 50
+assert req.query_param_int("nonexistent", 999) == 999
+assert req.query_param("filter") == "active"
+assert req.query_param("empty") == ""
+print("Test 1 (Query parameter parsing): PASSED")
+
+# 2. Test Header and Bearer Token
+h_name = "Authorization"
+h_val = "Bearer secret_jwt_token_12345"
+req.headers.add(ByteSlice(h_name.c_str(), len(h_name)), ByteSlice(h_val.c_str(), len(h_val)))
+
+assert req.header("authorization") == h_val
+assert req.bearer_token() == "secret_jwt_token_12345"
+print("Test 2 (Header & Bearer token): PASSED")
+
+# 3. Test JSON parsing
+json_body = "{\"username\": \"john_doe\", \"role\": \"admin\", \"id\": 42}"
+req.body = ByteSlice(json_body.c_str(), len(json_body))
+
+data = req.json()
+assert data["username"] == "john_doe"
+assert data["role"] == "admin"
+assert data["id"] == "42"
+print("Test 3 (JSON parsing): PASSED")
+
+print("All Request extension tests PASSED successfully!")

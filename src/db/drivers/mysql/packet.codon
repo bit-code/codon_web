@@ -1,0 +1,317 @@
+# MySQL Binary Packet Reader and Writer (Wire Framing & Codec)
+
+from src.os.linux import recv as c_recv, send as c_send, get_errno
+from src.db.errors import OperationalError
+
+class PacketReader:
+    data: Ptr[byte]
+    capacity: int
+    length: int
+    offset: int
+    seq_id: int
+
+    def __init__(self, initial_capacity: int = 16384):
+        self.capacity = initial_capacity
+        self.data = Ptr[byte](self.capacity)
+        self.length = 0
+        self.offset = 0
+        self.seq_id = 0
+
+    def _ensure_capacity(self, needed: int) -> None:
+        if needed > self.capacity:
+            new_cap = self.capacity * 2
+            while new_cap < needed:
+                new_cap *= 2
+            new_data = Ptr[byte](new_cap)
+            for i in range(self.length):
+                new_data[i] = self.data[i]
+            self.data = new_data
+            self.capacity = new_cap
+
+    def read_from_socket(self, fd: i32) -> bool:
+        """Reads one full MySQL packet: 4-byte header followed by payload"""
+        header_buf = Ptr[byte](4)
+        recvd = 0
+        while recvd < 4:
+            ret = c_recv(fd, header_buf + recvd, 4 - recvd, i32(0))
+            if ret <= 0:
+                err = get_errno()
+                if err == 4: # EINTR
+                    continue
+                return False
+            recvd += ret
+
+        # Parse header
+        b0 = int(header_buf[0])
+        b1 = int(header_buf[1])
+        b2 = int(header_buf[2])
+        payload_len = b0 | (b1 << 8) | (b2 << 16)
+        self.seq_id = int(header_buf[3])
+
+        self._ensure_capacity(payload_len + 1)
+        self.length = payload_len
+        self.offset = 0
+
+        # Read payload
+        recvd = 0
+        while recvd < payload_len:
+            ret = c_recv(fd, self.data + recvd, payload_len - recvd, i32(0))
+            if ret <= 0:
+                err = get_errno()
+                if err == 4: # EINTR
+                    continue
+                return False
+            recvd += ret
+
+        self.data[self.length] = byte(0) # Null terminate for safety
+        return True
+
+    def load_payload(self, payload: str, seq_id: int = 0) -> None:
+        """Loads an externally read packet payload into the buffer for decoding."""
+        p_len = len(payload)
+        self._ensure_capacity(p_len + 1)
+        self.length = p_len
+        self.offset = 0
+        self.seq_id = seq_id
+        p_ptr = payload.c_str()
+        for i in range(p_len):
+            self.data[i] = p_ptr[i]
+        self.data[self.length] = byte(0)
+
+
+    def remaining(self) -> int:
+        return self.length - self.offset
+
+    def has_more(self) -> bool:
+        return self.offset < self.length
+
+    def read_uint8(self) -> int:
+        if self.offset >= self.length:
+            return 0
+        val = int(self.data[self.offset])
+        self.offset += 1
+        return val
+
+    def peek_uint8(self) -> int:
+        if self.offset >= self.length:
+            return 0
+        return int(self.data[self.offset])
+
+    def read_uint16(self) -> int:
+        if self.offset + 2 > self.length:
+            return 0
+        b0 = int(self.data[self.offset])
+        b1 = int(self.data[self.offset + 1])
+        self.offset += 2
+        return b0 | (b1 << 8)
+
+    def read_uint24(self) -> int:
+        if self.offset + 3 > self.length:
+            return 0
+        b0 = int(self.data[self.offset])
+        b1 = int(self.data[self.offset + 1])
+        b2 = int(self.data[self.offset + 2])
+        self.offset += 3
+        return b0 | (b1 << 8) | (b2 << 16)
+
+    def read_uint32(self) -> int:
+        if self.offset + 4 > self.length:
+            return 0
+        b0 = int(self.data[self.offset])
+        b1 = int(self.data[self.offset + 1])
+        b2 = int(self.data[self.offset + 2])
+        b3 = int(self.data[self.offset + 3])
+        self.offset += 4
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+    def read_length_encoded_int(self) -> int:
+        if not self.has_more():
+            return -1
+        first = self.read_uint8()
+        if first < 0xfb:
+            return first
+        if first == 0xfb:
+            return -1 # NULL
+        if first == 0xfc:
+            return self.read_uint16()
+        if first == 0xfd:
+            return self.read_uint24()
+        # 0xfe: 8-byte uint64
+        lo = self.read_uint32()
+        hi = self.read_uint32()
+        return lo | (hi << 32)
+
+    def read_length_encoded_str(self) -> Optional[str]:
+        length = self.read_length_encoded_int()
+        if length < 0:
+            return None
+        if length == 0:
+            return ""
+        if self.offset + length > self.length:
+            return ""
+        p_new = Ptr[byte](length)
+        for i in range(length):
+            p_new[i] = self.data[self.offset + i]
+        s = str(p_new, length)
+        self.offset += length
+        return s
+
+    def read_null_terminated_str(self) -> str:
+        start = self.offset
+        while self.offset < self.length and self.data[self.offset] != byte(0):
+            self.offset += 1
+        length = self.offset - start
+        p_new = Ptr[byte](length)
+        for i in range(length):
+            p_new[i] = self.data[start + i]
+        s = str(p_new, length)
+        if self.offset < self.length:
+            self.offset += 1 # skip null byte
+        return s
+
+    def read_fixed_str(self, length: int) -> str:
+        if self.offset + length > self.length:
+            length = self.length - self.offset
+        p_new = Ptr[byte](length)
+        for i in range(length):
+            p_new[i] = self.data[self.offset + i]
+        s = str(p_new, length)
+        self.offset += length
+        return s
+
+    def read_bytes(self, length: int) -> List[byte]:
+        if self.offset + length > self.length:
+            length = self.length - self.offset
+        res = List[byte]()
+        for i in range(length):
+            res.append(self.data[self.offset + i])
+        self.offset += length
+        return res
+
+    def advance(self, n: int) -> None:
+        self.offset += n
+        if self.offset > self.length:
+            self.offset = self.length
+
+    def is_ok(self) -> bool:
+        return self.length >= 1 and int(self.data[0]) == 0x00
+
+    def is_eof(self) -> bool:
+        return self.length >= 1 and int(self.data[0]) == 0xfe and self.length < 9
+
+    def is_err(self) -> bool:
+        return self.length >= 1 and int(self.data[0]) == 0xff
+
+    def get_err_code(self) -> int:
+        if self.is_err() and self.length >= 3:
+            return int(self.data[1]) | (int(self.data[2]) << 8)
+        return 0
+
+    def get_err_message(self) -> str:
+        if not self.is_err() or self.length < 4:
+            return "Unknown database error"
+        # If SQL state marker '#' present at offset 3
+        start = 3
+        if self.length >= 9 and self.data[3] == byte(ord('#')):
+            start = 9
+        return str(self.data + start, self.length - start)
+
+
+class PacketWriter:
+    buffer: List[byte]
+
+    def __init__(self):
+        self.buffer = List[byte]()
+
+    def reset(self) -> None:
+        self.buffer.clear()
+
+    def write_uint8(self, val: int) -> None:
+        self.buffer.append(byte(val & 0xff))
+
+    def write_uint16(self, val: int) -> None:
+        self.buffer.append(byte(val & 0xff))
+        self.buffer.append(byte((val >> 8) & 0xff))
+
+    def write_uint24(self, val: int) -> None:
+        self.buffer.append(byte(val & 0xff))
+        self.buffer.append(byte((val >> 8) & 0xff))
+        self.buffer.append(byte((val >> 16) & 0xff))
+
+    def write_uint32(self, val: int) -> None:
+        self.buffer.append(byte(val & 0xff))
+        self.buffer.append(byte((val >> 8) & 0xff))
+        self.buffer.append(byte((val >> 16) & 0xff))
+        self.buffer.append(byte((val >> 24) & 0xff))
+
+    def write_length_encoded_int(self, val: int) -> None:
+        if val < 251:
+            self.write_uint8(val)
+        elif val < 65536:
+            self.write_uint8(0xfc)
+            self.write_uint16(val)
+        elif val < 16777216:
+            self.write_uint8(0xfd)
+            self.write_uint24(val)
+        else:
+            self.write_uint8(0xfe)
+            self.write_uint32(val & 0xffffffff)
+            self.write_uint32((val >> 32) & 0xffffffff)
+
+    def write_str(self, s: str) -> None:
+        for i in range(len(s)):
+            self.buffer.append(byte(ord(s[i])))
+
+    def write_null_terminated_str(self, s: str) -> None:
+        self.write_str(s)
+        self.write_uint8(0)
+
+    def write_length_encoded_str(self, s: str) -> None:
+        self.write_length_encoded_int(len(s))
+        self.write_str(s)
+
+    def write_bytes(self, b: List[byte]) -> None:
+        for x in b:
+            self.buffer.append(x)
+
+    def send_to_socket(self, fd: i32, seq_id: int) -> bool:
+        pay_len = len(self.buffer)
+        total_len = 4 + pay_len
+        raw = Ptr[byte](total_len)
+
+        # 4-byte header: 3 bytes length + 1 byte seq_id
+        raw[0] = byte(pay_len & 0xff)
+        raw[1] = byte((pay_len >> 8) & 0xff)
+        raw[2] = byte((pay_len >> 16) & 0xff)
+        raw[3] = byte(seq_id & 0xff)
+
+        for i in range(pay_len):
+            raw[4 + i] = self.buffer[i]
+
+        sent = 0
+        while sent < total_len:
+            ret = c_send(fd, raw + sent, total_len - sent, i32(0))
+            if ret < 0:
+                err = get_errno()
+                if err == 4: # EINTR
+                    continue
+                return False
+            sent += ret
+        return True
+
+    def build_packet(self, seq_id: int) -> str:
+        """Constructs a framed 4-byte header + payload string ready for async transmission."""
+        pay_len = len(self.buffer)
+        total_len = 4 + pay_len
+        raw = Ptr[byte](total_len)
+
+        raw[0] = byte(pay_len & 0xff)
+        raw[1] = byte((pay_len >> 8) & 0xff)
+        raw[2] = byte((pay_len >> 16) & 0xff)
+        raw[3] = byte(seq_id & 0xff)
+
+        for i in range(pay_len):
+            raw[4 + i] = self.buffer[i]
+
+        return str(raw, total_len)
+

@@ -1,0 +1,24 @@
+from src.db.drivers.mysql.connection import MySQLConnection, MySQLCursor
+from src.db.drivers.mysql.async_connection import connect_async, AsyncMySQLConnection, AsyncMySQLCursor
+from src.db.drivers.mysql.constants import *
+
+def connect(
+    host: str = "127.0.0.1",
+    port: int = 3306,
+    user: str = "root",
+    password: str = "",
+    database: str = "",
+    charset: str = "utf8mb4",
+    autocommit: bool = True,
+    connect_timeout: int = 10
+) -> MySQLConnection:
+    return MySQLConnection(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        charset=charset,
+        autocommit=autocommit,
+        connect_timeout=connect_timeout
+    )

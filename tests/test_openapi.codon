@@ -1,0 +1,77 @@
+from src.framework.openapi import OpenAPIGenerator, RouteMeta, _clean_openapi_path
+from src.http.schema import Schema
+
+def test_openapi():
+    # 1. Path cleaning
+    p1, params1 = _clean_openapi_path("/users/{id:int}/profile")
+    assert p1 == "/users/{id}/profile"
+    assert len(params1) == 1
+    assert params1[0][0] == "id"
+    assert params1[0][1] == "integer"
+
+    p2, params2 = _clean_openapi_path("/static/*")
+    assert p2 == "/static/{wildcard}"
+    assert len(params2) == 1
+    assert params2[0][0] == "wildcard"
+
+    # 2. Generator spec JSON
+    gen = OpenAPIGenerator(title="Test Shop API", version="1.2.0")
+
+    user_schema = Schema()
+    user_schema.field_str("username", min_len=3, max_len=20)
+    user_schema.field_int("age", min_val=18)
+    user_schema.field_float("balance", min_val=0.0)
+    user_schema.field_bool("is_verified")
+
+    gen.add_route(RouteMeta(
+        path="/users/{id:int}",
+        method="get",
+        summary="Get user",
+        description="Retrieve user by ID",
+        tags=["Users"],
+        status_code=200
+    ))
+
+    gen.add_route(RouteMeta(
+        path="/users",
+        method="post",
+        summary="Create user",
+        tags=["Users"],
+        status_code=201,
+        has_schema=True,
+        schema=user_schema
+    ))
+
+    spec = gen.generate_json()
+    assert "\"openapi\":\"3.0.2\"" in spec
+    assert "\"title\":\"Test Shop API\"" in spec
+    assert "\"version\":\"1.2.0\"" in spec
+    assert "\"/users/{id}\"" in spec
+    assert "\"in\":\"path\"" in spec
+    assert "\"type\":\"integer\"" in spec
+    assert "\"/users\"" in spec
+    assert "\"requestBody\"" in spec
+    assert "\"username\"" in spec
+    assert "\"balance\"" in spec
+    assert "\"type\":\"number\"" in spec
+    assert "\"is_verified\"" in spec
+    assert "\"type\":\"boolean\"" in spec
+
+    # 3. Swagger UI HTML
+    swagger_html = gen.generate_swagger_ui_html("/openapi.json")
+    assert "SwaggerUIBundle" in swagger_html
+    assert "/openapi.json" in swagger_html
+    assert "Test Shop API - Swagger UI" in swagger_html
+
+    # 4. ReDoc HTML
+    redoc_html = gen.generate_redoc_html("/openapi.json")
+    assert "redoc" in redoc_html
+    assert "/openapi.json" in redoc_html
+
+    print("[PASS] test_openapi")
+
+def run():
+    test_openapi()
+
+if __name__ == "__main__":
+    run()

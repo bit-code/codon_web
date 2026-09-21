@@ -1,0 +1,4 @@
+from src.db.drivers.sqlite.connection import SQLiteConnection, SQLiteCursor
+
+def connect(database: str = ":memory:") -> SQLiteConnection:
+    return SQLiteConnection(database)

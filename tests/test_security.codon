@@ -1,0 +1,122 @@
+from src.http.request import Request
+from src.framework.security import (
+    HTTPBearer, HTTPBasic, APIKeyHeader, APIKeyQuery, APIKeyCookie,
+    _base64_decode
+)
+from src.http.exceptions import UnauthorizedException, ForbiddenException
+from src.framework.openapi import OpenAPIGenerator, RouteMeta
+
+def test_base64_decode():
+    # "Aladdin:open sesame" in base64 is "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+    dec = _base64_decode("QWxhZGRpbjpvcGVuIHNlc2FtZQ==")
+    assert dec == "Aladdin:open sesame"
+    print("[PASS] test_base64_decode")
+
+def test_http_bearer():
+    bearer = HTTPBearer()
+
+    # 1. Valid bearer token
+    req = Request()
+    req.headers.set("Authorization", "Bearer secret_jwt_token_123")
+    token = bearer(req)
+    assert token == "secret_jwt_token_123"
+    assert req.get_state("auth_token") == "secret_jwt_token_123"
+
+    # 2. Missing token -> 401 Unauthorized
+    req_unauth = Request()
+    threw_unauth = False
+    try:
+        bearer(req_unauth)
+    except UnauthorizedException as e:
+        threw_unauth = True
+        assert e.status_code == 401
+        assert len(e.headers) > 0
+        assert e.headers[0][0] == "WWW-Authenticate"
+        assert e.headers[0][1] == "Bearer"
+    assert threw_unauth
+    print("[PASS] test_http_bearer")
+
+def test_api_key_security():
+    api_header = APIKeyHeader(name="X-API-Key")
+    api_query = APIKeyQuery(name="key")
+    api_cookie = APIKeyCookie(name="session_key")
+
+    # Header valid
+    req1 = Request()
+    req1.headers.set("X-API-Key", "my_secret_key")
+    assert api_header(req1) == "my_secret_key"
+
+    # Header missing -> 403 Forbidden
+    threw_403 = False
+    try:
+        api_header(Request())
+    except ForbiddenException as e:
+        threw_403 = True
+        assert e.status_code == 403
+    assert threw_403
+
+    # Query valid
+    req2 = Request()
+    req2.query_params["key"] = "query_secret"
+    req2.parsed_query = True
+    assert api_query(req2) == "query_secret"
+
+    # Cookie valid
+    req3 = Request()
+    req3.cookies["session_key"] = "cookie_secret"
+    req3.parsed_cookies = True
+    assert api_cookie(req3) == "cookie_secret"
+
+    print("[PASS] test_api_key_security")
+
+def test_http_basic():
+    basic = HTTPBasic()
+
+    req = Request()
+    req.headers.set("Authorization", "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==")
+    creds = basic(req)
+    assert creds.username == "Aladdin"
+    assert creds.password == "open sesame"
+    assert req.get_state("auth_user") == "Aladdin"
+
+    # Missing basic -> 401
+    threw_unauth = False
+    try:
+        basic(Request())
+    except UnauthorizedException as e:
+        threw_unauth = True
+        assert e.status_code == 401
+    assert threw_unauth
+
+    print("[PASS] test_http_basic")
+
+def test_security_openapi_integration():
+    gen = OpenAPIGenerator(title="Auth API", version="1.0.0")
+    bearer = HTTPBearer()
+    gen.add_security_scheme(bearer.get_security_scheme())
+
+    meta = RouteMeta(
+        path="/secure/profile",
+        method="get",
+        summary="Protected profile",
+        security_schemes=["HTTPBearer"]
+    )
+    gen.add_route(meta)
+
+    spec = gen.generate_json()
+    assert "\"securitySchemes\"" in spec
+    assert "\"HTTPBearer\"" in spec
+    assert "\"bearerFormat\":\"JWT\"" in spec
+    assert "\"security\":[{\"HTTPBearer\":[]}]" in spec
+    assert "\"401\"" in spec
+    print("[PASS] test_security_openapi_integration")
+
+def run():
+    test_base64_decode()
+    test_http_bearer()
+    test_api_key_security()
+    test_http_basic()
+    test_security_openapi_integration()
+
+if __name__ == "__main__":
+    run()

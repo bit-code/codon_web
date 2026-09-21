@@ -1,0 +1,62 @@
+from src.memory.slice import ByteSlice
+from src.memory.buffer import ByteBuffer
+from src.http.method import HttpMethod, METHOD_GET, METHOD_POST
+from src.http.request import Request
+from src.http.parser import HttpParser, PARSE_OK, PARSE_NEED_MORE, PARSE_ERROR
+
+parser = HttpParser()
+req = Request()
+
+# 1. Test Simple GET
+buf1 = ByteBuffer(1024)
+buf1.append_str("GET /index.html HTTP/1.1\r\nHost: localhost\r\nUser-Agent: Codon\r\n\r\n")
+
+res, consumed = parser.parse(buf1.readable_slice(), req)
+assert res == PARSE_OK
+assert req.method == METHOD_GET
+assert req.path.equals_ascii("/index.html")
+assert req.headers.get("host").equals_ascii("localhost")
+assert req.headers.get("user-agent").equals_ascii("Codon")
+assert req.keep_alive == True
+print("Test 1 (Simple GET): PASSED, consumed:", consumed)
+
+# 2. Test GET with query string
+req.reset()
+buf2 = ByteBuffer(1024)
+buf2.append_str("GET /users/search?name=alice&role=admin HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+res, consumed = parser.parse(buf2.readable_slice(), req)
+assert res == PARSE_OK
+assert req.path.equals_ascii("/users/search")
+assert req.query.equals_ascii("name=alice&role=admin")
+assert req.keep_alive == False
+print("Test 2 (GET with query & Connection: close): PASSED")
+
+# 3. Test POST with Body
+req.reset()
+buf3 = ByteBuffer(1024)
+payload = "{\"name\":\"codon\",\"version\":1}"
+buf3.append_str("POST /api/data HTTP/1.1\r\nHost: test\r\nContent-Length: " + str(len(payload)) + "\r\n\r\n" + payload)
+res, consumed = parser.parse(buf3.readable_slice(), req)
+assert res == PARSE_OK
+assert req.method == METHOD_POST
+assert req.path.equals_ascii("/api/data")
+assert req.body.equals_ascii(payload)
+print("Test 3 (POST with Body): PASSED")
+
+# 4. Test Incomplete Request (Partial Recv)
+req.reset()
+buf4 = ByteBuffer(1024)
+buf4.append_str("GET /inc")
+res, consumed = parser.parse(buf4.readable_slice(), req)
+assert res == PARSE_NEED_MORE
+print("Test 4 (Incomplete Header -> NEED_MORE): PASSED")
+
+# 5. Test Incomplete Body
+req.reset()
+buf5 = ByteBuffer(1024)
+buf5.append_str("POST /test HTTP/1.1\r\nContent-Length: 20\r\n\r\nPartial...")
+res, consumed = parser.parse(buf5.readable_slice(), req)
+assert res == PARSE_NEED_MORE
+print("Test 5 (Incomplete Body -> NEED_MORE): PASSED")
+
+print("All HTTP Parser tests PASSED successfully!")

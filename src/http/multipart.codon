@@ -1,0 +1,125 @@
+# Native Zero-Dependency Multipart Form Data & File Upload Parser
+
+class UploadedFile:
+    filename: str
+    content_type: str
+    data: str
+    size: int
+
+    def __init__(self, filename: str, content_type: str = "application/octet-stream", data: str = ""):
+        self.filename = filename
+        self.content_type = content_type
+        self.data = data
+        self.size = len(data)
+
+    def save(self, filepath: str) -> None:
+        with open(filepath, "w") as f:
+            f.write(self.data)
+
+class MultipartFormData:
+    fields: dict[str, str]
+    files: dict[str, UploadedFile]
+    multi_files: dict[str, list[UploadedFile]]
+
+    def __init__(self):
+        self.fields = {}
+        self.files = {}
+        self.multi_files = {}
+
+    def get_field(self, name: str, default_val: str = "") -> str:
+        if name in self.fields:
+            return self.fields[name]
+        return default_val
+
+    def get_file(self, name: str) -> Optional[UploadedFile]:
+        if name in self.files:
+            return self.files[name]
+        return None
+
+    def get_files(self, name: str) -> list[UploadedFile]:
+        if name in self.multi_files:
+            return self.multi_files[name]
+        return []
+
+def parse_multipart_form_data(body: str, boundary: str) -> MultipartFormData:
+    result = MultipartFormData()
+    if len(boundary) == 0 or len(body) == 0:
+        return result
+
+    delimiter = "--" + boundary
+    parts = body.split(delimiter)
+
+    for i in range(len(parts)):
+        part = parts[i]
+        # Skip empty parts or closing boundary markers
+        trimmed = part.strip()
+        if len(trimmed) == 0 or trimmed == "--":
+            continue
+
+        # Strip leading CRLF if present
+        if part.startswith("\r\n"):
+            part = part[2:]
+        elif part.startswith("\n"):
+            part = part[1:]
+
+        # Strip trailing CRLF if present
+        if part.endswith("\r\n"):
+            part = part[:-2]
+        elif part.endswith("\n"):
+            part = part[:-1]
+
+        # Separate headers and content
+        sep_idx = part.find("\r\n\r\n")
+        sep_len = 4
+        if sep_idx < 0:
+            sep_idx = part.find("\n\n")
+            sep_len = 2
+
+        if sep_idx < 0:
+            continue
+
+        raw_headers = part[:sep_idx]
+        part_content = part[sep_idx + sep_len:]
+
+        # Parse headers line by line
+        lines = raw_headers.split("\r\n") if "\r\n" in raw_headers else raw_headers.split("\n")
+        field_name = ""
+        filename = ""
+        content_type = "text/plain"
+
+        for j in range(len(lines)):
+            line = lines[j]
+            colon = line.find(":")
+            if colon < 0:
+                continue
+            h_name = line[:colon].strip().lower()
+            h_val = line[colon + 1:].strip()
+
+            if h_name == "content-disposition":
+                sub_parts = h_val.split(";")
+                for k in range(len(sub_parts)):
+                    sp = sub_parts[k].strip()
+                    if sp.startswith("name="):
+                        val = sp[5:].strip()
+                        if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+                            val = val[1:-1]
+                        field_name = val
+                    elif sp.startswith("filename="):
+                        val = sp[9:].strip()
+                        if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+                            val = val[1:-1]
+                        filename = val
+            elif h_name == "content-type":
+                content_type = h_val
+
+        if len(field_name) > 0:
+            if len(filename) > 0:
+                up_file = UploadedFile(filename, content_type, part_content)
+                result.files[field_name] = up_file
+                if field_name not in result.multi_files:
+                    result.multi_files[field_name] = []
+                result.multi_files[field_name].append(up_file)
+            else:
+                result.fields[field_name] = part_content
+
+    return result

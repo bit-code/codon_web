@@ -1,0 +1,75 @@
+from src.http.request import Request
+from src.http.response import Response
+from src.http.exceptions import (
+    HTTPException, BadRequestException, UnauthorizedException,
+    ForbiddenException, NotFoundException, UnprocessableEntityException
+)
+from src.framework.route import RouteHandler
+from src.framework.middleware import RecoveryMiddleware
+
+class MockExplodingHandler(RouteHandler):
+    mode: int
+    def __init__(self, mode: int):
+        self.mode = mode
+
+    def handle(self, req: Request) -> Response:
+        if self.mode == 1:
+            raise UnauthorizedException("Invalid bearer token", headers=[("WWW-Authenticate", "Bearer")])
+        elif self.mode == 2:
+            raise NotFoundException("User record not found")
+        elif self.mode == 3:
+            raise UnprocessableEntityException("Invalid age constraint")
+        elif self.mode == 4:
+            raise ValueError("Zero division arithmetic error")
+        return Response.text("OK", 200)
+
+def test_http_exceptions():
+    recovery = RecoveryMiddleware()
+    req = Request()
+
+    # 1. Test 401 Unauthorized with custom header
+    h401 = MockExplodingHandler(1)
+    resp401 = recovery.handle(req, h401)
+    assert resp401.status_code == 401
+    assert "Unauthorized" in resp401.body
+    assert "Invalid bearer token" in resp401.body
+    found_auth_header = False
+    for i in range(len(resp401.custom_headers)):
+        k, v = resp401.custom_headers[i]
+        if k == "WWW-Authenticate" and v == "Bearer":
+            found_auth_header = True
+    assert found_auth_header
+
+    # 2. Test 404 Not Found
+    h404 = MockExplodingHandler(2)
+    resp404 = recovery.handle(req, h404)
+    assert resp404.status_code == 404
+    assert "Not Found" in resp404.body
+    assert "User record not found" in resp404.body
+
+    # 3. Test 422 Unprocessable Entity
+    h422 = MockExplodingHandler(3)
+    resp422 = recovery.handle(req, h422)
+    assert resp422.status_code == 422
+    assert "Unprocessable Entity" in resp422.body
+
+    # 4. Test standard unexpected panic (500)
+    h500 = MockExplodingHandler(4)
+    resp500 = recovery.handle(req, h500)
+    assert resp500.status_code == 500
+    assert "Internal Server Error" in resp500.body
+    assert "Zero division arithmetic error" in resp500.body
+
+    # 5. Test Normal pass-through (200)
+    h200 = MockExplodingHandler(0)
+    resp200 = recovery.handle(req, h200)
+    assert resp200.status_code == 200
+    assert resp200.body == "OK"
+
+    print("[PASS] test_http_exceptions")
+
+def run():
+    test_http_exceptions()
+
+if __name__ == "__main__":
+    run()

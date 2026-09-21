@@ -1,0 +1,80 @@
+import time
+from src.core.async import (
+    run,
+    sleep,
+    create_task,
+    open_connection,
+    get_event_loop
+)
+from src.os.socket import Socket
+
+async def dummy_worker(n: int):
+    await sleep(0.01)
+    return n * 10
+
+async def echo_server_handler(server_sock: Socket):
+    # Accept client
+    client_fd, _, _ = server_sock.accept_nonblocking()
+    while client_fd < 0:
+        await sleep(0.005)
+        client_fd, _, _ = server_sock.accept_nonblocking()
+
+    conn = Socket(client_fd)
+    conn.set_nonblocking()
+    
+    # Read incoming message
+    raw = conn.recv_str(1024)
+    while len(raw) == 0:
+        await sleep(0.005)
+        raw = conn.recv_str(1024)
+
+    # Echo back
+    conn.send_str("ECHO:" + raw)
+    conn.close()
+
+async def test_async_streams():
+    # 1. Start a simple loopback server socket
+    server = Socket.create_tcp()
+    server.set_reuse_addr(True)
+    server.bind("127.0.0.1", 19998)
+    server.listen(128)
+
+    # Schedule server handler
+    create_task(echo_server_handler(server))
+
+    # 2. Client connects via open_connection
+    reader, writer = await open_connection("127.0.0.1", 19998)
+
+    # 3. Client writes data
+    await writer.write("CodonRocks")
+
+    # 4. Client reads echo response
+    reply = await reader.read(1024)
+    assert reply == "ECHO:CodonRocks", f"Expected ECHO:CodonRocks, got {reply}"
+    print("[PASS] test_async_streams: Echo received correctly ->", reply)
+
+    writer.close()
+    server.close()
+
+async def main():
+    print("=== Testing Core Async Ecosystem ===")
+    
+    # Test 1: Coroutine concurrency
+    t1 = create_task(dummy_worker(5))
+    t2 = create_task(dummy_worker(8))
+    r1 = await t1
+    r2 = await t2
+    assert r1 == 50, f"Expected 50, got {r1}"
+    assert r2 == 80, f"Expected 80, got {r2}"
+    print("[PASS] test_coroutine_tasks: Concurrent tasks succeeded ->", r1, r2)
+
+    # Test 2: Full TCP Async Streams with Epoll
+    await test_async_streams()
+    print("=== All Core Async Tests Passed! ===")
+
+def run():
+    from src.core.async import run as aio_run
+    aio_run(main())
+
+if __name__ == "__main__":
+    run()

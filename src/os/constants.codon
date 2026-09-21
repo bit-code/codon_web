@@ -1,0 +1,44 @@
+# POSIX and Linux constants for x86-64
+# All integer constants used in system calls must be typed appropriately.
+
+# Socket Domains
+AF_INET: i32 = i32(2)
+
+# Socket Types & Flags
+SOCK_STREAM: i32 = i32(1)
+SOCK_NONBLOCK: i32 = i32(2048)        # 0x800 (octal 00004000)
+SOCK_CLOEXEC: i32 = i32(524288)       # 0x80000 (octal 02000000)
+
+# Socket Options
+SOL_SOCKET: i32 = i32(1)
+SO_REUSEADDR: i32 = i32(2)
+SO_REUSEPORT: i32 = i32(15)
+IPPROTO_TCP: i32 = i32(6)
+TCP_NODELAY: i32 = i32(1)
+
+# File Control Flags
+F_GETFL: i32 = i32(3)
+F_SETFL: i32 = i32(4)
+O_NONBLOCK: i32 = i32(2048)
+
+# Epoll Events (u32 bitmask)
+EPOLLIN: u32 = u32(1)          # 0x0001
+EPOLLPRI: u32 = u32(2)         # 0x0002
+EPOLLOUT: u32 = u32(4)         # 0x0004
+EPOLLERR: u32 = u32(8)         # 0x0008
+EPOLLHUP: u32 = u32(16)        # 0x0010
+EPOLLRDHUP: u32 = u32(8192)    # 0x2000
+EPOLLET: u32 = u32(2147483648) # 0x80000000 (1 << 31)
+
+# Epoll Operations
+EPOLL_CTL_ADD: i32 = i32(1)
+EPOLL_CTL_DEL: i32 = i32(2)
+EPOLL_CTL_MOD: i32 = i32(3)
+
+# Common Errno Values (Linux x86-64)
+EINTR: i32 = i32(4)
+EAGAIN: i32 = i32(11)
+EWOULDBLOCK: i32 = i32(11)
+EPIPE: i32 = i32(32)
+ECONNRESET: i32 = i32(104)
+EINPROGRESS: i32 = i32(115)

@@ -1,0 +1,63 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C / C++ Object and Library Files
+*.o
+*.obj
+*.so
+*.so.*
+*.dylib
+*.dll
+*.a
+*.lib
+
+# Codon / Binary Executables
+*.exe
+*.out
+bench_mysql_server
+examples/bench_mysql_server
+test_json
+test_fast_json_integration
+test_req
+test_tc
+test_run_all
+tests/test_fast_json_integration
+tests/test_request_ext
+tests/test_testclient
+tests/test_json
+
+# Build and Packaging Directories
+build/
+dist/
+*.egg-info/
+.codon/
+
+# Environments and Virtualenvs
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs, Profiling, and Temporary Files
+*.log
+*.tmp
+gmon.out
+perf.data
+perf.data.old

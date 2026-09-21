@@ -1,0 +1,104 @@
+from C import strlen(cobj) -> int, memcpy(cobj, cobj, int) -> cobj
+from src.memory.slice import ByteSlice
+
+class ByteBuffer:
+    ptr: Ptr[byte]
+    capacity: int
+    read_pos: int
+    write_pos: int
+
+    def __init__(self, initial_capacity: int = 4096):
+        cap = initial_capacity if initial_capacity >= 1024 else 1024
+        self.capacity = cap
+        self.ptr = Ptr[byte](cap)
+        self.read_pos = 0
+        self.write_pos = 0
+
+    def readable_bytes(self) -> int:
+        return self.write_pos - self.read_pos
+
+    def writable_bytes(self) -> int:
+        return self.capacity - self.write_pos
+
+    def readable_slice(self) -> ByteSlice:
+        rlen = self.readable_bytes()
+        if rlen <= 0:
+            return ByteSlice(Ptr[byte](0), 0)
+        return ByteSlice(self.ptr + self.read_pos, rlen)
+
+    def write_ptr(self) -> Ptr[byte]:
+        return self.ptr + self.write_pos
+
+    def advance_write(self, count: int) -> None:
+        self.write_pos += count
+        if self.write_pos > self.capacity:
+            self.write_pos = self.capacity
+
+    def consume(self, count: int) -> None:
+        self.read_pos += count
+        if self.read_pos >= self.write_pos:
+            self.read_pos = 0
+            self.write_pos = 0
+
+    def compact(self) -> None:
+        rlen = self.readable_bytes()
+        if self.read_pos == 0 or rlen == 0:
+            if rlen == 0:
+                self.read_pos = 0
+                self.write_pos = 0
+            return
+        # Move readable bytes to front
+        for i in range(rlen):
+            self.ptr[i] = self.ptr[self.read_pos + i]
+        self.read_pos = 0
+        self.write_pos = rlen
+
+    def ensure_writable(self, needed: int) -> None:
+        if self.writable_bytes() >= needed:
+            return
+        # If compacting gives enough space, do compact
+        if (self.capacity - self.readable_bytes()) >= needed:
+            self.compact()
+            return
+        # Otherwise expand capacity
+        new_cap = self.capacity * 2
+        while (new_cap - self.readable_bytes()) < needed:
+            new_cap *= 2
+        new_ptr = Ptr[byte](new_cap)
+        rlen = self.readable_bytes()
+        for i in range(rlen):
+            new_ptr[i] = self.ptr[self.read_pos + i]
+        self.ptr = new_ptr
+        self.capacity = new_cap
+        self.read_pos = 0
+        self.write_pos = rlen
+
+    def append_byte(self, b: byte) -> None:
+        self.ensure_writable(1)
+        self.ptr[self.write_pos] = b
+        self.write_pos += 1
+
+    def append_str(self, s: str) -> None:
+        c_str = s.c_str()
+        slen = strlen(c_str.as_byte())
+        if slen == 0:
+            return
+        self.ensure_writable(slen)
+        memcpy((self.ptr + self.write_pos).as_byte(), c_str.as_byte(), slen)
+        self.write_pos += slen
+
+    def append_slice(self, s: ByteSlice) -> None:
+        if s.len == 0:
+            return
+        self.ensure_writable(s.len)
+        for i in range(s.len):
+            self.ptr[self.write_pos + i] = s.ptr[i]
+        self.write_pos += s.len
+
+    def reset(self) -> None:
+        self.read_pos = 0
+        self.write_pos = 0
+
+    def to_str(self) -> str:
+        return self.readable_slice().to_str()
+

@@ -1,0 +1,74 @@
+# Unit Test for HTTPSRedirectMiddleware & SignedCookieSessionMiddleware
+
+from codon_web import (
+    App, Request, Response, TestClient,
+    HTTPSRedirectMiddleware, SignedCookieSessionMiddleware
+)
+
+print("=== 1. Testing HTTPSRedirectMiddleware ===")
+app_https = App()
+app_https.use(HTTPSRedirectMiddleware())
+
+@app_https.get("/secure")
+def secure_endpoint(req: Request) -> Response:
+    return Response.text("Secret Data")
+
+client_https = TestClient(app_https)
+
+# HTTP forwarded request -> 307 Temporary Redirect to https://
+headers_http = dict[str, str]()
+headers_http["X-Forwarded-Proto"] = "http"
+headers_http["Host"] = "api.example.com"
+r_redir = client_https.get("/secure?key=1", headers=headers_http)
+assert r_redir.status_code == 307, "Expected 307 Redirect, got: " + str(r_redir.status_code)
+assert r_redir.header("location") == "https://api.example.com/secure?key=1", "Location header mismatch: " + r_redir.header("location")
+print("[PASS] HTTP request successfully redirected to HTTPS!")
+
+# HTTPS forwarded request -> 200 OK
+headers_https = dict[str, str]()
+headers_https["X-Forwarded-Proto"] = "https"
+r_ok = client_https.get("/secure", headers=headers_https)
+assert r_ok.status_code == 200
+assert r_ok.text == "Secret Data"
+print("[PASS] HTTPS request passed through cleanly!")
+
+print("\n=== 2. Testing SignedCookieSessionMiddleware ===")
+app_sess = App()
+app_sess.use(SignedCookieSessionMiddleware(secret_key="production_secret_key_12345"))
+
+@app_sess.get("/login")
+def login(req: Request) -> Response:
+    req.set_state("session", "user_id=10086")
+    return Response.text("Logged in")
+
+@app_sess.get("/dashboard")
+def dashboard(req: Request) -> Response:
+    sess = req.get_state("session")
+    return Response.text("Dashboard: " + sess)
+
+client_sess = TestClient(app_sess)
+
+# Login request writes signed cookie
+r_login = client_sess.get("/login")
+assert r_login.status_code == 200
+sess_cookie = r_login.cookie("session")
+assert len(sess_cookie) > 0, "Missing session cookie"
+assert sess_cookie.startswith("user_id=10086."), "Session cookie lacks signature: " + sess_cookie
+print("[PASS] Signed cookie generated with signature: " + sess_cookie)
+
+# Dashboard request automatically transmits signed cookie
+r_dash = client_sess.get("/dashboard")
+assert r_dash.status_code == 200
+assert r_dash.text == "Dashboard: user_id=10086", "Session not loaded: " + r_dash.text
+print("[PASS] Verified signed cookie authenticated session successfully!")
+
+# Tampered cookie attack test: modify user_id to 99999
+tampered_cookies = dict[str, str]()
+tampered_cookies["session"] = "user_id=99999.invalid_signature"
+r_tampered = client_sess.get("/dashboard", cookies=tampered_cookies)
+assert r_tampered.status_code == 200
+# Tampered signature must be rejected and session emptied
+assert r_tampered.text == "Dashboard: ", "Tampered session was improperly accepted!"
+print("[PASS] Tampered session signature successfully rejected!")
+
+print("\n>>> ALL ADVANCED MIDDLEWARE TESTS PASSED! <<<")

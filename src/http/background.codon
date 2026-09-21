@@ -1,0 +1,27 @@
+# Post-Response Background Task Executor for CodonWeb
+
+from typing import Callable
+
+class BackgroundTasks:
+    tasks: list[Callable[[], None]]
+
+    def __init__(self):
+        self.tasks = []
+
+    def add_task(self, task: Callable[[], None]) -> None:
+        self.tasks.append(task)
+
+    def run_all(self) -> None:
+        for i in range(len(self.tasks)):
+            try:
+                task = self.tasks[i]
+                task()
+            except Exception as e:
+                print("[BACKGROUND ERROR] Task execution error: " + str(e))
+        self.tasks.clear()
+
+    def clear(self) -> None:
+        self.tasks.clear()
+
+    def __len__(self) -> int:
+        return len(self.tasks)

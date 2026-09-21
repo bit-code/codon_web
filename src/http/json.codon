@@ -1,0 +1,71 @@
+# Native Lightweight JSON Parser & Serializer
+# High performance, zero external dependencies, designed for Codon.
+
+class Json:
+    @staticmethod
+    def parse_object(raw: str) -> dict[str, str]:
+        # Fast scanner for simple JSON object {"key": "val" or 123 or true}
+        res: dict[str, str] = {}
+        s = raw.strip()
+        if len(s) < 2 or not s.startswith("{") or not s.endswith("}"):
+            return res
+
+        i = 1
+        n = len(s) - 1
+        while i < n:
+            # Skip spaces and commas
+            while i < n and (s[i] == ' ' or s[i] == '\t' or s[i] == '\r' or s[i] == '\n' or s[i] == ','):
+                i += 1
+            if i >= n:
+                break
+
+            # Expect key enclosed in quotes
+            if s[i] != '"':
+                break
+            i += 1
+            k_start = i
+            while i < n and s[i] != '"':
+                i += 1
+            key = s[k_start:i]
+            if i < n:
+                i += 1 # skip ending quote
+
+            # Skip spaces to ':'
+            while i < n and (s[i] == ' ' or s[i] == '\t'):
+                i += 1
+            if i >= n or s[i] != ':':
+                break
+            i += 1 # skip ':'
+
+            # Skip spaces after ':'
+            while i < n and (s[i] == ' ' or s[i] == '\t'):
+                i += 1
+            if i >= n:
+                break
+
+            # Parse value
+            if s[i] == '"':
+                i += 1
+                v_start = i
+                while i < n and s[i] != '"':
+                    i += 1
+                val = s[v_start:i]
+                if i < n:
+                    i += 1
+                res[key] = val
+            else:
+                # Number, boolean, null
+                v_start = i
+                while i < n and s[i] != ',' and s[i] != '}' and s[i] != ' ' and s[i] != '\t' and s[i] != '\r' and s[i] != '\n':
+                    i += 1
+                val = s[v_start:i]
+                res[key] = val
+
+        return res
+
+    @staticmethod
+    def dumps(d: dict[str, str]) -> str:
+        parts: list[str] = []
+        for k, v in d.items():
+            parts.append("\"" + k + "\":\"" + v + "\"")
+        return "{" + ", ".join(parts) + "}"

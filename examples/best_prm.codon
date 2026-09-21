@@ -1,0 +1,97 @@
+import time
+import math
+from C import omp_get_thread_num() -> int
+
+@llvm
+def popcnt64(x: int) -> int:
+    declare i64 @llvm.ctpop.i64(i64)
+    %0 = call i64 @llvm.ctpop.i64(i64 %x)
+    ret i64 %0
+
+def sieve_bitset_ptr(n: int, threads: int) -> tuple[int, float]:
+    t0 = time.time()
+    if n < 2: return 0, 0.0
+    if n == 2: return 1, 0.0
+
+    total_odds = (n - 1) // 2
+    limit = int(math.sqrt(float(n)))
+    limit_odds = (limit + 1) // 2
+    base_is_prime = bytearray(limit_odds)
+    base_primes = []
+
+    p = 3
+    while p <= limit:
+        if not base_is_prime[p // 2]:
+            base_primes.append(p)
+            j = p * p
+            while j <= limit:
+                base_is_prime[j // 2] = 1
+                j += 2 * p
+        p += 2
+
+    segment_odds = 262144
+    segment_words = 4096
+    num_segments = (total_odds + segment_odds - 1) // segment_odds
+    counts = [0] * num_segments
+
+    # Raw C pointers per thread: zero GC, zero bounds checking!
+    thread_ptrs = [Ptr[int](segment_words) for _ in range(threads)]
+
+    @par(num_threads=threads, schedule='dynamic')
+    for seg_idx in range(num_segments):
+        tid = omp_get_thread_num()
+        words = thread_ptrs[tid]
+
+        low_odd_idx = seg_idx * segment_odds
+        high_odd_idx = min(low_odd_idx + segment_odds, total_odds)
+        span_odds = high_odd_idx - low_odd_idx
+        if span_odds > 0:
+            low_val = 2 * low_odd_idx + 3
+            high_val = 2 * high_odd_idx + 3
+            words_len = (span_odds + 63) // 64
+
+            for i in range(words_len):
+                words[i] = 0
+
+            for p_val in base_primes:
+                start = p_val * p_val
+                if start < low_val:
+                    rem = low_val % p_val
+                    start = low_val if rem == 0 else low_val + (p_val - rem)
+                if start % 2 == 0:
+                    start += p_val
+
+                if start < high_val:
+                    offset = (start - low_val) // 2
+                    while offset < span_odds:
+                        words[offset >> 6] |= 1 << (offset & 63)
+                        offset += p_val
+
+            # Hardware POPCNT
+            comp = 0
+            for i in range(words_len):
+                comp += popcnt64(words[i])
+            counts[seg_idx] = span_odds - comp
+
+    total_primes = 1
+    for c in counts:
+        total_primes += c
+    t1 = time.time()
+    return total_primes, (t1 - t0) * 1000.0
+
+n = 100_000_000
+_ = sieve_bitset_ptr(100_000, 1)
+
+print("=== SOTA Codon Raw Pointer Bitset Sieve (Ptr[int] + POPCNT) ===")
+runs = 5
+base_t = 0.0
+for t in [1, 2, 4, 8, 16]:
+    tot = 0.0
+    c = 0
+    for _ in range(runs):
+        c, ms = sieve_bitset_ptr(n, t)
+        tot += ms
+    avg = tot / runs
+    if t == 1:
+        base_t = avg
+    print(f"Threads {t:2d}: {avg:6.3f} ms | 加速比: {base_t / avg:4.2f}x")

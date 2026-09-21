@@ -1,0 +1,324 @@
+import time
+from typing import Callable, Optional
+from src.os.constants import (
+    EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP, EPOLLET
+)
+from src.os.socket import Socket
+from src.runtime.epoll import Epoll, EpollEvent
+from src.runtime.connection import (
+    Connection,
+    STATE_ACCEPTED, STATE_READING_HEADERS, STATE_READING_BODY,
+    STATE_REQUEST_READY, STATE_PROCESSING, STATE_WRITING,
+    STATE_WRITE_PENDING, STATE_KEEP_ALIVE, STATE_CLOSING, STATE_CLOSED,
+    STATE_SUSPENDED
+)
+from src.runtime.async_context import AsyncContext, AsyncResumer
+from src.core.async.loop import EpollEventLoop, set_event_loop
+from src.http.request import Request
+from src.http.response import Response
+
+class RequestHandler:
+    def handle(self, req: Request) -> Response:
+        return Response.text("Not Found", 404)
+
+def _dummy_void_fn():
+    pass
+
+def _dummy_ctx_fn(ctx: AsyncContext):
+    pass
+
+class NativeTimer:
+    trigger_time: float
+    callback: Callable[[], None]
+    has_ctx: bool
+    ctx: AsyncContext
+    ctx_callback: Callable[[AsyncContext], None]
+    is_cancelled: bool
+
+    def __init__(
+        self,
+        trigger_time: float,
+        callback: Callable[[], None] = _dummy_void_fn,
+        has_ctx: bool = False,
+        ctx: AsyncContext = AsyncContext(i32(-1)),
+        ctx_callback: Callable[[AsyncContext], None] = _dummy_ctx_fn
+    ):
+        self.trigger_time = trigger_time
+        self.callback = callback
+        self.has_ctx = has_ctx
+        self.ctx = ctx
+        self.ctx_callback = ctx_callback
+        self.is_cancelled = False
+
+    def cancel(self) -> None:
+        self.is_cancelled = True
+
+class EventLoop(AsyncResumer):
+    epoll: Epoll
+    aio_loop: EpollEventLoop
+    listen_socket: Socket
+    connections: dict[i32, Connection]
+    async_contexts: dict[i32, AsyncContext]
+    timers: list[NativeTimer]
+    handler: RequestHandler
+    is_running: bool
+    buffer_size: int
+    keep_alive_timeout_sec: float
+    last_reap_time: float
+
+    def __init__(
+        self,
+        listen_socket: Socket,
+        handler: RequestHandler,
+        max_events: int = 1024,
+        buffer_size: int = 4096,
+        keep_alive_timeout_sec: float = 15.0
+    ):
+        self.listen_socket = listen_socket
+        self.epoll = Epoll(max_events)
+        self.aio_loop = EpollEventLoop(epoll=self.epoll)
+        set_event_loop(self.aio_loop)
+        self.connections = {}
+        self.async_contexts = {}
+        self.timers = list[NativeTimer]()
+        self.handler = handler
+        self.is_running = False
+        self.buffer_size = buffer_size
+        self.keep_alive_timeout_sec = keep_alive_timeout_sec
+        self.last_reap_time = 0.0
+
+    def resume(self, fd: i32, resp: Response) -> bool:
+        return self.resume_connection(fd, resp)
+
+    def call_later(self, delay_sec: float, callback: Callable[[], None]) -> NativeTimer:
+        target = time.time() + delay_sec
+        timer = NativeTimer(target, callback=callback)
+        self.timers.append(timer)
+        return timer
+
+    def call_later_ctx(
+        self,
+        delay_sec: float,
+        ctx: AsyncContext,
+        callback: Callable[[AsyncContext], None]
+    ) -> NativeTimer:
+        target = time.time() + delay_sec
+        timer = NativeTimer(
+            target,
+            has_ctx=True,
+            ctx=ctx,
+            ctx_callback=callback
+        )
+        self.timers.append(timer)
+        return timer
+
+    def _process_timers(self, now: float) -> None:
+        if len(self.timers) == 0:
+            return
+        remaining = list[NativeTimer]()
+        ready = list[NativeTimer]()
+        for i in range(len(self.timers)):
+            t = self.timers[i]
+            if t.is_cancelled:
+                continue
+            if now >= t.trigger_time:
+                ready.append(t)
+            else:
+                remaining.append(t)
+        self.timers = remaining
+
+        for j in range(len(ready)):
+            t = ready[j]
+            if t.has_ctx:
+                c_fn = t.ctx_callback
+                c_fn(t.ctx)
+            else:
+                cb = t.callback
+                cb()
+
+    def reap_idle_connections(self, now: float) -> None:
+        to_close: list[i32] = []
+        for fd, conn in self.connections.items():
+            if not conn.is_suspended() and conn.is_idle_timeout(now, self.keep_alive_timeout_sec):
+                to_close.append(fd)
+        for i in range(len(to_close)):
+            self.close_connection(to_close[i])
+
+    def resume_connection(self, fd: i32, resp: Response) -> bool:
+        if fd not in self.connections:
+            return False
+
+        conn = self.connections[fd]
+        if not conn.is_suspended():
+            return False
+
+        if fd in self.async_contexts:
+            del self.async_contexts[fd]
+
+        conn.send_response(resp, self.epoll)
+
+        if conn.state == STATE_CLOSING:
+            self.close_connection(fd)
+        elif conn.state == STATE_REQUEST_READY:
+            self._process_connection_requests(fd, conn)
+
+        return True
+
+    def _process_connection_requests(self, fd: i32, conn: Connection) -> None:
+        while conn.state == STATE_REQUEST_READY:
+            conn.state = STATE_PROCESSING
+            base_r: AsyncResumer = self
+            conn.request.fd = fd
+            conn.request.async_resumer = base_r
+            conn.request.async_ctx = None
+
+            try:
+                resp = self.handler.handle(conn.request)
+            except Exception as e:
+                resp = Response.json("{\"error\":\"Internal Server Error\"}", 500)
+
+            if resp.is_deferred:
+                # Connection is asynchronously suspended!
+                ctx = conn.request.async_ctx
+                if ctx is not None:
+                    self.async_contexts[fd] = ctx
+                conn.mark_suspended()
+                break
+
+            # Synchronous response path: zero heap allocations, zero dict operations!
+            conn.send_response(resp, self.epoll)
+
+            if conn.state == STATE_CLOSING:
+                self.close_connection(fd)
+                break
+
+    def _calc_epoll_timeout(self, now: float) -> int:
+        if len(self.timers) == 0:
+            return 100
+        earliest = 1e18
+        has_active = False
+        for i in range(len(self.timers)):
+            t = self.timers[i]
+            if not t.is_cancelled:
+                if t.trigger_time < earliest:
+                    earliest = t.trigger_time
+                has_active = True
+        if not has_active:
+            return 100
+        diff = earliest - now
+        if diff <= 0.0:
+            return 0
+        ms = int(diff * 1000.0) + 1
+        if ms > 100:
+            return 100
+        return ms
+
+    def run(self) -> None:
+        self.epoll.add(self.listen_socket.fd, EPOLLIN | EPOLLET | EPOLLERR | EPOLLHUP)
+        self.is_running = True
+        self.last_reap_time = time.time()
+        tick_count = 0
+
+        while self.is_running:
+            timeout_ms = 100
+            if self.aio_loop.has_pending_tasks():
+                timeout_ms = 0
+            elif len(self.timers) > 0:
+                now = time.time()
+                timeout_ms = self._calc_epoll_timeout(now)
+
+            events = self.epoll.wait(timeout_ms)
+
+            # 1. Advance coroutine scheduler work queue
+            self.aio_loop.step()
+
+            # 2. Process active timers (zero overhead if empty)
+            if len(self.timers) > 0:
+                now = time.time()
+                self._process_timers(now)
+
+            # 3. Periodic idle connection reaper (check clock every 1024 ticks to eliminate syscall overhead)
+            tick_count += 1
+            if tick_count >= 1024:
+                tick_count = 0
+                now_for_reap = time.time()
+                if (now_for_reap - self.last_reap_time) > 5.0:
+                    self.last_reap_time = now_for_reap
+                    self.reap_idle_connections(now_for_reap)
+
+            # 4. Handle epoll I/O events
+            for i in range(len(events)):
+                ev = events[i]
+                fd = ev.fd
+                event_mask = ev.events
+
+                # Priority 0: Coroutine async network/driver I/O (MySQL, Redis, AsyncStream)
+                if self.aio_loop.has_fd_handler(int(fd)):
+                    self.aio_loop.handle_fd_event(int(fd), event_mask)
+                    self.aio_loop.step()
+                    continue
+
+                # Case 1: Listen socket ready -> Accept new connections
+                if fd == self.listen_socket.fd:
+                    self.accept_connections()
+                    continue
+
+                # Case 2: Socket error or hang up
+                if (event_mask & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != u32(0):
+                    self.close_connection(fd)
+                    continue
+
+                # Case 3: Read ready event
+                if (event_mask & EPOLLIN) != u32(0):
+                    if fd in self.connections:
+                        conn = self.connections[fd]
+                        if conn.is_suspended():
+                            # Connection is suspended waiting for async result; drain socket if peer closed
+                            continue
+                        state = conn.on_readable()
+                        self._process_connection_requests(fd, conn)
+
+                        if conn.state == STATE_CLOSING:
+                            self.close_connection(fd)
+
+                # Case 4: Write ready event (resumed from partial write EAGAIN)
+                if (event_mask & EPOLLOUT) != u32(0):
+                    if fd in self.connections:
+                        conn = self.connections[fd]
+                        if conn.state == STATE_WRITE_PENDING:
+                            conn.on_writable(self.epoll)
+                            if conn.state == STATE_CLOSING:
+                                self.close_connection(fd)
+
+            # 5. Step coroutines once more after I/O events
+            self.aio_loop.step()
+
+    def accept_connections(self) -> None:
+        while True:
+            client_fd, client_ip, client_port = self.listen_socket.accept_nonblocking()
+            if client_fd < i32(0):
+                break
+
+            try:
+                self.epoll.add(client_fd, EPOLLIN | EPOLLET | EPOLLRDHUP)
+                conn = Connection(client_fd, client_ip, client_port, self.buffer_size)
+                self.connections[client_fd] = conn
+            except Exception as e:
+                pass
+
+    def close_connection(self, fd: i32) -> None:
+        if fd in self.async_contexts:
+            ctx = self.async_contexts[fd]
+            ctx.abort()
+            del self.async_contexts[fd]
+        if fd in self.connections:
+            conn = self.connections[fd]
+            conn.close(self.epoll)
+            del self.connections[fd]
+
+    def stop(self) -> None:
+        self.is_running = False
+        for fd in list(self.connections.keys()):
+            self.close_connection(fd)
+        self.listen_socket.close()
+        self.epoll.close()

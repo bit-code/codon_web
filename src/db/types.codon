@@ -1,0 +1,155 @@
+# Database Driver Data Types and Row Abstraction
+from C import strlen(cobj) -> int
+
+def _append_escaped_json_str(sb: List[str], s: str):
+    c_str = s.c_str()
+    slen = strlen(c_str.as_byte())
+    has_special = False
+    for j in range(slen):
+        b = int(c_str[j])
+        if b == 34 or b == 92 or b == 10 or b == 13 or b == 9:
+            has_special = True
+            break
+
+    sb.append('"')
+    if not has_special:
+        sb.append(s)
+    else:
+        start_idx = 0
+        for j in range(slen):
+            b = int(c_str[j])
+            if b == 34 or b == 92 or b == 10 or b == 13 or b == 9:
+                if j > start_idx:
+                    sb.append(str(c_str + start_idx, j - start_idx))
+                if b == 34:
+                    sb.append('\\"')
+                elif b == 92:
+                    sb.append('\\\\')
+                elif b == 10:
+                    sb.append('\\n')
+                elif b == 13:
+                    sb.append('\\r')
+                elif b == 9:
+                    sb.append('\\t')
+                start_idx = j + 1
+        if slen > start_idx:
+            sb.append(str(c_str + start_idx, slen - start_idx))
+    sb.append('"')
+
+
+class FieldInfo:
+    name: str
+    table: str
+    column_type: int
+    flags: int
+    decimals: int
+
+    def __init__(
+        self,
+        name: str = "",
+        table: str = "",
+        column_type: int = 0,
+        flags: int = 0,
+        decimals: int = 0
+    ):
+        self.name = name
+        self.table = table
+        self.column_type = column_type
+        self.flags = flags
+        self.decimals = decimals
+
+    def __repr__(self) -> str:
+        return f"FieldInfo(name='{self.name}', table='{self.table}', type={self.column_type})"
+
+class Row:
+    field_names: List[str]
+    values: List[Optional[str]]
+    name_to_idx: Dict[str, int]
+
+    def __init__(self, field_names: List[str], values: List[Optional[str]]):
+        self.field_names = field_names
+        self.values = values
+        self.name_to_idx = Dict[str, int]()
+        for i in range(len(field_names)):
+            self.name_to_idx[field_names[i]] = i
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __getitem__(self, idx: int) -> Optional[str]:
+        if idx < 0 or idx >= len(self.values):
+            raise IndexError("Row index out of range: " + str(idx))
+        return self.values[idx]
+
+    def __getitem__(self, name: str) -> Optional[str]:
+        return self.get(name)
+
+    def get(self, name: str) -> Optional[str]:
+        if name not in self.name_to_idx:
+            raise KeyError("Column not found in row: " + name)
+        idx = self.name_to_idx[name]
+        return self.values[idx]
+
+    def is_null(self, idx: int) -> bool:
+        if idx < 0 or idx >= len(self.values):
+            raise IndexError("Row index out of range: " + str(idx))
+        return self.values[idx] is None
+
+    def get_str(self, idx: int, default_val: str = "") -> str:
+        v = self[idx]
+        if v is None:
+            return default_val
+        return v
+
+    def get_int(self, idx: int, default_val: int = 0) -> int:
+        v = self[idx]
+        if v is None:
+            return default_val
+        try:
+            return int(v)
+        except:
+            return default_val
+
+    def get_float(self, idx: int, default_val: float = 0.0) -> float:
+        v = self[idx]
+        if v is None:
+            return default_val
+        try:
+            return float(v)
+        except:
+            return default_val
+
+    def to_dict(self) -> Dict[str, str]:
+        res = Dict[str, str]()
+        for i in range(len(self.field_names)):
+            name = self.field_names[i]
+            val = self.values[i]
+            res[name] = val if val is not None else ""
+        return res
+
+    def to_json(self) -> str:
+        # High performance direct JSON serialization for Web APIs
+        sb = List[str]()
+        sb.append("{")
+        first = True
+        for i in range(len(self.field_names)):
+            if not first:
+                sb.append(",")
+            first = False
+            _append_escaped_json_str(sb, self.field_names[i])
+            sb.append(":")
+            val = self.values[i]
+            if val is None:
+                sb.append("null")
+            else:
+                _append_escaped_json_str(sb, val)
+        sb.append("}")
+        return "".join(sb)
+
+    def __repr__(self) -> str:
+        items = List[str]()
+        for i in range(len(self.field_names)):
+            v = self.values[i]
+            v_str = "None" if v is None else f"'{v}'"
+            items.append(f"{self.field_names[i]}={v_str}")
+        return f"Row({', '.join(items)})"

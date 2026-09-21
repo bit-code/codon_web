@@ -1,0 +1,29 @@
+# Standard Database Errors compliant with PEP 249 / DB-API 2.0
+
+class DatabaseError(Exception):
+    def __init__(self, message: str = ""):
+        super().__init__(message)
+
+class InterfaceError(DatabaseError):
+    def __init__(self, message: str = ""):
+        super().__init__(message)
+
+class OperationalError(DatabaseError):
+    def __init__(self, message: str = ""):
+        super().__init__(message)
+
+class ProgrammingError(DatabaseError):
+    def __init__(self, message: str = ""):
+        super().__init__(message)
+
+class DataError(DatabaseError):
+    def __init__(self, message: str = ""):
+        super().__init__(message)
+
+class IntegrityError(DatabaseError):
+    def __init__(self, message: str = ""):
+        super().__init__(message)
+
+class NotSupportedError(DatabaseError):
+    def __init__(self, message: str = ""):
+        super().__init__(message)

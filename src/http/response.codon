@@ -1,0 +1,174 @@
+from C import strlen(cobj) -> int
+from src.http.status import HttpStatus
+from src.http.mime import MimeType
+from src.http.streaming import ChunkedEncoder, ServerSentEvent
+from src.memory.buffer import ByteBuffer
+from src.http.fast_json import FastJson, FastJsonDoc
+
+class Response:
+    status_code: int
+    content_type: str
+    body: str
+    custom_headers: list[Tuple[str, str]]
+    is_chunked: bool
+    is_deferred: bool
+
+    def __init__(
+        self,
+        body: str = "",
+        status_code: int = 200,
+        content_type: str = "text/plain; charset=utf-8",
+        is_chunked: bool = False,
+        is_deferred: bool = False
+    ):
+        self.status_code = status_code
+        self.content_type = content_type
+        self.body = body
+        self.custom_headers = []
+        self.is_chunked = is_chunked
+        self.is_deferred = is_deferred
+
+    def set_header(self, name: str, value: str) -> None:
+        self.custom_headers.append((name, value))
+
+    def set_cookie(
+        self,
+        name: str,
+        value: str,
+        path: str = "/",
+        max_age: int = -1,
+        http_only: bool = True,
+        secure: bool = False,
+        same_site: str = "Lax"
+    ) -> None:
+        parts: list[str] = [name + "=" + value]
+        if len(path) > 0:
+            parts.append("Path=" + path)
+        if max_age >= 0:
+            parts.append("Max-Age=" + str(max_age))
+        if http_only:
+            parts.append("HttpOnly")
+        if secure:
+            parts.append("Secure")
+        if len(same_site) > 0:
+            parts.append("SameSite=" + same_site)
+        self.set_header("Set-Cookie", "; ".join(parts))
+
+    def delete_cookie(self, name: str, path: str = "/", domain: str = "") -> None:
+        parts: list[str] = [
+            name + "=\"\"",
+            "Max-Age=0",
+            "Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+        ]
+        if len(path) > 0:
+            parts.append("Path=" + path)
+        if len(domain) > 0:
+            parts.append("Domain=" + domain)
+        self.set_header("Set-Cookie", "; ".join(parts))
+
+    @staticmethod
+    def text(content: str, status: int = 200) -> Response:
+        return Response(body=content, status_code=status, content_type="text/plain; charset=utf-8")
+
+    @staticmethod
+    def json(content: str, status: int = 200) -> Response:
+        return Response(body=content, status_code=status, content_type="application/json; charset=utf-8")
+
+    @staticmethod
+    def json(doc: FastJsonDoc, status: int = 200) -> Response:
+        return Response(body=doc.dumps(), status_code=status, content_type="application/json; charset=utf-8")
+
+    @staticmethod
+    def json(d: dict[str, str], status: int = 200) -> Response:
+        return Response(body=FastJson.dumps_dict(d), status_code=status, content_type="application/json; charset=utf-8")
+
+    @staticmethod
+    def html(content: str, status: int = 200) -> Response:
+        return Response(body=content, status_code=status, content_type="text/html; charset=utf-8")
+
+    @staticmethod
+    def redirect(location: str, status: int = 302) -> Response:
+        resp = Response(body="", status_code=status, content_type="text/plain; charset=utf-8")
+        resp.set_header("Location", location)
+        return resp
+
+    @staticmethod
+    def empty(status: int = 204) -> Response:
+        return Response(body="", status_code=status, content_type="text/plain; charset=utf-8")
+
+    @staticmethod
+    def not_modified(etag: str = "") -> Response:
+        resp = Response(body="", status_code=304, content_type="text/plain; charset=utf-8")
+        if len(etag) > 0:
+            resp.set_header("ETag", etag)
+        return resp
+
+    @staticmethod
+    def defer() -> Response:
+        return Response(is_deferred=True)
+
+    @staticmethod
+    def file(filepath: str, content_type: str = "") -> Response:
+        try:
+            with open(filepath, "r") as f:
+                content = f.read()
+            ct = content_type if len(content_type) > 0 else MimeType.from_path(filepath)
+            return Response(body=content, status_code=200, content_type=ct)
+        except:
+            return Response.text("File Not Found", 404)
+
+    @staticmethod
+    def stream(chunks: list[str], content_type: str = "application/octet-stream", status: int = 200) -> Response:
+        encoded_body = ChunkedEncoder.encode_all(chunks)
+        return Response(
+            body=encoded_body,
+            status_code=status,
+            content_type=content_type,
+            is_chunked=True
+        )
+
+    @staticmethod
+    def event_stream(events: list[ServerSentEvent], status: int = 200) -> Response:
+        chunks = list[str]()
+        for i in range(len(events)):
+            chunks.append(events[i].format())
+        encoded_body = ChunkedEncoder.encode_all(chunks)
+        resp = Response(
+            body=encoded_body,
+            status_code=status,
+            content_type="text/event-stream; charset=utf-8",
+            is_chunked=True
+        )
+        resp.set_header("Cache-Control", "no-cache")
+        resp.set_header("X-Accel-Buffering", "no")
+        return resp
+
+    def serialize(self, dest: ByteBuffer, keep_alive: bool = True) -> None:
+        # HTTP/1.1 <status> <reason>\r\n
+        reason = HttpStatus.get_reason_phrase(self.status_code)
+        dest.append_str("HTTP/1.1 ")
+        dest.append_str(str(self.status_code))
+        dest.append_str(" ")
+        dest.append_str(reason)
+        dest.append_str("\r\nServer: CodonWeb/0.1\r\nContent-Type: ")
+        dest.append_str(self.content_type)
+
+        if self.is_chunked:
+            dest.append_str("\r\nTransfer-Encoding: chunked")
+        else:
+            dest.append_str("\r\nContent-Length: ")
+            dest.append_str(str(strlen(self.body.c_str().as_byte())))
+
+        dest.append_str("\r\nConnection: ")
+        dest.append_str("keep-alive" if keep_alive else "close")
+        dest.append_str("\r\n")
+
+        for i in range(len(self.custom_headers)):
+            k, v = self.custom_headers[i]
+            dest.append_str(k)
+            dest.append_str(": ")
+            dest.append_str(v)
+            dest.append_str("\r\n")
+
+        dest.append_str("\r\n")
+        dest.append_str(self.body)

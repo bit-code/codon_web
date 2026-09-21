@@ -1,0 +1,206 @@
+from src.http.response import Response
+
+class FieldRule:
+    name: str
+    required: bool
+    field_type: str # "str", "int", "float", "bool"
+    min_val: int
+    max_val: int
+    min_float: float
+    max_float: float
+    min_len: int
+    max_len: int
+    choices: list[str]
+    is_email: bool
+    default_val: str
+
+    def __init__(
+        self,
+        name: str,
+        required: bool = True,
+        field_type: str = "str",
+        min_val: int = 0,
+        max_val: int = 0,
+        min_float: float = 0.0,
+        max_float: float = 0.0,
+        min_len: int = 0,
+        max_len: int = 0,
+        choices: Optional[list[str]] = None,
+        is_email: bool = False,
+        default_val: str = ""
+    ):
+        self.name = name
+        self.required = required
+        self.field_type = field_type
+        self.min_val = min_val
+        self.max_val = max_val
+        self.min_float = min_float
+        self.max_float = max_float
+        self.min_len = min_len
+        self.max_len = max_len
+        if choices is not None:
+            self.choices = choices
+        else:
+            self.choices = list[str]()
+        self.is_email = is_email
+        self.default_val = default_val
+
+class Schema:
+    rules: list[FieldRule]
+
+    def __init__(self):
+        self.rules = []
+
+    def field_str(
+        self,
+        name: str,
+        required: bool = True,
+        min_len: int = 0,
+        max_len: int = 0,
+        choices: Optional[list[str]] = None,
+        is_email: bool = False,
+        default_val: str = ""
+    ) -> None:
+        ch = choices if choices is not None else list[str]()
+        self.rules.append(FieldRule(
+            name=name,
+            required=required,
+            field_type="str",
+            min_len=min_len,
+            max_len=max_len,
+            choices=ch,
+            is_email=is_email,
+            default_val=default_val
+        ))
+
+    def field_int(
+        self,
+        name: str,
+        required: bool = True,
+        min_val: int = 0,
+        max_val: int = 0,
+        default_val: int = 0
+    ) -> None:
+        def_str = str(default_val) if not required else ""
+        self.rules.append(FieldRule(
+            name=name,
+            required=required,
+            field_type="int",
+            min_val=min_val,
+            max_val=max_val,
+            default_val=def_str
+        ))
+
+    def field_float(
+        self,
+        name: str,
+        required: bool = True,
+        min_val: float = 0.0,
+        max_val: float = 0.0,
+        default_val: float = 0.0
+    ) -> None:
+        def_str = str(default_val) if not required else ""
+        self.rules.append(FieldRule(
+            name=name,
+            required=required,
+            field_type="float",
+            min_float=min_val,
+            max_float=max_val,
+            default_val=def_str
+        ))
+
+    def field_bool(
+        self,
+        name: str,
+        required: bool = True,
+        default_val: bool = False
+    ) -> None:
+        def_str = "true" if default_val else "false"
+        self.rules.append(FieldRule(
+            name=name,
+            required=required,
+            field_type="bool",
+            default_val=def_str if not required else ""
+        ))
+
+    def bind(self, data: dict[str, str]) -> Tuple[bool, dict[str, str], list[str]]:
+        bound: dict[str, str] = {}
+        for k, v in data.items():
+            bound[k] = v
+
+        errors: list[str] = []
+        for i in range(len(self.rules)):
+            rule = self.rules[i]
+            val_present = (rule.name in bound) and (len(bound[rule.name].strip()) > 0)
+
+            if not val_present:
+                if rule.required:
+                    errors.append("Field '" + rule.name + "' is required")
+                elif len(rule.default_val) > 0:
+                    bound[rule.name] = rule.default_val
+                continue
+
+            val = bound[rule.name].strip()
+
+            if rule.field_type == "int":
+                try:
+                    val_int = int(val)
+                    if rule.min_val != 0 and val_int < rule.min_val:
+                        errors.append("Field '" + rule.name + "' must be >= " + str(rule.min_val))
+                    if rule.max_val != 0 and val_int > rule.max_val:
+                        errors.append("Field '" + rule.name + "' must be <= " + str(rule.max_val))
+                except:
+                    errors.append("Field '" + rule.name + "' must be a valid integer")
+
+            elif rule.field_type == "float":
+                try:
+                    val_f = float(val)
+                    if rule.min_float != 0.0 and val_f < rule.min_float:
+                        errors.append("Field '" + rule.name + "' must be >= " + str(rule.min_float))
+                    if rule.max_float != 0.0 and val_f > rule.max_float:
+                        errors.append("Field '" + rule.name + "' must be <= " + str(rule.max_float))
+                except:
+                    errors.append("Field '" + rule.name + "' must be a valid float")
+
+            elif rule.field_type == "bool":
+                lowered = val.lower()
+                if lowered == "true" or lowered == "1" or lowered == "yes":
+                    bound[rule.name] = "true"
+                elif lowered == "false" or lowered == "0" or lowered == "no":
+                    bound[rule.name] = "false"
+                else:
+                    errors.append("Field '" + rule.name + "' must be a valid boolean (true/false)")
+
+            else: # "str"
+                l = len(val)
+                if rule.min_len > 0 and l < rule.min_len:
+                    errors.append("Field '" + rule.name + "' length must be >= " + str(rule.min_len))
+                if rule.max_len > 0 and l > rule.max_len:
+                    errors.append("Field '" + rule.name + "' length must be <= " + str(rule.max_len))
+                if rule.is_email:
+                    at_idx = val.find("@")
+                    dot_idx = val.rfind(".")
+                    if at_idx <= 0 or dot_idx <= at_idx + 1 or dot_idx >= l - 1:
+                        errors.append("Field '" + rule.name + "' must be a valid email address")
+                if len(rule.choices) > 0:
+                    found_choice = False
+                    for c in rule.choices:
+                        if val == c:
+                            found_choice = True
+                            break
+                    if not found_choice:
+                        errors.append("Field '" + rule.name + "' must be one of: " + ", ".join(rule.choices))
+
+        return (len(errors) == 0, bound, errors)
+
+    def validate(self, data: dict[str, str]) -> Tuple[bool, list[str]]:
+        ok, _, errors = self.bind(data)
+        return (ok, errors)
+
+    @staticmethod
+    def validation_error_response(errors: list[str]) -> Response:
+        parts: list[str] = []
+        for i in range(len(errors)):
+            parts.append("\"" + errors[i] + "\"")
+        json_body = "{\"error\":\"Unprocessable Entity\",\"status\":422,\"details\":[" + ",".join(parts) + "]}"
+        return Response.json(json_body, 422)

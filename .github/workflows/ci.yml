@@ -1,0 +1,43 @@
+name: CodonWeb CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    name: Build & Test (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc make curl
+
+      - name: Install Codon Compiler
+        run: |
+          /bin/bash -c "$(curl -fsSL https://exaloop.io/install.sh)"
+          echo "$HOME/.codon/bin" >> $GITHUB_PATH
+
+      - name: Verify Environment
+        run: |
+          gcc --version
+          codon --version
+
+      - name: Build Native C Extensions (FastJson/yyjson)
+        run: |
+          make native
+
+      - name: Run Core Integration Tests
+        run: |
+          make test
+
+      - name: Run All CodonWeb Test Suites
+        run: |
+          CODON_PATH=. codon run --linker-flags 'src/native/libcfastjson.a' tests/run_all.codon

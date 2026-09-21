@@ -1,0 +1,42 @@
+from src.http.background import BackgroundTasks
+
+task_run_log: list[str] = []
+
+def task_one():
+    global task_run_log
+    task_run_log.append("one")
+
+def task_failing():
+    global task_run_log
+    task_run_log.append("failing")
+    raise ValueError("Task error occurred")
+
+def task_two():
+    global task_run_log
+    task_run_log.append("two")
+
+def test_background_tasks():
+    global task_run_log
+    task_run_log = []
+
+    bg = BackgroundTasks()
+    bg.add_task(task_one)
+    bg.add_task(task_failing)
+    bg.add_task(task_two)
+
+    assert len(bg) == 3
+    bg.run_all()
+
+    assert len(bg) == 0
+    assert len(task_run_log) == 3
+    assert task_run_log[0] == "one"
+    assert task_run_log[1] == "failing"
+    assert task_run_log[2] == "two"
+
+    print("[PASS] test_background_tasks")
+
+def run():
+    test_background_tasks()
+
+if __name__ == "__main__":
+    run()

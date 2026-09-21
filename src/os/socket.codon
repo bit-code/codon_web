@@ -1,0 +1,216 @@
+from src.os.constants import (
+    AF_INET, SOCK_STREAM, SOCK_NONBLOCK, SOCK_CLOEXEC,
+    SOL_SOCKET, SO_REUSEADDR, SO_REUSEPORT, IPPROTO_TCP, TCP_NODELAY,
+    F_GETFL, F_SETFL, O_NONBLOCK, EINTR, EAGAIN, EWOULDBLOCK, EINPROGRESS
+)
+from src.os.linux import (
+    socket as c_socket,
+    setsockopt as c_setsockopt,
+    bind as c_bind,
+    connect as c_connect,
+    listen as c_listen,
+    accept4 as c_accept4,
+    recv as c_recv,
+    send as c_send,
+    close as c_close,
+    fcntl as c_fcntl,
+    inet_pton as c_inet_pton,
+    htons as c_htons,
+    ntohs as c_ntohs,
+    get_errno,
+    get_error_message
+)
+
+class Socket:
+    fd: i32
+    is_closed: bool
+
+    def __init__(self, fd: i32 = i32(-1)):
+        self.fd = fd
+        self.is_closed = (fd < i32(0))
+
+    @staticmethod
+    def create_tcp() -> Socket:
+        fd = c_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, i32(0))
+        if fd < i32(0):
+            err = get_errno()
+            raise OSError("Failed to create TCP socket: " + get_error_message(err))
+        return Socket(fd)
+
+    def set_nonblocking(self) -> None:
+        if self.is_closed:
+            return
+        flags = c_fcntl(self.fd, F_GETFL, i32(0))
+        if flags < i32(0):
+            err = get_errno()
+            raise OSError("fcntl F_GETFL failed: " + get_error_message(err))
+        res = c_fcntl(self.fd, F_SETFL, flags | O_NONBLOCK)
+        if res < i32(0):
+            err = get_errno()
+            raise OSError("fcntl F_SETFL O_NONBLOCK failed: " + get_error_message(err))
+
+    def set_reuse_addr(self, enabled: bool = True) -> None:
+        if self.is_closed:
+            return
+        val = i32(1 if enabled else 0)
+        ret = c_setsockopt(self.fd, SOL_SOCKET, SO_REUSEADDR, __ptr__(val).as_byte(), i32(4))
+        if ret < i32(0):
+            err = get_errno()
+            raise OSError("setsockopt SO_REUSEADDR failed: " + get_error_message(err))
+
+    def set_reuse_port(self, enabled: bool = True) -> None:
+        if self.is_closed:
+            return
+        val = i32(1 if enabled else 0)
+        ret = c_setsockopt(self.fd, SOL_SOCKET, SO_REUSEPORT, __ptr__(val).as_byte(), i32(4))
+        if ret < i32(0):
+            err = get_errno()
+            raise OSError("setsockopt SO_REUSEPORT failed: " + get_error_message(err))
+
+    def set_tcp_nodelay(self, enabled: bool = True) -> None:
+        if self.is_closed:
+            return
+        val = i32(1 if enabled else 0)
+        ret = c_setsockopt(self.fd, IPPROTO_TCP, TCP_NODELAY, __ptr__(val).as_byte(), i32(4))
+        if ret < i32(0):
+            err = get_errno()
+            raise OSError("setsockopt TCP_NODELAY failed: " + get_error_message(err))
+
+    def bind(self, host: str, port: int) -> None:
+        if self.is_closed:
+            raise OSError("Cannot bind closed socket")
+        
+        # Build struct sockaddr_in (16 bytes)
+        addr_buf = Ptr[byte](16)
+        for i in range(16):
+            addr_buf[i] = byte(0)
+
+        # sin_family = AF_INET (2 bytes, offset 0)
+        addr_buf[0] = byte(AF_INET & i32(0xFF))
+        addr_buf[1] = byte((AF_INET >> i32(8)) & i32(0xFF))
+
+        # sin_port = htons(port) (2 bytes, offset 2)
+        p = c_htons(u16(port))
+        addr_buf[2] = byte(p & u16(0xFF))
+        addr_buf[3] = byte((p >> u16(8)) & u16(0xFF))
+
+        # sin_addr = inet_pton (4 bytes, offset 4)
+        c_host = host.c_str()
+        ret = c_inet_pton(AF_INET, c_host, addr_buf + 4)
+        if ret <= i32(0):
+            raise ValueError("Invalid IP address: " + host)
+
+        bind_ret = c_bind(self.fd, addr_buf, i32(16))
+        if bind_ret < i32(0):
+            err = get_errno()
+            raise OSError("bind failed: " + get_error_message(err))
+
+    def listen(self, backlog: int = 4096) -> None:
+        if self.is_closed:
+            raise OSError("Cannot listen on closed socket")
+        ret = c_listen(self.fd, i32(backlog))
+        if ret < i32(0):
+            err = get_errno()
+            raise OSError("listen failed: " + get_error_message(err))
+
+    def accept_nonblocking(self) -> Tuple[i32, str, int]:
+        # Returns (client_fd, client_ip, client_port)
+        # client_fd == -1 indicates EAGAIN/EWOULDBLOCK
+        if self.is_closed:
+            return (i32(-1), "", 0)
+
+        addr_buf = Ptr[byte](16)
+        for i in range(16):
+            addr_buf[i] = byte(0)
+        addr_len = i32(16)
+
+        client_fd = c_accept4(
+            self.fd,
+            addr_buf,
+            __ptr__(addr_len),
+            SOCK_NONBLOCK | SOCK_CLOEXEC
+        )
+
+        if client_fd < i32(0):
+            err = get_errno()
+            if err == EAGAIN or err == EWOULDBLOCK or err == EINTR:
+                return (i32(-1), "", 0)
+            raise OSError("accept4 failed: " + get_error_message(err))
+
+        # Extract port (offset 2)
+        raw_port = u16(addr_buf[2]) | (u16(addr_buf[3]) << u16(8))
+        port = int(c_ntohs(raw_port))
+
+        # Extract IPv4 address (offset 4..7)
+        b0 = int(addr_buf[4])
+        b1 = int(addr_buf[5])
+        b2 = int(addr_buf[6])
+        b3 = int(addr_buf[7])
+        ip = str(b0) + "." + str(b1) + "." + str(b2) + "." + str(b3)
+
+        return (client_fd, ip, port)
+
+    def close(self) -> None:
+        if not self.is_closed and self.fd >= i32(0):
+            c_close(self.fd)
+            self.is_closed = True
+            self.fd = i32(-1)
+
+    @staticmethod
+    def create_tcp_client(blocking: bool = True) -> Socket:
+        flags = SOCK_CLOEXEC
+        if not blocking:
+            flags |= SOCK_NONBLOCK
+        fd = c_socket(AF_INET, SOCK_STREAM | flags, i32(0))
+        if fd < i32(0):
+            err = get_errno()
+            raise OSError("Failed to create TCP client socket: " + get_error_message(err))
+        return Socket(fd)
+
+    def connect(self, host: str, port: int) -> bool:
+        if self.is_closed:
+            raise OSError("Cannot connect closed socket")
+        addr_buf = Ptr[byte](16)
+        for i in range(16):
+            addr_buf[i] = byte(0)
+        addr_buf[0] = byte(AF_INET & i32(0xFF))
+        addr_buf[1] = byte((AF_INET >> i32(8)) & i32(0xFF))
+        p = c_htons(u16(port))
+        addr_buf[2] = byte(p & u16(0xFF))
+        addr_buf[3] = byte((p >> u16(8)) & u16(0xFF))
+        c_host = host.c_str()
+        ret = c_inet_pton(AF_INET, c_host, addr_buf + 4)
+        if ret <= i32(0):
+            raise ValueError("Invalid IP address: " + host)
+        res = c_connect(self.fd, addr_buf, i32(16))
+        if res < i32(0):
+            err = get_errno()
+            if err == EINTR or err == EAGAIN or err == EWOULDBLOCK or err == EINPROGRESS:
+                return False
+            raise OSError("connect failed: " + get_error_message(err))
+        return True
+
+    def send_str(self, s: str) -> int:
+        if self.is_closed:
+            return -1
+        p = s.c_str()
+        n = len(s)
+        sent = 0
+        while sent < n:
+            ret = c_send(self.fd, p + sent, n - sent, i32(0))
+            if ret < 0:
+                err = get_errno()
+                if err == EINTR:
+                    continue
+                return -1
+            sent += ret
+        return sent
+
+    def recv_str(self, max_len: int = 4096) -> str:
+        if self.is_closed:
+            return ""
+        buf = Ptr[byte](max_len)
+        ret = c_recv(self.fd, buf, max_len, i32(0))
+        if ret <= 0:
+            return ""
+        return str(buf, ret)

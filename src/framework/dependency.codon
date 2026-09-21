@@ -1,0 +1,37 @@
+# Modern Dependency Injection (DI) & Provider Engine for CodonWeb
+
+from typing import Callable, Optional
+from src.http.request import Request
+
+class DependencyManager:
+    overrides: dict[str, Callable[[Request], None]]
+
+    def __init__(self):
+        self.overrides = {}
+
+    def override(self, key: str, mock_fn: Callable[[Request], None]) -> None:
+        self.overrides[key] = mock_fn
+
+    def clear(self) -> None:
+        self.overrides.clear()
+
+    def has_override(self, key: str) -> bool:
+        return key in self.overrides
+
+    def get_override(self, key: str) -> Callable[[Request], None]:
+        return self.overrides[key]
+
+# Singleton dependency manager instance
+default_dependency_manager = DependencyManager()
+
+def resolve_dependency(key: str, req: Request, default_fn: Callable[[Request], None]) -> None:
+    if default_dependency_manager.has_override(key):
+        override_fn = default_dependency_manager.get_override(key)
+        override_fn(req)
+    else:
+        default_fn(req)
+
+def execute_dependencies(dependencies: list[Callable[[Request], None]], req: Request) -> None:
+    for i in range(len(dependencies)):
+        dep = dependencies[i]
+        dep(req)

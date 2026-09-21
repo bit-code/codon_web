@@ -1,0 +1,124 @@
+# Comprehensive Unit Test for FastAPI-Style TestClient & TestResponse
+
+from src.framework.app import App
+from src.framework.middleware import CORSMiddleware, RequestIdMiddleware, TimingMiddleware
+from src.testing.test_client import TestClient, TestResponse
+from src.http.request import Request
+from src.http.response import Response
+from src.http.exceptions import HTTPException
+
+app = App()
+app.use(CORSMiddleware(allow_origin="*"))
+app.use(RequestIdMiddleware())
+app.use(TimingMiddleware())
+
+started = [False]
+stopped = [False]
+
+def on_start():
+    started[0] = True
+
+def on_stop():
+    stopped[0] = True
+
+app.on_startup(on_start)
+app.on_shutdown(on_stop)
+
+@app.get("/hello")
+def hello(req: Request) -> Response:
+    return Response.text("Hello TestClient!")
+
+@app.get("/items/{id:int}")
+def get_item(req: Request) -> Response:
+    item_id = req.param("id")
+    sort = req.query_param("sort", "asc")
+    return Response.json("{\"id\":" + item_id + ",\"sort\":\"" + sort + "\"}")
+
+@app.post("/users")
+def create_user(req: Request) -> Response:
+    data = req.json()
+    name = data["name"] if "name" in data else "anonymous"
+    return Response.json("{\"status\":\"created\",\"name\":\"" + name + "\"}", 201)
+
+@app.get("/set-cookie")
+def set_cookie_handler(req: Request) -> Response:
+    resp = Response.text("Cookie Set")
+    resp.set_cookie("session_id", "sess_98765")
+    return resp
+
+@app.get("/get-cookie")
+def get_cookie_handler(req: Request) -> Response:
+    val = req.cookie("session_id")
+    return Response.text("Cookie: " + val)
+
+bg_done = [False]
+def sample_bg_task():
+    bg_done[0] = True
+
+@app.post("/queue-task")
+def queue_task_handler(req: Request) -> Response:
+    req.background_tasks.add_task(sample_bg_task)
+    return Response.text("Task Queued", 202)
+
+print("=== Testing FastAPI-Style TestClient ===")
+
+# Test 1: Context Manager Lifecycle Hooks
+with TestClient(app) as client:
+    assert started[0] == True, "Startup hook was not executed"
+
+    # Test 2: GET /hello & Middleware validation
+    r1 = client.get("/hello")
+    assert r1.status_code == 200, "Expected 200 OK, got: " + str(r1.status_code)
+    assert r1.text == "Hello TestClient!", "Unexpected body: " + r1.text
+    assert r1.is_success == True
+    assert r1.header("x-request-id").startswith("req-"), "Missing X-Request-ID middleware header"
+    assert r1.header("access-control-allow-origin") == "*", "Missing CORS header"
+    print("[PASS] Test 1 & 2: GET route and Middlewares verified!")
+
+    # Test 3: Path and Query Parameter binding
+    params = dict[str, str]()
+    params["sort"] = "desc"
+    r2 = client.get("/items/42", params=params)
+    assert r2.status_code == 200
+    j2 = r2.json()
+    assert j2["id"] == "42", "Expected id 42, got: " + j2["id"]
+    assert j2["sort"] == "desc", "Expected sort desc, got: " + j2["sort"]
+    print("[PASS] Test 3: Path & Query params parsed cleanly!")
+
+    # Test 4: POST with JSON body & 201 status
+    r3 = client.post("/users", json="{\"name\":\"Alice\"}")
+    assert r3.status_code == 201
+    j3 = r3.json()
+    assert j3["status"] == "created"
+    assert j3["name"] == "Alice"
+    print("[PASS] Test 4: POST JSON body parsed and 201 verified!")
+
+    # Test 5: Cookie Jar persistence across requests
+    r4 = client.get("/set-cookie")
+    assert r4.status_code == 200
+    assert r4.cookie("session_id") == "sess_98765", "Cookie not captured in TestResponse"
+    assert client.cookies["session_id"] == "sess_98765", "Cookie not persisted in TestClient jar"
+
+    r5 = client.get("/get-cookie")
+    assert r5.status_code == 200
+    assert r5.text == "Cookie: sess_98765", "Persisted cookie was not sent to server: " + r5.text
+    print("[PASS] Test 5: Cookie Jar persistence across requests verified!")
+
+    # Test 6: Background Tasks execution
+    assert bg_done[0] == False
+    r6 = client.post("/queue-task")
+    assert r6.status_code == 202
+    assert bg_done[0] == True, "Background task was not executed post-response!"
+    print("[PASS] Test 6: Post-response background tasks executed!")
+
+    # Test 7: 404 Not Found
+    r7 = client.get("/non-existent")
+    assert r7.status_code == 404
+    assert r7.is_client_error == True
+    print("[PASS] Test 7: 404 Not Found handled gracefully!")
+
+# Test 8: Context Manager Exit Lifecycle Hook
+assert stopped[0] == True, "Shutdown hook was not executed upon context manager exit"
+print("[PASS] Test 8: Shutdown hook verified upon context exit!")
+
+print("\n>>> ALL TESTCLIENT TESTS PASSED SUCCESSFULLY! <<<")

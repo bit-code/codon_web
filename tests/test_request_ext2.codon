@@ -1,0 +1,72 @@
+# Unit Test for Request & Response Advanced Helpers (client_ip, url, delete_cookie)
+
+from codon_web import App, Request, Response, TestClient
+
+app = App()
+
+@app.get("/ip-check")
+def ip_check(req: Request) -> Response:
+    client_ip = req.client_ip()
+    base_url = req.base_url()
+    full_url = req.url()
+    return Response.json(
+        "{\"ip\":\"" + client_ip + "\",\"base\":\"" + base_url + "\",\"url\":\"" + full_url + "\"}"
+    )
+
+@app.post("/content-check")
+def content_check(req: Request) -> Response:
+    ct = req.content_type()
+    cl = req.content_length()
+    return Response.json("{\"content_type\":\"" + ct + "\",\"content_length\":" + str(cl) + "}")
+
+@app.get("/logout")
+def logout(req: Request) -> Response:
+    resp = Response.text("Logged out")
+    resp.delete_cookie("session_token", path="/api")
+    return resp
+
+client = TestClient(app)
+
+print("=== Testing Request & Response Advanced Helpers ===")
+
+# 1. client_ip via X-Forwarded-For (multi-proxy chain)
+h_proxy = dict[str, str]()
+h_proxy["X-Forwarded-For"] = "203.0.113.195, 70.41.3.18, 150.172.238.178"
+h_proxy["X-Forwarded-Proto"] = "https"
+h_proxy["Host"] = "cloud.example.org"
+
+r1 = client.get("/ip-check?search=query1", headers=h_proxy)
+assert r1.status_code == 200
+j1 = r1.json()
+assert j1["ip"] == "203.0.113.195", "Expected first forwarded IP, got: " + j1["ip"]
+assert j1["base"] == "https://cloud.example.org", "Expected base_url https://cloud.example.org, got: " + j1["base"]
+assert j1["url"] == "https://cloud.example.org/ip-check?search=query1", "Expected full URL, got: " + j1["url"]
+print("[PASS] 1. client_ip, base_url, url parsing verified!")
+
+# 2. client_ip via X-Real-IP fallback
+h_real = dict[str, str]()
+h_real["X-Real-IP"] = "198.51.100.42"
+r2 = client.get("/ip-check", headers=h_real)
+assert r2.status_code == 200
+j2 = r2.json()
+assert j2["ip"] == "198.51.100.42", "Expected X-Real-IP, got: " + j2["ip"]
+print("[PASS] 2. client_ip X-Real-IP fallback verified!")
+
+# 3. Content-Type and Content-Length parsing
+r3 = client.post("/content-check", json="{\"key\":\"value\"}")
+assert r3.status_code == 200
+j3 = r3.json()
+assert j3["content_type"] == "application/json"
+assert j3["content_length"] == "15"
+print("[PASS] 3. Content-Type and Content-Length verified!")
+
+# 4. delete_cookie header injection
+r4 = client.get("/logout")
+assert r4.status_code == 200
+cookie_header = r4.header("set-cookie")
+assert "session_token=\"\"" in cookie_header, "Missing deleted cookie value"
+assert "Max-Age=0" in cookie_header, "Missing Max-Age=0"
+assert "Path=/api" in cookie_header, "Missing Path=/api"
+print("[PASS] 4. delete_cookie header structure verified!")
+
+print("\n>>> ALL REQUEST & RESPONSE ADVANCED HELPER TESTS PASSED! <<<")

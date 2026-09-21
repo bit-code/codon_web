@@ -1,0 +1,109 @@
+from C import strlen(cobj) -> int
+from src.http.request import Request
+from src.http.response import Response
+from src.http.fast_json import FastJson, FastJsonDoc
+from src.memory.slice import ByteSlice
+
+def make_req(body_str: str) -> Request:
+    req = Request()
+    b_len = strlen(body_str.c_str().as_byte())
+    req.body = ByteSlice(body_str.c_str(), b_len)
+    return req
+
+def test_request_json():
+    raw = '{"username":"alice","role":"admin","attempts":3,"is_active":true}'
+    req = make_req(raw)
+    d = req.json()
+    assert len(d) == 4, "Expected 4 items"
+    assert d["username"] == "alice", "username mismatch"
+    assert d["role"] == "admin", "role mismatch"
+    assert d["attempts"] == "3", "attempts mismatch"
+    assert d["is_active"] == "true", "is_active mismatch"
+
+    # Test caching: second call returns same dict
+    d2 = req.json()
+    assert d2["username"] == "alice"
+    print("PASS: Request.json() backward compatibility & parsing")
+
+def test_request_json_doc():
+    raw = '{"order_id":9981,"items":[{"id":1,"name":"Widget","price":19.99},{"id":2,"name":"Gadget","price":49.50}],"paid":true}'
+    req = make_req(raw)
+    doc = req.json_doc()
+    root = doc.root
+    assert root["order_id"].as_int() == 9981
+    items = root["items"]
+    assert len(items) == 2
+    assert items[0]["name"].as_str() == "Widget"
+    assert items[1]["name"].as_str() == "Gadget"
+    assert items[1]["price"].as_float() == 49.50
+    assert root["paid"].as_bool() == True
+
+    # Test caching
+    doc2 = req.json_doc()
+    assert doc2.root["order_id"].as_int() == 9981
+
+    # Test reset
+    req.reset()
+    assert req.json_doc_cache is None
+    print("PASS: Request.json_doc() nested queries & lifecycle")
+
+def test_response_json_str():
+    resp = Response.json('{"status":"ok"}', 200)
+    assert resp.body == '{"status":"ok"}'
+    assert resp.content_type == "application/json; charset=utf-8"
+    assert resp.status_code == 200
+    print("PASS: Response.json(str)")
+
+def test_response_json_doc():
+    raw = '{"type":"event","id":123}'
+    doc = FastJson.loads(raw)
+    resp = Response.json(doc, 201)
+    assert resp.body == '{"type":"event","id":123}'
+    assert resp.content_type == "application/json; charset=utf-8"
+    assert resp.status_code == 201
+    doc.close()
+    print("PASS: Response.json(FastJsonDoc)")
+
+def test_response_json_dict():
+    payload = {
+        "msg": "success",
+        "code": "200",
+        "detail": "Quotes \"escaped\" and backslash \\ and newline \n"
+    }
+    resp = Response.json(payload, 200)
+    assert resp.content_type == "application/json; charset=utf-8"
+    assert resp.status_code == 200
+
+    # Parse back and verify round-trip fidelity
+    parsed = FastJson.parse_to_dict(resp.body)
+    assert parsed["msg"] == "success"
+    assert parsed["code"] == "200"
+    assert parsed["detail"] == "Quotes \"escaped\" and backslash \\ and newline \n"
+    print("PASS: Response.json(dict[str, str]) zero-copy serialization")
+
+def test_unicode_utf8():
+    raw = '{"greeting":"你好，世界！🌟","url":"https://example.com/api?a=1&b=2"}'
+    req = make_req(raw)
+    d = req.json()
+    assert d["greeting"] == "你好，世界！🌟"
+    assert d["url"] == "https://example.com/api?a=1&b=2"
+
+    resp = Response.json(d)
+    d2 = FastJson.parse_to_dict(resp.body)
+    assert d2["greeting"] == "你好，世界！🌟"
+    assert d2["url"] == "https://example.com/api?a=1&b=2"
+    print("PASS: Unicode UTF-8 & special characters round-trip")
+
+def main():
+    print("--- Running FastJson Integration Tests ---")
+    test_request_json()
+    test_request_json_doc()
+    test_response_json_str()
+    test_response_json_doc()
+    test_response_json_dict()
+    test_unicode_utf8()
+    print("==========================================")
+    print("ALL PHASE 1 & PHASE 2 INTEGRATION TESTS PASSED!")
+    print("==========================================")
+
+main()

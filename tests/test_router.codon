@@ -1,0 +1,67 @@
+from src.framework.radix import RadixRouter
+from src.framework.route import RouteHandler
+from src.http.request import Request
+from src.http.response import Response
+from src.http.method import METHOD_GET, METHOD_POST, METHOD_PUT
+from src.memory.slice import ByteSlice
+
+class RootHandler(RouteHandler):
+    def handle(self, req: Request) -> Response:
+        return Response.text("Hello Root")
+
+class UserGetHandler(RouteHandler):
+    def handle(self, req: Request) -> Response:
+        uid = req.param_int("id")
+        return Response.json("{\"id\":" + str(uid) + "}")
+
+class UserPostHandler(RouteHandler):
+    def handle(self, req: Request) -> Response:
+        return Response.json("{\"status\":\"created\"}", 201)
+
+router = RadixRouter()
+router.add_route(METHOD_GET, "/", RootHandler())
+router.add_route(METHOD_GET, "/users/{id:int}", UserGetHandler())
+router.add_route(METHOD_POST, "/users", UserPostHandler())
+
+def make_req(method: i32, path: str) -> Request:
+    req = Request()
+    req.method = method
+    # Point path to raw slice
+    c_str = path.c_str()
+    req.path = ByteSlice(c_str, len(path))
+    return req
+
+# Test 1: GET /
+r1 = router.dispatch(make_req(METHOD_GET, "/"))
+assert r1.status_code == 200
+assert r1.body == "Hello Root"
+print("Test 1 (GET /): PASSED")
+
+# Test 2: GET /users/42
+r2 = router.dispatch(make_req(METHOD_GET, "/users/42"))
+assert r2.status_code == 200
+assert r2.body == "{\"id\":42}"
+print("Test 2 (GET /users/42): PASSED")
+
+# Test 3: GET /users/invalid_id (should fail int validation with 400)
+r3 = router.dispatch(make_req(METHOD_GET, "/users/invalid"))
+assert r3.status_code == 400
+print("Test 3 (GET /users/invalid -> 400): PASSED")
+
+# Test 4: POST /users
+r4 = router.dispatch(make_req(METHOD_POST, "/users"))
+assert r4.status_code == 201
+assert r4.body == "{\"status\":\"created\"}"
+print("Test 4 (POST /users -> 201): PASSED")
+
+# Test 5: PUT /users (Method not allowed -> 405)
+r5 = router.dispatch(make_req(METHOD_PUT, "/users"))
+assert r5.status_code == 405
+print("Test 5 (PUT /users -> 405): PASSED")
+
+# Test 6: GET /unknown (Not found -> 404)
+r6 = router.dispatch(make_req(METHOD_GET, "/unknown"))
+assert r6.status_code == 404
+print("Test 6 (GET /unknown -> 404): PASSED")
+
+print("All Router tests PASSED successfully!")

@@ -1,0 +1,325 @@
+# Automated OpenAPI 3.0 Generation & Interactive Documentation (Swagger UI & ReDoc)
+
+from typing import Optional, Tuple
+from src.http.schema import Schema
+from src.http.params import Param, PARAM_PATH, PARAM_QUERY, PARAM_HEADER, PARAM_COOKIE
+from src.framework.security import SecurityScheme
+
+class RouteMeta:
+    path: str
+    method: str
+    summary: str
+    description: str
+    tags: list[str]
+    status_code: int
+    deprecated: bool
+    has_schema: bool
+    schema: Schema
+    params: list[Param]
+    security_schemes: list[str]
+
+    def __init__(
+        self,
+        path: str,
+        method: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False,
+        has_schema: bool = False,
+        schema: Schema = Schema(),
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None
+    ):
+        self.path = path
+        self.method = method.lower()
+        self.summary = summary
+        self.description = description
+        if tags is not None:
+            self.tags = tags
+        else:
+            self.tags = list[str]()
+        self.status_code = status_code
+        self.deprecated = deprecated
+        self.has_schema = has_schema
+        self.schema = schema
+        if params is not None:
+            self.params = params
+        else:
+            self.params = list[Param]()
+        if security_schemes is not None:
+            self.security_schemes = security_schemes
+        else:
+            self.security_schemes = list[str]()
+
+def _clean_openapi_path(p: str) -> Tuple[str, list[Tuple[str, str]]]:
+    # Converts /users/{id:int} to /users/{id} and extracts (id, integer)
+    params: list[Tuple[str, str]] = []
+    clean_parts: list[str] = []
+    segments = p.split("/")
+
+    for i in range(len(segments)):
+        seg = segments[i]
+        if seg.startswith("{") and seg.endswith("}") and len(seg) > 2:
+            inner = seg[1:-1]
+            colon = inner.find(":")
+            if colon >= 0:
+                p_name = inner[:colon]
+                p_type = "integer" if inner[colon + 1:] == "int" else "string"
+                params.append((p_name, p_type))
+                clean_parts.append("{" + p_name + "}")
+            else:
+                params.append((inner, "string"))
+                clean_parts.append("{" + inner + "}")
+        elif seg == "*":
+            clean_parts.append("{wildcard}")
+            params.append(("wildcard", "string"))
+        else:
+            clean_parts.append(seg)
+
+    return ("/".join(clean_parts), params)
+
+class OpenAPIGenerator:
+    title: str
+    version: str
+    description: str
+    routes: list[RouteMeta]
+    security_schemes: dict[str, SecurityScheme]
+
+    def __init__(self, title: str = "CodonWeb API", version: str = "0.1.0", description: str = "High Performance Native Web API"):
+        self.title = title
+        self.version = version
+        self.description = description
+        self.routes = []
+        self.security_schemes = {}
+
+    def add_security_scheme(self, scheme: SecurityScheme) -> None:
+        self.security_schemes[scheme.name] = scheme
+
+    def add_route(self, meta: RouteMeta) -> None:
+        self.routes.append(meta)
+
+    def generate_json(self) -> str:
+        # Group routes by clean path
+        paths_map: dict[str, list[RouteMeta]] = {}
+        for i in range(len(self.routes)):
+            r = self.routes[i]
+            c_path, _ = _clean_openapi_path(r.path)
+            if c_path not in paths_map:
+                paths_map[c_path] = []
+            paths_map[c_path].append(r)
+
+        path_entries: list[str] = []
+
+        for path, route_list in paths_map.items():
+            method_entries: list[str] = []
+
+            for j in range(len(route_list)):
+                rm = route_list[j]
+                _, path_params = _clean_openapi_path(rm.path)
+
+                m_parts: list[str] = []
+                summary = rm.summary if len(rm.summary) > 0 else (rm.method.upper() + " " + path)
+                m_parts.append("\"summary\":\"" + summary + "\"")
+
+                if len(rm.description) > 0:
+                    m_parts.append("\"description\":\"" + rm.description + "\"")
+
+                if rm.deprecated:
+                    m_parts.append("\"deprecated\":true")
+
+                # Tags
+                if len(rm.tags) > 0:
+                    tag_strs: list[str] = []
+                    for t in rm.tags:
+                        tag_strs.append("\"" + t + "\"")
+                    m_parts.append("\"tags\":[" + ",".join(tag_strs) + "]")
+
+                # Parameters (Path, Query, Header, Cookie)
+                param_entries: list[str] = []
+                handled_param_names: dict[str, bool] = {}
+
+                # 1. Explicit multi-source params
+                for p_idx in range(len(rm.params)):
+                    p = rm.params[p_idx]
+                    handled_param_names[p.name] = True
+                    p_items: list[str] = [
+                        "\"name\":\"" + p.name + "\"",
+                        "\"in\":\"" + p.source + "\"",
+                        "\"required\":" + ("true" if p.required else "false")
+                    ]
+                    if len(p.description) > 0:
+                        p_items.append("\"description\":\"" + p.description + "\"")
+
+                    schema_props: list[str] = []
+                    type_str = "string"
+                    if p.param_type == "int":
+                        type_str = "integer"
+                        if p.min_val != 0:
+                            schema_props.append("\"minimum\":" + str(p.min_val))
+                        if p.max_val != 0:
+                            schema_props.append("\"maximum\":" + str(p.max_val))
+                    elif p.param_type == "float":
+                        type_str = "number"
+                    elif p.param_type == "bool":
+                        type_str = "boolean"
+                    schema_props.append("\"type\":\"" + type_str + "\"")
+
+                    if len(p.default_val) > 0:
+                        schema_props.append("\"default\":\"" + p.default_val + "\"")
+                    if len(p.choices) > 0:
+                        ch_arr: list[str] = []
+                        for c in p.choices:
+                            ch_arr.append("\"" + c + "\"")
+                        schema_props.append("\"enum\":[" + ",".join(ch_arr) + "]")
+
+                    p_items.append("\"schema\":{" + ",".join(schema_props) + "}")
+                    param_entries.append("{" + ",".join(p_items) + "}")
+
+                # 2. Path params from URL path matching (if not declared in params)
+                for k in range(len(path_params)):
+                    p_name, p_type = path_params[k]
+                    if p_name not in handled_param_names:
+                        param_entries.append(
+                            "{\"name\":\"" + p_name + "\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"" + p_type + "\"}}"
+                        )
+
+                if len(param_entries) > 0:
+                    m_parts.append("\"parameters\":[" + ",".join(param_entries) + "]")
+
+                # RequestBody (Schema)
+                if rm.has_schema and len(rm.schema.rules) > 0:
+                    prop_entries: list[str] = []
+                    req_fields: list[str] = []
+                    for k in range(len(rm.schema.rules)):
+                        rule = rm.schema.rules[k]
+                        p_items: list[str] = []
+                        type_str = rule.field_type
+                        if type_str == "int":
+                            p_items.append("\"type\":\"integer\"")
+                            if rule.min_val != 0:
+                                p_items.append("\"minimum\":" + str(rule.min_val))
+                            if rule.max_val != 0:
+                                p_items.append("\"maximum\":" + str(rule.max_val))
+                        elif type_str == "float":
+                            p_items.append("\"type\":\"number\"")
+                        elif type_str == "bool":
+                            p_items.append("\"type\":\"boolean\"")
+                        else:
+                            p_items.append("\"type\":\"string\"")
+                            if rule.is_email:
+                                p_items.append("\"format\":\"email\"")
+                            if rule.min_len > 0:
+                                p_items.append("\"minLength\":" + str(rule.min_len))
+                            if rule.max_len > 0:
+                                p_items.append("\"maxLength\":" + str(rule.max_len))
+                            if len(rule.choices) > 0:
+                                c_arr: list[str] = []
+                                for c in rule.choices:
+                                    c_arr.append("\"" + c + "\"")
+                                p_items.append("\"enum\":[" + ",".join(c_arr) + "]")
+
+                        prop_entries.append("\"" + rule.name + "\":{" + ",".join(p_items) + "}")
+                        if rule.required:
+                            req_fields.append("\"" + rule.name + "\"")
+
+                    req_field_json = (",\"required\":[" + ",".join(req_fields) + "]") if len(req_fields) > 0 else ""
+                    schema_json = "{\"type\":\"object\",\"properties\":{" + ",".join(prop_entries) + "}" + req_field_json + "}"
+                    m_parts.append("\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":" + schema_json + "}}}")
+
+                # Security requirement per route
+                if len(rm.security_schemes) > 0:
+                    sec_list: list[str] = []
+                    for s_idx in range(len(rm.security_schemes)):
+                        sec_list.append("{\"" + rm.security_schemes[s_idx] + "\":[]}")
+                    m_parts.append("\"security\":[" + ",".join(sec_list) + "]")
+
+                # Responses
+                resp_entries: list[str] = [
+                    "\"" + str(rm.status_code) + "\":{\"description\":\"Successful Response\"}"
+                ]
+                if rm.has_schema or len(rm.params) > 0:
+                    resp_entries.append("\"422\":{\"description\":\"Validation Error\"}")
+                if len(rm.security_schemes) > 0:
+                    resp_entries.append("\"401\":{\"description\":\"Unauthorized / Authentication Required\"}")
+                resp_entries.append("\"500\":{\"description\":\"Internal Server Error\"}")
+
+                m_parts.append("\"responses\":{" + ",".join(resp_entries) + "}")
+
+                method_entries.append("\"" + rm.method + "\":{" + ",".join(m_parts) + "}")
+
+            path_entries.append("\"" + path + "\":{" + ",".join(method_entries) + "}")
+
+        # Components & Security Schemes
+        comp_parts: list[str] = []
+        if len(self.security_schemes) > 0:
+            sec_scheme_entries: list[str] = []
+            for s_name, s_obj in self.security_schemes.items():
+                sec_scheme_entries.append("\"" + s_name + "\":" + s_obj.to_openapi_dict_str())
+            comp_parts.append("\"securitySchemes\":{" + ",".join(sec_scheme_entries) + "}")
+
+        components_json = ""
+        if len(comp_parts) > 0:
+            components_json = ",\"components\":{" + ",".join(comp_parts) + "}"
+
+        json_out = (
+            "{\"openapi\":\"3.0.2\","
+            "\"info\":{\"title\":\"" + self.title + "\",\"version\":\"" + self.version + "\",\"description\":\"" + self.description + "\"},"
+            "\"paths\":{" + ",".join(path_entries) + "}" + components_json + "}"
+        )
+        return json_out
+
+    def generate_swagger_ui_html(self, openapi_url: str = "/openapi.json") -> str:
+        return (
+            "<!DOCTYPE html>\n"
+            "<html>\n"
+            "<head>\n"
+            "    <meta charset=\"UTF-8\">\n"
+            "    <title>" + self.title + " - Swagger UI</title>\n"
+            "    <link rel=\"stylesheet\" type=\"text/css\" href=\"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css\">\n"
+            "    <link rel=\"shortcut icon\" href=\"https://fastapi.tiangolo.com/img/favicon.png\">\n"
+            "    <style>\n"
+            "        html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }\n"
+            "        *, *:before, *:after { box-sizing: inherit; }\n"
+            "        body { margin: 0; background: #fafafa; font-family: sans-serif; }\n"
+            "        .swagger-ui .topbar { background-color: #0f172a; border-bottom: 2px solid #38bdf8; }\n"
+            "    </style>\n"
+            "</head>\n"
+            "<body>\n"
+            "    <div id=\"swagger-ui\"></div>\n"
+            "    <script src=\"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js\"></script>\n"
+            "    <script>\n"
+            "    window.onload = function() {\n"
+            "        SwaggerUIBundle({\n"
+            "            url: '" + openapi_url + "',\n"
+            "            dom_id: '#swagger-ui',\n"
+            "            presets: [SwaggerUIBundle.presets.apis],\n"
+            "            layout: 'BaseLayout',\n"
+            "            deepLinking: true,\n"
+            "            showExtensions: true,\n"
+            "            showCommonExtensions: true\n"
+            "        });\n"
+            "    }\n"
+            "    </script>\n"
+            "</body>\n"
+            "</html>"
+        )
+
+    def generate_redoc_html(self, openapi_url: str = "/openapi.json") -> str:
+        return (
+            "<!DOCTYPE html>\n"
+            "<html>\n"
+            "<head>\n"
+            "    <title>" + self.title + " - ReDoc</title>\n"
+            "    <meta charset=\"utf-8\"/>\n"
+            "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "    <link href=\"https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700\" rel=\"stylesheet\">\n"
+            "    <style>body { margin: 0; padding: 0; }</style>\n"
+            "</head>\n"
+            "<body>\n"
+            "    <redoc spec-url='" + openapi_url + "'></redoc>\n"
+            "    <script src=\"https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js\"></script>\n"
+            "</body>\n"
+            "</html>"
+        )

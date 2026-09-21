@@ -1,0 +1,54 @@
+from src.http.request import Request, url_decode
+from src.memory.slice import ByteSlice
+
+def test_url_decode():
+    assert url_decode("hello+world") == "hello world"
+    assert url_decode("hello%20world") == "hello world"
+    assert url_decode("foo%26bar%3Dbaz") == "foo&bar=baz"
+    assert url_decode("simple") == "simple"
+    print("[PASS] test_url_decode")
+
+def test_request_cookies():
+    req = Request()
+    cookie_str = "session_id=xyz789; theme=dark; token=jwt_token_123"
+    cookie_ptr = Ptr[byte](len(cookie_str) + 1)
+    req.headers.add_str("Cookie", cookie_str)
+
+    assert req.cookie("session_id") == "xyz789"
+    assert req.cookie("theme") == "dark"
+    assert req.cookie("token") == "jwt_token_123"
+    assert req.cookie("nonexistent", "fallback") == "fallback"
+    print("[PASS] test_request_cookies")
+
+def test_request_form():
+    req = Request()
+    form_str = "username=alice&age=25&bio=hello+world%21"
+    form_ptr = Ptr[byte](len(form_str) + 1)
+    for i in range(len(form_str)):
+        form_ptr[i] = byte(ord(form_str[i]))
+    req.body = ByteSlice(form_ptr, len(form_str))
+
+    assert req.form_param("username") == "alice"
+    assert req.form_param_int("age") == 25
+    assert req.form_param("bio") == "hello world!"
+    assert req.form_param("unknown", "default") == "default"
+    print("[PASS] test_request_form")
+
+def test_request_state():
+    req = Request()
+    req.set_state("user_id", "u_1001")
+    req.set_state("role", "admin")
+
+    assert req.get_state("user_id") == "u_1001"
+    assert req.get_state("role") == "admin"
+    assert req.get_state("missing", "guest") == "guest"
+    print("[PASS] test_request_state")
+
+def run():
+    test_url_decode()
+    test_request_cookies()
+    test_request_form()
+    test_request_state()
+
+if __name__ == "__main__":
+    run()

@@ -1,0 +1,192 @@
+from typing import Tuple, Optional
+import asyncio
+from asyncio import Future
+from src.os.socket import Socket
+from src.os.constants import SOL_SOCKET, EINTR, EAGAIN, EWOULDBLOCK
+from src.os.linux import (
+    recv as c_recv,
+    send as c_send,
+    getsockopt as c_getsockopt,
+    get_errno,
+    get_error_message
+)
+from src.core.async.loop import get_event_loop, EpollEventLoop
+
+SO_ERROR: i32 = i32(4)
+
+class AsyncStreamReader:
+    sock: Socket
+    loop: EpollEventLoop
+    buf: str
+
+    def __init__(self, sock: Socket, loop: Optional[EpollEventLoop] = None):
+        self.sock = sock
+        if loop is None:
+            self.loop = get_event_loop()
+        else:
+            self.loop = loop
+        self.buf = ""
+
+    def read_chunk_async(self, max_bytes: int = 4096):
+        fut = self.loop.create_future(str)
+        fd = int(self.sock.fd)
+
+        def on_readable():
+            # Read from non-blocking socket
+            raw_buf = Ptr[byte](max_bytes + 1)
+            n = c_recv(self.sock.fd, raw_buf, max_bytes, i32(0))
+            if n < 0:
+                err = get_errno()
+                if err == EAGAIN or err == EWOULDBLOCK or err == EINTR:
+                    return # keep waiting
+                self.loop.remove_reader(fd)
+                fut.set_result("")
+                return
+            elif n == 0:
+                # Connection closed by peer
+                self.loop.remove_reader(fd)
+                fut.set_result("")
+                return
+            
+            raw_buf[n] = byte(0)
+            data = str(raw_buf, n)
+            self.loop.remove_reader(fd)
+            fut.set_result(data)
+
+        self.loop.add_reader(fd, on_readable)
+        return fut
+
+    async def read(self, n: int = -1):
+        """Read up to `n` bytes from the stream asynchronously."""
+        if len(self.buf) > 0:
+            if n <= 0 or len(self.buf) <= n:
+                res = self.buf
+                self.buf = ""
+                return res
+            else:
+                res = self.buf[:n]
+                self.buf = self.buf[n:]
+                return res
+
+        chunk = await self.read_chunk_async(4096 if n <= 0 else n)
+        if len(chunk) == 0:
+            return ""
+        if n <= 0 or len(chunk) <= n:
+            return chunk
+        else:
+            res = chunk[:n]
+            self.buf = chunk[n:]
+            return res
+
+    async def readexactly(self, n: int):
+        """Read exactly `n` bytes from the stream asynchronously."""
+        while len(self.buf) < n:
+            chunk = await self.read_chunk_async(max(4096, n - len(self.buf)))
+            if len(chunk) == 0:
+                raise OSError("Unexpected EOF while reading " + str(n) + " bytes")
+            self.buf += chunk
+        
+        res = self.buf[:n]
+        self.buf = self.buf[n:]
+        return res
+
+    async def readline(self):
+        """Read one line up to '\n' asynchronously."""
+        while True:
+            idx = self.buf.find("\n")
+            if idx >= 0:
+                res = self.buf[:idx + 1]
+                self.buf = self.buf[idx + 1:]
+                return res
+            chunk = await self.read_chunk_async(1024)
+            if len(chunk) == 0:
+                # EOF reached
+                res = self.buf
+                self.buf = ""
+                return res
+            self.buf += chunk
+
+class AsyncStreamWriter:
+    sock: Socket
+    loop: EpollEventLoop
+
+    def __init__(self, sock: Socket, loop: Optional[EpollEventLoop] = None):
+        self.sock = sock
+        if loop is None:
+            self.loop = get_event_loop()
+        else:
+            self.loop = loop
+
+    def write_async(self, data: str):
+        fut = self.loop.create_future(int)
+        fd = int(self.sock.fd)
+        data_len = len(data)
+
+        def on_writable():
+            p = data.c_str()
+            n = c_send(self.sock.fd, p, data_len, i32(0))
+            if n < 0:
+                err = get_errno()
+                if err == EAGAIN or err == EWOULDBLOCK or err == EINTR:
+                    return # keep waiting
+                self.loop.remove_writer(fd)
+                fut.set_result(-1)
+                return
+            self.loop.remove_writer(fd)
+            fut.set_result(n)
+
+        self.loop.add_writer(fd, on_writable)
+        return fut
+
+    async def write(self, data: str):
+        """Write string to socket asynchronously until all bytes are transmitted."""
+        offset = 0
+        total = len(data)
+        while offset < total:
+            remaining = data[offset:]
+            sent = await self.write_async(remaining)
+            if sent <= 0:
+                raise OSError("Socket send failed or connection closed")
+            offset += sent
+
+    def close(self):
+        """Close the underlying socket."""
+        self.sock.close()
+
+async def open_connection(host: str, port: int):
+    """
+    Asynchronously establish a TCP connection to host:port.
+    Returns (reader, writer) tuple.
+    """
+    loop = get_event_loop()
+    sock = Socket.create_tcp_client(blocking=False)
+    fd = int(sock.fd)
+
+    # Begin non-blocking connect
+    # In Linux, connect on non-blocking socket returns False (EINPROGRESS)
+    sock.connect(host, port)
+
+    # Wait for socket to become writable via Epoll
+    fut = loop.create_future(bool)
+
+    def on_connected():
+        loop.remove_writer(fd)
+        # Check socket error
+        err_val = i32(0)
+        opt_len = i32(4)
+        c_getsockopt(sock.fd, SOL_SOCKET, SO_ERROR, __ptr__(err_val).as_byte(), __ptr__(opt_len))
+        if err_val != i32(0):
+            fut.set_result(False)
+        else:
+            fut.set_result(True)
+
+    loop.add_writer(fd, on_connected)
+    ok = await fut
+    if not ok:
+        sock.close()
+        raise OSError(f"Failed to connect to {host}:{port}")
+
+    sock.set_tcp_nodelay(True)
+    reader = AsyncStreamReader(sock, loop)
+    writer = AsyncStreamWriter(sock, loop)
+    return (reader, writer)

@@ -1,0 +1,42 @@
+from C import socket(i32, i32, i32) -> i32
+from C import setsockopt(i32, i32, i32, Ptr[byte], i32) -> i32
+from C import getsockopt(i32, i32, i32, Ptr[byte], Ptr[i32]) -> i32
+from C import bind(i32, Ptr[byte], i32) -> i32
+from C import connect(i32, Ptr[byte], i32) -> i32
+from C import listen(i32, i32) -> i32
+from C import accept4(i32, Ptr[byte], Ptr[i32], i32) -> i32
+from C import recv(i32, Ptr[byte], int, i32) -> int
+from C import send(i32, Ptr[byte], int, i32) -> int
+from C import close(i32) -> i32
+from C import fcntl(i32, i32, i32) -> i32
+from C import pipe(Ptr[i32]) -> i32
+from C import read(i32, Ptr[byte], int) -> int
+from C import write(i32, Ptr[byte], int) -> int
+
+from C import epoll_create1(i32) -> i32
+from C import epoll_ctl(i32, i32, i32, Ptr[byte]) -> i32
+from C import epoll_wait(i32, Ptr[byte], i32, i32) -> i32
+
+from C import __errno_location() -> Ptr[i32]
+from C import strerror(i32) -> Ptr[byte]
+from C import inet_pton(i32, Ptr[byte], Ptr[byte]) -> i32
+from C import htons(u16) -> u16
+from C import ntohs(u16) -> u16
+from C import fork() -> i32
+from C import getpid() -> i32
+from C import waitpid(i32, Ptr[i32], i32) -> i32
+from C import kill(i32, i32) -> i32
+
+def get_errno() -> i32:
+    return __errno_location()[0]
+
+def get_error_message(err: i32) -> str:
+    p = strerror(err)
+    if not p:
+        return "Unknown error"
+    # Find null terminator
+    length = 0
+    while p[length] != byte(0):
+        length += 1
+    return str(p, length)
+

@@ -1,0 +1,305 @@
+import time
+from typing import Callable
+from src.http.request import Request
+from src.http.response import Response
+from src.framework.route import RouteHandler
+from src.http.method import METHOD_OPTIONS
+from src.http.status import HttpStatus
+from src.http.exceptions import HTTPException
+
+# Base Middleware Class
+class Middleware:
+    def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        return next_handler.handle(req)
+
+# Recovery Middleware (Panic Isolation, HTTPException handling & Custom Exception Handlers)
+class RecoveryMiddleware(Middleware):
+    handlers: dict[int, Callable[[Request, HTTPException], Response]]
+
+    def __init__(self, handlers: Optional[dict[int, Callable[[Request, HTTPException], Response]]] = None):
+        if handlers is not None:
+            self.handlers = handlers
+        else:
+            self.handlers = dict[int, Callable[[Request, HTTPException], Response]]()
+
+    def add_handler(self, status_code: int, handler: Callable[[Request, HTTPException], Response]) -> None:
+        self.handlers[status_code] = handler
+
+    def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        try:
+            return next_handler.handle(req)
+        except HTTPException as e:
+            if e.status_code in self.handlers:
+                custom_fn = self.handlers[e.status_code]
+                return custom_fn(req, e)
+            reason = HttpStatus.get_reason_phrase(e.status_code)
+            resp = Response.json(
+                "{\"error\":\"" + reason + "\",\"status\":" + str(e.status_code) + ",\"detail\":\"" + e.detail + "\"}",
+                e.status_code
+            )
+            for i in range(len(e.headers)):
+                k, v = e.headers[i]
+                resp.set_header(k, v)
+            return resp
+        except Exception as e:
+            err_msg = str(e)
+            print("[ERROR] Panic recovered in request " + req.path_str() + ": " + err_msg)
+            return Response.json(
+                "{\"error\":\"Internal Server Error\",\"detail\":\"" + err_msg + "\"}",
+                500
+            )
+
+# Access Log Middleware
+class AccessLogMiddleware(Middleware):
+    def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        start_time = time.time()
+        resp = next_handler.handle(req)
+        duration_us = int((time.time() - start_time) * 1000000.0)
+        print("[ACCESS] " + req.path_str() + " -> " + str(resp.status_code) + " (" + str(duration_us) + "us)")
+        return resp
+
+# CORS Middleware (Preflight & Header Injection)
+class CORSMiddleware(Middleware):
+    allow_origin: str
+    allow_methods: str
+    allow_headers: str
+    allow_credentials: bool
+
+    def __init__(
+        self,
+        allow_origin: str = "*",
+        allow_methods: str = "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+        allow_headers: str = "Content-Type, Authorization, X-Requested-With",
+        allow_credentials: bool = True
+    ):
+        self.allow_origin = allow_origin
+        self.allow_methods = allow_methods
+        self.allow_headers = allow_headers
+        self.allow_credentials = allow_credentials
+
+    def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        if req.method == METHOD_OPTIONS:
+            preflight_resp = Response.text("", 204)
+            self._apply_cors_headers(preflight_resp)
+            return preflight_resp
+
+        resp = next_handler.handle(req)
+        self._apply_cors_headers(resp)
+        return resp
+
+    def _apply_cors_headers(self, resp: Response) -> None:
+        resp.set_header("Access-Control-Allow-Origin", self.allow_origin)
+        resp.set_header("Access-Control-Allow-Methods", self.allow_methods)
+        resp.set_header("Access-Control-Allow-Headers", self.allow_headers)
+        if self.allow_credentials:
+            resp.set_header("Access-Control-Allow-Credentials", "true")
+
+# Timing Middleware (Process Time Header)
+class TimingMiddleware(Middleware):
+    def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        t0 = time.time()
+        resp = next_handler.handle(req)
+        t_ms = (time.time() - t0) * 1000.0
+        resp.set_header("X-Process-Time", str(round(t_ms, 3)) + "ms")
+        return resp
+
+# Security Headers Middleware
+class SecurityHeadersMiddleware(Middleware):
+    def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        resp = next_handler.handle(req)
+        resp.set_header("X-Content-Type-Options", "nosniff")
+        resp.set_header("X-Frame-Options", "DENY")
+        resp.set_header("X-XSS-Protection", "1; mode=block")
+        resp.set_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        return resp
+
+# Request ID Middleware
+class RequestIdMiddleware(Middleware):
+    counter: int
+
+    def __init__(self):
+        self.counter = 0
+
+    def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        req_id = req.header("X-Request-ID")
+        if len(req_id) == 0:
+            self.counter += 1
+            req_id = "req-" + str(self.counter)
+        req.set_state("request_id", req_id)
+        resp = next_handler.handle(req)
+        resp.set_header("X-Request-ID", req_id)
+        return resp
+
+# Rate Limiter Middleware
+class RateLimiterMiddleware(Middleware):
+    max_requests: int
+    window_sec: float
+    current_window_start: float
+    request_count: int
+
+    def __init__(self, max_requests: int = 100000, window_sec: float = 1.0):
+        self.max_requests = max_requests
+        self.window_sec = window_sec
+        self.current_window_start = time.time()
+        self.request_count = 0
+
+    def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        now = time.time()
+        if now - self.current_window_start >= self.window_sec:
+            self.current_window_start = now
+            self.request_count = 0
+
+        self.request_count += 1
+        if self.request_count > self.max_requests:
+            resp = Response.text("Too Many Requests", 429)
+            resp.set_header("Retry-After", "1")
+            return resp
+
+        return next_handler.handle(req)
+
+# Trusted Host Middleware (Host Header Injection Guard)
+class TrustedHostMiddleware(Middleware):
+    allowed_hosts: list[str]
+    allow_any: bool
+
+    def __init__(self, allowed_hosts: list[str]):
+        self.allowed_hosts = allowed_hosts
+        self.allow_any = False
+        for i in range(len(allowed_hosts)):
+            if allowed_hosts[i] == "*":
+                self.allow_any = True
+                break
+
+    def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        if self.allow_any:
+            return next_handler.handle(req)
+
+        host_header = req.header("Host")
+        if len(host_header) == 0:
+            return Response.text("Invalid Host header", 400)
+
+        # Strip port if present, e.g. "localhost:8000" -> "localhost"
+        host = host_header
+        colon_idx = host_header.find(":")
+        if colon_idx >= 0:
+            host = host_header[:colon_idx]
+
+        matched = False
+        for i in range(len(self.allowed_hosts)):
+            pattern = self.allowed_hosts[i]
+            if pattern == host:
+                matched = True
+                break
+            if pattern.startswith("*."):
+                suffix = pattern[1:] # e.g. ".example.com"
+                if host.endswith(suffix) and len(host) > len(suffix):
+                    matched = True
+                    break
+
+        if not matched:
+            return Response.text("Invalid Host header", 400)
+
+        return next_handler.handle(req)
+
+# HTTPS Redirect Middleware (Enforces HTTPS by redirecting HTTP requests)
+class HTTPSRedirectMiddleware(Middleware):
+    def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        proto = req.header("X-Forwarded-Proto")
+        if proto == "http":
+            host = req.header("Host")
+            if len(host) == 0:
+                host = "localhost"
+            new_url = "https://" + host + req.path_str()
+            q = req.query_str()
+            if len(q) > 0:
+                new_url = new_url + "?" + q
+            return Response.redirect(new_url, 307)
+        return next_handler.handle(req)
+
+# Signed Cookie Session Helpers
+def _sign_session_data(data: str, secret: str) -> str:
+    h = 2166136261
+    combined = secret + ":" + data
+    for i in range(len(combined)):
+        h = (h ^ ord(combined[i])) * 16777619
+        h = h & 0xFFFFFFFF
+    return data + "." + str(h)
+
+def _verify_session_data(signed_data: str, secret: str) -> str:
+    dot_idx = signed_data.rfind(".")
+    if dot_idx < 0:
+        return ""
+    data = signed_data[:dot_idx]
+    sig = signed_data[dot_idx + 1:]
+    h = 2166136261
+    combined = secret + ":" + data
+    for i in range(len(combined)):
+        h = (h ^ ord(combined[i])) * 16777619
+        h = h & 0xFFFFFFFF
+    if str(h) == sig:
+        return data
+    return ""
+
+# Signed Cookie Session Middleware (Tamper-proof cookie session)
+class SignedCookieSessionMiddleware(Middleware):
+    cookie_name: str
+    secret_key: str
+    max_age: int
+    same_site: str
+    https_only: bool
+
+    def __init__(
+        self,
+        secret_key: str,
+        cookie_name: str = "session",
+        max_age: int = 1209600,
+        same_site: str = "Lax",
+        https_only: bool = False
+    ):
+        self.secret_key = secret_key
+        self.cookie_name = cookie_name
+        self.max_age = max_age
+        self.same_site = same_site
+        self.https_only = https_only
+
+    def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        cookie_val = req.cookie(self.cookie_name)
+        if len(cookie_val) > 0:
+            verified = _verify_session_data(cookie_val, self.secret_key)
+            if len(verified) > 0:
+                req.set_state("session", verified)
+
+        resp = next_handler.handle(req)
+
+        session_val = req.get_state("session")
+        if len(session_val) > 0:
+            signed = _sign_session_data(session_val, self.secret_key)
+            resp.set_cookie(
+                self.cookie_name,
+                signed,
+                max_age=self.max_age,
+                http_only=True,
+                secure=self.https_only,
+                same_site=self.same_site
+            )
+        return resp
+
+# Middleware Chain Adapter (Onion Execution)
+class MiddlewareChainHandler(RouteHandler):
+    middleware: Middleware
+    next_handler: RouteHandler
+
+    def __init__(self, middleware: Middleware, next_handler: RouteHandler):
+        self.middleware = middleware
+        self.next_handler = next_handler
+
+    def handle(self, req: Request) -> Response:
+        return self.middleware.handle(req, self.next_handler)
+
+def build_middleware_pipeline(middlewares: list[Middleware], terminal_handler: RouteHandler) -> RouteHandler:
+    curr = terminal_handler
+    i = len(middlewares) - 1
+    while i >= 0:
+        curr = MiddlewareChainHandler(middlewares[i], curr)
+        i -= 1
+    return curr

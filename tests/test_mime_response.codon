@@ -1,0 +1,44 @@
+from src.http.mime import MimeType
+from src.http.response import Response
+from src.memory.buffer import ByteBuffer
+
+def test_mime_mapping():
+    assert MimeType.from_path("index.html") == "text/html; charset=utf-8"
+    assert MimeType.from_path("/assets/style.css") == "text/css; charset=utf-8"
+    assert MimeType.from_path("bundle.min.js") == "application/javascript; charset=utf-8"
+    assert MimeType.from_path("data.json") == "application/json; charset=utf-8"
+    assert MimeType.from_path("logo.png") == "image/png"
+    assert MimeType.from_path("photo.jpg") == "image/jpeg"
+    assert MimeType.from_path("vector.svg") == "image/svg+xml"
+    assert MimeType.from_path("favicon.ico") == "image/x-icon"
+    assert MimeType.from_path("unknown.xyz123") == "application/octet-stream"
+    print("[PASS] test_mime_mapping")
+
+def test_response_redirect():
+    resp = Response.redirect("/dashboard", 302)
+    assert resp.status_code == 302
+    found_loc = False
+    for i in range(len(resp.custom_headers)):
+        k, v = resp.custom_headers[i]
+        if k == "Location" and v == "/dashboard":
+            found_loc = True
+            break
+    assert found_loc
+    print("[PASS] test_response_redirect")
+
+def test_response_cookies():
+    resp = Response.text("ok")
+    resp.set_cookie("auth_token", "abc123xyz", path="/", max_age=7200, http_only=True, same_site="Strict")
+    buf = ByteBuffer(512)
+    resp.serialize(buf, True)
+    serialized = buf.to_str()
+    assert "Set-Cookie: auth_token=abc123xyz; Path=/; Max-Age=7200; HttpOnly; SameSite=Strict" in serialized
+    print("[PASS] test_response_cookies")
+
+def run():
+    test_mime_mapping()
+    test_response_redirect()
+    test_response_cookies()
+
+if __name__ == "__main__":
+    run()

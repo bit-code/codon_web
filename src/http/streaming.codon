@@ -1,0 +1,73 @@
+# Streaming & Server-Sent Events (SSE) Protocol Engine for CodonWeb
+
+from typing import Optional
+
+def _to_hex_str(n: int) -> str:
+    if n == 0:
+        return "0"
+    digits = "0123456789abcdef"
+    res = list[str]()
+    num = n
+    while num > 0:
+        res.append(digits[num & 0x0F])
+        num >>= 4
+    # Reverse
+    i = 0
+    j = len(res) - 1
+    while i < j:
+        t = res[i]
+        res[i] = res[j]
+        res[j] = t
+        i += 1
+        j -= 1
+    return "".join(res)
+
+class ChunkedEncoder:
+    @staticmethod
+    def encode_chunk(data: str) -> str:
+        if len(data) == 0:
+            return ""
+        hex_len = _to_hex_str(len(data))
+        return hex_len + "\r\n" + data + "\r\n"
+
+    @staticmethod
+    def end_chunk() -> str:
+        return "0\r\n\r\n"
+
+    @staticmethod
+    def encode_all(chunks: list[str]) -> str:
+        res = list[str]()
+        for i in range(len(chunks)):
+            ch = chunks[i]
+            if len(ch) > 0:
+                res.append(ChunkedEncoder.encode_chunk(ch))
+        res.append(ChunkedEncoder.end_chunk())
+        return "".join(res)
+
+class ServerSentEvent:
+    data: str
+    event: str
+    id: str
+    retry: int
+
+    def __init__(self, data: str, event: str = "", id: str = "", retry: int = 0):
+        self.data = data
+        self.event = event
+        self.id = id
+        self.retry = retry
+
+    def format(self) -> str:
+        lines = list[str]()
+        if len(self.event) > 0:
+            lines.append("event: " + self.event)
+        if len(self.id) > 0:
+            lines.append("id: " + self.id)
+        if self.retry > 0:
+            lines.append("retry: " + str(self.retry))
+
+        # Support multi-line data
+        data_lines = self.data.split("\n")
+        for i in range(len(data_lines)):
+            lines.append("data: " + data_lines[i])
+
+        return "\n".join(lines) + "\n\n"

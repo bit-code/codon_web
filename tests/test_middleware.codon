@@ -1,0 +1,64 @@
+from src.framework.middleware import (
+    Middleware, RecoveryMiddleware, CORSMiddleware, TimingMiddleware,
+    build_middleware_pipeline
+)
+from src.framework.route import RouteHandler
+from src.http.request import Request
+from src.http.response import Response
+from src.http.method import METHOD_GET, METHOD_OPTIONS
+
+class PanicHandler(RouteHandler):
+    def handle(self, req: Request) -> Response:
+        raise ValueError("Simulated handler crash")
+
+class NormalHandler(RouteHandler):
+    def handle(self, req: Request) -> Response:
+        return Response.json("{\"ok\":true}")
+
+# 1. Test Recovery Middleware
+mws = list[Middleware]()
+mws.append(RecoveryMiddleware())
+pipeline1 = build_middleware_pipeline(mws, PanicHandler())
+resp1 = pipeline1.handle(Request())
+assert resp1.status_code == 500
+assert "Simulated handler crash" in resp1.body
+print("Test 1 (Recovery Middleware): PASSED")
+
+# 2. Test CORS Middleware
+cors_mws = list[Middleware]()
+cors_mws.append(CORSMiddleware(allow_origin="https://myapp.com"))
+pipeline2 = build_middleware_pipeline(cors_mws, NormalHandler())
+
+# GET request should have CORS headers
+req_get = Request()
+req_get.method = METHOD_GET
+resp2 = pipeline2.handle(req_get)
+assert resp2.status_code == 200
+
+has_origin = False
+for k, v in resp2.custom_headers:
+    if k == "Access-Control-Allow-Origin" and v == "https://myapp.com":
+        has_origin = True
+assert has_origin
+print("Test 2.1 (CORS GET headers): PASSED")
+
+# OPTIONS preflight request should return 204
+req_options = Request()
+req_options.method = METHOD_OPTIONS
+resp_opt = pipeline2.handle(req_options)
+assert resp_opt.status_code == 204
+print("Test 2.2 (CORS OPTIONS Preflight): PASSED")
+
+# 3. Test Timing Middleware
+timing_mws = list[Middleware]()
+timing_mws.append(TimingMiddleware())
+pipeline3 = build_middleware_pipeline(timing_mws, NormalHandler())
+resp3 = pipeline3.handle(Request())
+has_timing = False
+for k, v in resp3.custom_headers:
+    if k == "X-Process-Time":
+        has_timing = True
+assert has_timing
+print("Test 3 (Timing Middleware): PASSED")
+
+print("All Middleware unit tests PASSED successfully!")

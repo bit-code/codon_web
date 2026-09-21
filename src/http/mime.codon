@@ -1,0 +1,50 @@
+class MimeType:
+    @staticmethod
+    def get_extension(path: str) -> str:
+        dot = path.rfind(".")
+        if dot < 0:
+            return ""
+        # Make sure slash is not after dot
+        slash = path.rfind("/")
+        if slash > dot:
+            return ""
+        return path[dot:].lower()
+
+    @staticmethod
+    def from_path(path: str) -> str:
+        ext = MimeType.get_extension(path)
+        if ext == ".html" or ext == ".htm":
+            return "text/html; charset=utf-8"
+        elif ext == ".css":
+            return "text/css; charset=utf-8"
+        elif ext == ".js" or ext == ".mjs":
+            return "application/javascript; charset=utf-8"
+        elif ext == ".json":
+            return "application/json; charset=utf-8"
+        elif ext == ".png":
+            return "image/png"
+        elif ext == ".jpg" or ext == ".jpeg":
+            return "image/jpeg"
+        elif ext == ".gif":
+            return "image/gif"
+        elif ext == ".svg":
+            return "image/svg+xml"
+        elif ext == ".ico":
+            return "image/x-icon"
+        elif ext == ".webp":
+            return "image/webp"
+        elif ext == ".txt":
+            return "text/plain; charset=utf-8"
+        elif ext == ".xml":
+            return "application/xml; charset=utf-8"
+        elif ext == ".pdf":
+            return "application/pdf"
+        elif ext == ".wasm":
+            return "application/wasm"
+        elif ext == ".woff":
+            return "font/woff"
+        elif ext == ".woff2":
+            return "font/woff2"
+        elif ext == ".ttf":
+            return "font/ttf"
+        return "application/octet-stream"

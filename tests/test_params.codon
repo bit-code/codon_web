@@ -1,0 +1,68 @@
+from src.http.request import Request
+from src.http.params import Param, ParamsBinder
+from src.http.exceptions import UnprocessableEntityException
+
+def test_param_binding_valid():
+    req = Request()
+    req.path_params["id"] = "100"
+    req.query_params["page"] = "2"
+    req.query_params["verbose"] = "true"
+    req.parsed_query = True
+    req.headers.set("X-Client-Id", "client-999")
+    req.cookies["session"] = "sess_abc"
+    req.parsed_cookies = True
+
+    binder = ParamsBinder([
+        Param.path_int("id"),
+        Param.query_int("page", required=True, min_val=1, max_val=100),
+        Param.query("verbose", param_type="bool", default_val="false"),
+        Param.header("X-Client-Id", required=True),
+        Param.cookie("session", required=True)
+    ])
+
+    ok, vals, errs = binder.bind(req)
+    assert ok, "Binding should succeed"
+    assert len(errs) == 0
+    assert vals["id"] == "100"
+    assert vals["page"] == "2"
+    assert vals["verbose"] == "true"
+    assert vals["X-Client-Id"] == "client-999"
+    assert vals["session"] == "sess_abc"
+
+    # Test bind_or_raise
+    res_dict = binder.bind_or_raise(req)
+    assert res_dict["id"] == "100"
+    print("[PASS] test_param_binding_valid")
+
+def test_param_binding_invalid_and_missing():
+    req = Request()
+    req.query_params["page"] = "0" # violates min_val=1
+    req.parsed_query = True
+
+    binder = ParamsBinder([
+        Param.path("id", required=True), # Missing
+        Param.query_int("page", min_val=1, max_val=100),
+        Param.query("sort", choices=["asc", "desc"], default_val="asc"),
+        Param.header("Authorization", required=True) # Missing
+    ])
+
+    ok, vals, errs = binder.bind(req)
+    assert not ok, "Binding should fail"
+    assert len(errs) >= 3
+
+    # Check bind_or_raise raises UnprocessableEntityException (422)
+    threw_422 = False
+    try:
+        binder.bind_or_raise(req)
+    except UnprocessableEntityException as e:
+        threw_422 = True
+        assert e.status_code == 422
+    assert threw_422, "Should raise UnprocessableEntityException"
+    print("[PASS] test_param_binding_invalid_and_missing")
+
+def run():
+    test_param_binding_valid()
+    test_param_binding_invalid_and_missing()
+
+if __name__ == "__main__":
+    run()

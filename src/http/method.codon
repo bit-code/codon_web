@@ -1,0 +1,48 @@
+# HTTP Methods
+from src.memory.slice import ByteSlice
+
+METHOD_GET: i32 = i32(1)
+METHOD_POST: i32 = i32(2)
+METHOD_PUT: i32 = i32(3)
+METHOD_DELETE: i32 = i32(4)
+METHOD_HEAD: i32 = i32(5)
+METHOD_OPTIONS: i32 = i32(6)
+METHOD_PATCH: i32 = i32(7)
+METHOD_UNKNOWN: i32 = i32(0)
+
+class HttpMethod:
+    @staticmethod
+    def from_slice(s: ByteSlice) -> i32:
+        if s.equals_ascii("GET"):
+            return METHOD_GET
+        if s.equals_ascii("POST"):
+            return METHOD_POST
+        if s.equals_ascii("PUT"):
+            return METHOD_PUT
+        if s.equals_ascii("DELETE"):
+            return METHOD_DELETE
+        if s.equals_ascii("HEAD"):
+            return METHOD_HEAD
+        if s.equals_ascii("OPTIONS"):
+            return METHOD_OPTIONS
+        if s.equals_ascii("PATCH"):
+            return METHOD_PATCH
+        return METHOD_UNKNOWN
+
+    @staticmethod
+    def to_str(m: i32) -> str:
+        if m == METHOD_GET:
+            return "GET"
+        if m == METHOD_POST:
+            return "POST"
+        if m == METHOD_PUT:
+            return "PUT"
+        if m == METHOD_DELETE:
+            return "DELETE"
+        if m == METHOD_HEAD:
+            return "HEAD"
+        if m == METHOD_OPTIONS:
+            return "OPTIONS"
+        if m == METHOD_PATCH:
+            return "PATCH"
+        return "UNKNOWN"

@@ -1,0 +1,83 @@
+# Comprehensive Unit Test Runner for CodonWeb
+
+print("=== 1. Testing Memory & Slice ===")
+from test_memory import *
+
+print("\n=== 2. Testing Linux Socket ===")
+from test_socket import *
+
+print("\n=== 3. Testing Linux Epoll ===")
+from test_epoll import *
+
+print("\n=== 4. Testing HTTP Parser ===")
+from test_parser import *
+
+print("\n=== 5. Testing Radix Router ===")
+from test_router import *
+
+print("\n=== 6. Testing Middleware Pipeline ===")
+from test_middleware import *
+
+print("\n=== 7. Testing RouterGroup & Prefix ===")
+from test_group import *
+
+print("\n=== 8. Testing Request Context & JSON ===")
+from test_request_ext import *
+
+print("\n=== 9. Testing Extended Context & Cookies & Form ===")
+from test_context import *
+
+print("\n=== 10. Testing MIME & Redirect & Response Utilities ===")
+from test_mime_response import *
+
+print("\n=== 11. Testing Typed Schema & 422 Validation ===")
+from test_schema import *
+
+print("\n=== 12. Testing Static Files & Security Traversal Guard ===")
+from test_static import *
+
+print("\n=== 13. Testing Production Middlewares (Security, RequestID, RateLimit) ===")
+from test_production_middlewares import *
+
+print("\n=== 14. Testing First-Class HTTPException & Error Hierarchy ===")
+from test_exceptions import *
+
+print("\n=== 15. Testing Dependency Injection & Request Caching ===")
+from test_dependency import *
+
+print("\n=== 16. Testing Automated OpenAPI 3.0 & Swagger UI / ReDoc ===")
+from test_openapi import *
+
+print("\n=== 17. Testing Multipart Form Data & File Uploads ===")
+from test_multipart import *
+
+print("\n=== 18. Testing Post-Response Background Tasks ===")
+from test_background import *
+
+print("\n=== 19. Testing Unified Async Reactor & Async Routes ===")
+from test_async_route_unified import *
+
+print("\n=== 20. Testing End-to-End Async MySQL Route Integration ===")
+from test_async_mysql_routes import *
+
+print("\n=== 21. Testing Pure Codon RFC 6455 WebSocket Handshake & Frames ===")
+from test_ws_protocol import *
+
+print("\n=== 22. Testing FastAPI-Style In-Memory TestClient & TestResponse ===")
+from test_testclient import *
+
+print("\n=== 23. Testing FastAPI Dependency Overrides & Provider Engine ===")
+from test_dependency_override import *
+
+print("\n=== 24. Testing Static Files ETag & HTTP 304 Caching ===")
+from test_static_etag import *
+
+print("\n=== 25. Testing Advanced Middlewares (HTTPS Redirect & Signed Cookie Session) ===")
+from test_middlewares_ext import *
+
+print("\n=== 26. Testing Request & Response Extensions (Client IP, Full URL, Delete Cookie) ===")
+from test_request_ext2 import *
+
+print("\n=======================================================")
+print(">>> ALL 26 CODON_WEB UNIT & INTEGRATION TESTS PASSED! <<<")
+print("=======================================================")

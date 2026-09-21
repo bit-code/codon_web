@@ -1,0 +1,50 @@
+from src.memory.slice import ByteSlice
+
+@tuple
+class Header:
+    name: ByteSlice
+    value: ByteSlice
+
+class Headers:
+    items: list[Header]
+
+    def __init__(self):
+        self.items = []
+
+    def add(self, name: ByteSlice, value: ByteSlice) -> None:
+        self.items.append(Header(name, value))
+
+    def add_str(self, name: str, value: str) -> None:
+        n_ptr = name.c_str()
+        v_ptr = value.c_str()
+        self.items.append(Header(ByteSlice(n_ptr, len(name)), ByteSlice(v_ptr, len(value))))
+
+    def set(self, name: str, value: str) -> None:
+        n_ptr = name.c_str()
+        v_ptr = value.c_str()
+        new_h = Header(ByteSlice(n_ptr, len(name)), ByteSlice(v_ptr, len(value)))
+        for i in range(len(self.items)):
+            if self.items[i].name.equals_case_insensitive(name):
+                self.items[i] = new_h
+                return
+        self.items.append(new_h)
+
+    def get(self, name: str) -> ByteSlice:
+        for i in range(len(self.items)):
+            h = self.items[i]
+            if h.name.equals_case_insensitive(name):
+                return h.value
+        return ByteSlice(Ptr[byte](0), 0)
+
+    def has(self, name: str) -> bool:
+        for i in range(len(self.items)):
+            h = self.items[i]
+            if h.name.equals_case_insensitive(name):
+                return True
+        return False
+
+    def clear(self) -> None:
+        self.items.clear()
+
+    def count(self) -> int:
+        return len(self.items)

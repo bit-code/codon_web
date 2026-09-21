@@ -1,0 +1,237 @@
+# Unified Parameter Binding & Multi-Source Validation (FastAPI-style)
+
+from typing import Tuple, Optional
+from src.http.request import Request
+from src.http.exceptions import UnprocessableEntityException
+
+PARAM_PATH = "path"
+PARAM_QUERY = "query"
+PARAM_HEADER = "header"
+PARAM_COOKIE = "cookie"
+
+class Param:
+    name: str
+    source: str # "path", "query", "header", "cookie"
+    param_type: str # "str", "int", "float", "bool"
+    required: bool
+    default_val: str
+    description: str
+    min_val: int
+    max_val: int
+    choices: list[str]
+
+    def __init__(
+        self,
+        name: str,
+        source: str = "query",
+        param_type: str = "str",
+        required: bool = False,
+        default_val: str = "",
+        description: str = "",
+        min_val: int = 0,
+        max_val: int = 0,
+        choices: Optional[list[str]] = None
+    ):
+        self.name = name
+        self.source = source
+        self.param_type = param_type
+        self.required = required
+        self.default_val = default_val
+        self.description = description
+        self.min_val = min_val
+        self.max_val = max_val
+        if choices is not None:
+            self.choices = choices
+        else:
+            self.choices = list[str]()
+
+    @staticmethod
+    def path(name: str, param_type: str = "str", required: bool = True, description: str = "") -> Param:
+        return Param(
+            name=name,
+            source=PARAM_PATH,
+            param_type=param_type,
+            required=required,
+            default_val="",
+            description=description
+        )
+
+    @staticmethod
+    def path_int(name: str, required: bool = True, description: str = "") -> Param:
+        return Param(
+            name=name,
+            source=PARAM_PATH,
+            param_type="int",
+            required=required,
+            default_val="",
+            description=description
+        )
+
+    @staticmethod
+    def query(
+        name: str,
+        param_type: str = "str",
+        required: bool = False,
+        default_val: str = "",
+        description: str = "",
+        min_val: int = 0,
+        max_val: int = 0,
+        choices: Optional[list[str]] = None
+    ) -> Param:
+        return Param(
+            name=name,
+            source=PARAM_QUERY,
+            param_type=param_type,
+            required=required,
+            default_val=default_val,
+            description=description,
+            min_val=min_val,
+            max_val=max_val,
+            choices=choices
+        )
+
+    @staticmethod
+    def query_int(
+        name: str,
+        required: bool = False,
+        default_val: int = 0,
+        min_val: int = 0,
+        max_val: int = 0,
+        description: str = ""
+    ) -> Param:
+        def_str = str(default_val) if not required else ""
+        return Param(
+            name=name,
+            source=PARAM_QUERY,
+            param_type="int",
+            required=required,
+            default_val=def_str,
+            description=description,
+            min_val=min_val,
+            max_val=max_val
+        )
+
+    @staticmethod
+    def header(
+        name: str,
+        required: bool = False,
+        default_val: str = "",
+        description: str = "",
+        choices: Optional[list[str]] = None
+    ) -> Param:
+        return Param(
+            name=name,
+            source=PARAM_HEADER,
+            param_type="str",
+            required=required,
+            default_val=default_val,
+            description=description,
+            choices=choices
+        )
+
+    @staticmethod
+    def cookie(
+        name: str,
+        required: bool = False,
+        default_val: str = "",
+        description: str = "",
+        choices: Optional[list[str]] = None
+    ) -> Param:
+        return Param(
+            name=name,
+            source=PARAM_COOKIE,
+            param_type="str",
+            required=required,
+            default_val=default_val,
+            description=description,
+            choices=choices
+        )
+
+class ParamsBinder:
+    params: list[Param]
+
+    def __init__(self, params: Optional[list[Param]] = None):
+        if params is not None:
+            self.params = params
+        else:
+            self.params = list[Param]()
+
+    def add(self, p: Param) -> None:
+        self.params.append(p)
+
+    def bind(self, req: Request) -> Tuple[bool, dict[str, str], list[str]]:
+        values: dict[str, str] = {}
+        errors: list[str] = []
+
+        for i in range(len(self.params)):
+            p = self.params[i]
+            val = ""
+            val_found = False
+
+            if p.source == PARAM_PATH:
+                val = req.param(p.name)
+                val_found = len(val) > 0
+            elif p.source == PARAM_QUERY:
+                val = req.query_param(p.name, "")
+                val_found = len(val) > 0
+            elif p.source == PARAM_HEADER:
+                val = req.header(p.name, "")
+                val_found = len(val) > 0
+            elif p.source == PARAM_COOKIE:
+                val = req.cookie(p.name, "")
+                val_found = len(val) > 0
+
+            if not val_found:
+                if p.required:
+                    errors.append(p.source.capitalize() + " parameter '" + p.name + "' is required")
+                else:
+                    values[p.name] = p.default_val
+                continue
+
+            # Type and value constraints
+            val_clean = val.strip()
+
+            if p.param_type == "int":
+                try:
+                    num = int(val_clean)
+                    if p.min_val != 0 and num < p.min_val:
+                        errors.append(p.source.capitalize() + " parameter '" + p.name + "' must be >= " + str(p.min_val))
+                    if p.max_val != 0 and num > p.max_val:
+                        errors.append(p.source.capitalize() + " parameter '" + p.name + "' must be <= " + str(p.max_val))
+                    values[p.name] = str(num)
+                except:
+                    errors.append(p.source.capitalize() + " parameter '" + p.name + "' must be a valid integer")
+            elif p.param_type == "float":
+                try:
+                    _ = float(val_clean)
+                    values[p.name] = val_clean
+                except:
+                    errors.append(p.source.capitalize() + " parameter '" + p.name + "' must be a valid float")
+            elif p.param_type == "bool":
+                low = val_clean.lower()
+                if low in ["true", "1", "yes", "t"]:
+                    values[p.name] = "true"
+                elif low in ["false", "0", "no", "f"]:
+                    values[p.name] = "false"
+                else:
+                    errors.append(p.source.capitalize() + " parameter '" + p.name + "' must be a boolean (true/false)")
+            else:
+                if len(p.choices) > 0:
+                    matched = False
+                    for c in p.choices:
+                        if c == val_clean:
+                            matched = True
+                            break
+                    if not matched:
+                        errors.append(p.source.capitalize() + " parameter '" + p.name + "' must be one of: " + ", ".join(p.choices))
+                values[p.name] = val_clean
+
+        is_valid = len(errors) == 0
+        return (is_valid, values, errors)
+
+    def bind_or_raise(self, req: Request) -> dict[str, str]:
+        ok, vals, errs = self.bind(req)
+        if not ok:
+            detail = "; ".join(errs)
+            raise UnprocessableEntityException("Validation error: " + detail)
+        return vals

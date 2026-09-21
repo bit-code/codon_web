@@ -1,0 +1,189 @@
+from src.http.request import Request
+from src.http.response import Response
+from src.http.method import HttpMethod
+from src.framework.route import RouteHandler
+
+class RouteNode:
+    segment: str
+    is_param: bool
+    param_name: str
+    param_type: str # "int", "str"
+    is_wildcard: bool
+    handlers: dict[i32, RouteHandler]
+    children: list[RouteNode]
+
+    def __init__(self, segment: str = ""):
+        self.segment = segment
+        self.is_param = False
+        self.param_name = ""
+        self.param_type = "str"
+        self.is_wildcard = False
+        self.handlers = {}
+        self.children = []
+
+    def find_static_child(self, seg: str) -> Optional[RouteNode]:
+        for i in range(len(self.children)):
+            c = self.children[i]
+            if not c.is_param and not c.is_wildcard and c.segment == seg:
+                return c
+        return None
+
+    def find_param_child(self) -> Optional[RouteNode]:
+        for i in range(len(self.children)):
+            c = self.children[i]
+            if c.is_param:
+                return c
+        return None
+
+    def find_wildcard_child(self) -> Optional[RouteNode]:
+        for i in range(len(self.children)):
+            c = self.children[i]
+            if c.is_wildcard:
+                return c
+        return None
+
+class RadixRouter:
+    root: RouteNode
+    not_found_handler: Optional[RouteHandler]
+    method_not_allowed_handler: Optional[RouteHandler]
+
+    def __init__(self):
+        self.root = RouteNode("")
+        self.not_found_handler = None
+        self.method_not_allowed_handler = None
+
+    def _split_path(self, path: str) -> list[str]:
+        res: list[str] = []
+        plen = len(path)
+        if plen == 0:
+            return res
+        start = 0
+        while start < plen:
+            while start < plen and path[start] == '/':
+                start += 1
+            if start >= plen:
+                break
+            end = start
+            while end < plen and path[end] != '/':
+                end += 1
+            res.append(path[start:end])
+            start = end
+        return res
+
+    def add_route(self, method: i32, path: str, handler: RouteHandler) -> None:
+        segments = self._split_path(path)
+        curr = self.root
+
+        for i in range(len(segments)):
+            seg = segments[i]
+            if seg.startswith("{") and seg.endswith("}"):
+                param_spec = seg[1:-1]
+                param_name = param_spec
+                param_type = "str"
+                
+                colon_idx = -1
+                for j in range(len(param_spec)):
+                    if param_spec[j] == ':':
+                        colon_idx = j
+                        break
+                if colon_idx >= 0:
+                    param_name = param_spec[:colon_idx]
+                    param_type = param_spec[colon_idx + 1:]
+
+                param_child = curr.find_param_child()
+                if param_child is None:
+                    node = RouteNode(seg)
+                    node.is_param = True
+                    node.param_name = param_name
+                    node.param_type = param_type
+                    curr.children.append(node)
+                    curr = node
+                else:
+                    curr = param_child
+            elif seg == "*":
+                wc_child = curr.find_wildcard_child()
+                if wc_child is None:
+                    node = RouteNode("*")
+                    node.is_wildcard = True
+                    curr.children.append(node)
+                    curr = node
+                else:
+                    curr = wc_child
+                break
+            else:
+                static_child = curr.find_static_child(seg)
+                if static_child is None:
+                    node = RouteNode(seg)
+                    curr.children.append(node)
+                    curr = node
+                else:
+                    curr = static_child
+
+        curr.handlers[method] = handler
+
+    def _is_numeric(self, s: str) -> bool:
+        if len(s) == 0:
+            return False
+        for i in range(len(s)):
+            b = ord(s[i])
+            if b < 48 or b > 57:
+                return False
+        return True
+
+    def _handle_not_found(self, req: Request) -> Response:
+        if self.not_found_handler is not None:
+            return self.not_found_handler.handle(req)
+        return Response.text("Not Found", 404)
+
+    def _handle_method_not_allowed(self, req: Request) -> Response:
+        if self.method_not_allowed_handler is not None:
+            return self.method_not_allowed_handler.handle(req)
+        return Response.text("Method Not Allowed", 405)
+
+    def dispatch(self, req: Request) -> Response:
+        path_str = req.path_str()
+        segments = self._split_path(path_str)
+        curr = self.root
+        matched_params: dict[str, str] = {}
+
+        for i in range(len(segments)):
+            seg = segments[i]
+            # 1. Static match
+            static_child = curr.find_static_child(seg)
+            if static_child is not None:
+                curr = static_child
+                continue
+
+            # 2. Param match
+            param_child = curr.find_param_child()
+            if param_child is not None:
+                if param_child.param_type == "int":
+                    if not self._is_numeric(seg):
+                        return Response.text("Invalid path parameter type", 400)
+                matched_params[param_child.param_name] = seg
+                curr = param_child
+                continue
+
+            # 3. Wildcard match
+            wc_child = curr.find_wildcard_child()
+            if wc_child is not None:
+                # Store all remaining segments
+                remaining: list[str] = []
+                for k in range(i, len(segments)):
+                    remaining.append(segments[k])
+                matched_params["*"] = "/".join(remaining)
+                curr = wc_child
+                break
+
+            return self._handle_not_found(req)
+
+        # Check method handler
+        if req.method in curr.handlers:
+            req.path_params = matched_params
+            h = curr.handlers[req.method]
+            return h.handle(req)
+
+        if len(curr.handlers) > 0:
+            return self._handle_method_not_allowed(req)
+
+        return self._handle_not_found(req)

@@ -1,0 +1,652 @@
+from typing import Callable, Optional
+from asyncio import Coroutine
+from src.config.server import ServerConfig
+from src.os.socket import Socket
+from src.os.linux import (
+    fork as c_fork,
+    waitpid as c_waitpid,
+    getpid as c_getpid
+)
+from src.http.request import Request
+from src.http.response import Response
+from src.http.method import (
+    METHOD_GET, METHOD_POST, METHOD_PUT, METHOD_DELETE,
+    METHOD_HEAD, METHOD_OPTIONS, METHOD_PATCH
+)
+from src.http.schema import Schema
+from src.http.params import Param
+from src.http.exceptions import HTTPException
+from src.framework.route import SimpleHandler, RouteHandler, DependencyRouteHandler
+from src.framework.router import Router, RouterAdapter
+from src.framework.static import StaticFilesHandler
+from src.framework.middleware import (
+    Middleware, RecoveryMiddleware, build_middleware_pipeline
+)
+from src.framework.group import RouterGroup
+from src.framework.openapi import OpenAPIGenerator, RouteMeta
+from src.framework.security import SecurityScheme
+from src.framework.dependency import default_dependency_manager
+from src.framework.async_route import AsyncRouteHandler
+from src.runtime.async_context import AsyncContext
+from src.runtime.event_loop import EventLoop
+
+class AppState:
+    data: dict[str, str]
+
+    def __init__(self):
+        self.data = {}
+
+    def set(self, key: str, value: str) -> None:
+        self.data[key] = value
+
+    def get(self, key: str, default_val: str = "") -> str:
+        if key in self.data:
+            return self.data[key]
+        return default_val
+
+    def has(self, key: str) -> bool:
+        return key in self.data
+
+class OpenAPISpecHandler(RouteHandler):
+    generator: OpenAPIGenerator
+
+    def __init__(self, generator: OpenAPIGenerator):
+        self.generator = generator
+
+    def handle(self, req: Request) -> Response:
+        return Response.json(self.generator.generate_json(), 200)
+
+class SwaggerUIHandler(RouteHandler):
+    generator: OpenAPIGenerator
+    openapi_url: str
+
+    def __init__(self, generator: OpenAPIGenerator, openapi_url: str):
+        self.generator = generator
+        self.openapi_url = openapi_url
+
+    def handle(self, req: Request) -> Response:
+        return Response.html(self.generator.generate_swagger_ui_html(self.openapi_url), 200)
+
+class ReDocHandler(RouteHandler):
+    generator: OpenAPIGenerator
+    openapi_url: str
+
+    def __init__(self, generator: OpenAPIGenerator, openapi_url: str):
+        self.generator = generator
+        self.openapi_url = openapi_url
+
+    def handle(self, req: Request) -> Response:
+        return Response.html(self.generator.generate_redoc_html(self.openapi_url), 200)
+
+class App:
+    config: ServerConfig
+    router: Router
+    middlewares: list[Middleware]
+    recovery_mw: RecoveryMiddleware
+    event_loop: Optional[EventLoop]
+    startup_hooks: list[Callable[[], None]]
+    shutdown_hooks: list[Callable[[], None]]
+    openapi_generator: OpenAPIGenerator
+    docs_url: str
+    redoc_url: str
+    openapi_url: str
+    enable_openapi: bool
+    openapi_mounted: bool
+    state: AppState
+
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8000,
+        backlog: int = 4096,
+        read_buffer_size: int = 4096,
+        reuse_port: bool = True,
+        tcp_nodelay: bool = True,
+        workers: int = 1,
+        title: str = "CodonWeb API",
+        version: str = "0.1.0",
+        description: str = "High Performance Native Web API",
+        docs_url: str = "/docs",
+        redoc_url: str = "/redoc",
+        openapi_url: str = "/openapi.json",
+        enable_openapi: bool = True
+    ):
+        self.config = ServerConfig(
+            host=host,
+            port=port,
+            backlog=backlog,
+            read_buffer_size=read_buffer_size,
+            reuse_port=reuse_port,
+            tcp_nodelay=tcp_nodelay,
+            workers=workers
+        )
+        self.router = Router()
+        self.middlewares = list[Middleware]()
+        # Safe default: panic isolation and HTTPException guard
+        self.recovery_mw = RecoveryMiddleware()
+        self.middlewares.append(self.recovery_mw)
+        self.event_loop = None
+        self.startup_hooks = []
+        self.shutdown_hooks = []
+        self.openapi_generator = OpenAPIGenerator(title=title, version=version, description=description)
+        self.docs_url = docs_url
+        self.redoc_url = redoc_url
+        self.openapi_url = openapi_url
+        self.enable_openapi = enable_openapi
+        self.openapi_mounted = False
+        self.state = AppState()
+
+    def use(self, middleware: Middleware) -> None:
+        self.middlewares.append(middleware)
+
+    def add_exception_handler(self, status_code: int, handler: Callable[[Request, HTTPException], Response]) -> None:
+        self.recovery_mw.add_handler(status_code, handler)
+
+    def exception_handler(self, status_code: int):
+        def decorator(handler: Callable[[Request, HTTPException], Response]):
+            self.add_exception_handler(status_code, handler)
+            return handler
+        return decorator
+
+    def add_security_scheme(self, scheme: SecurityScheme) -> None:
+        if self.enable_openapi:
+            self.openapi_generator.add_security_scheme(scheme)
+
+    def override_dependency(self, name: str, mock_fn: Callable[[Request], None]) -> None:
+        default_dependency_manager.override(name, mock_fn)
+
+    def clear_dependency_overrides(self) -> None:
+        default_dependency_manager.clear()
+
+    def on_startup(self, fn: Callable[[], None]) -> None:
+        self.startup_hooks.append(fn)
+
+    def on_shutdown(self, fn: Callable[[], None]) -> None:
+        self.shutdown_hooks.append(fn)
+
+    def call_later(self, delay_sec: float, callback: Callable[[], None]) -> None:
+        if self.event_loop is not None:
+            loop = self.event_loop
+            loop.call_later(delay_sec, callback)
+
+    def call_later_ctx(self, delay_sec: float, ctx: AsyncContext, callback: Callable[[AsyncContext], None]) -> None:
+        if self.event_loop is not None:
+            loop = self.event_loop
+            loop.call_later_ctx(delay_sec, ctx, callback)
+
+    def set_not_found(self, fn: Callable[[Request], Response]) -> None:
+        self.router.set_not_found_handler(SimpleHandler(fn))
+
+    def set_method_not_allowed(self, fn: Callable[[Request], Response]) -> None:
+        self.router.set_method_not_allowed_handler(SimpleHandler(fn))
+
+    def group(
+        self,
+        prefix: str,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        tags: Optional[list[str]] = None
+    ) -> RouterGroup:
+        group_mws = list[Middleware]()
+        gen = self.openapi_generator if self.enable_openapi else None
+        return RouterGroup(
+            prefix,
+            self.router,
+            group_mws,
+            group_dependencies=dependencies,
+            group_tags=tags,
+            openapi_generator=gen
+        )
+
+    def add_route(
+        self,
+        method: i32,
+        path: str,
+        fn: Callable[[Request], Response],
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ) -> None:
+        base_handler: RouteHandler = SimpleHandler(fn)
+        if dependencies is not None and len(dependencies) > 0:
+            base_handler = DependencyRouteHandler(dependencies, base_handler)
+
+        self.router.add(method, path, base_handler)
+
+        if self.enable_openapi:
+            method_str = "get"
+            if method == METHOD_POST:
+                method_str = "post"
+            elif method == METHOD_PUT:
+                method_str = "put"
+            elif method == METHOD_DELETE:
+                method_str = "delete"
+            elif method == METHOD_PATCH:
+                method_str = "patch"
+            elif method == METHOD_HEAD:
+                method_str = "head"
+            elif method == METHOD_OPTIONS:
+                method_str = "options"
+
+            route_tags = list[str]()
+            if tags is not None:
+                for t in tags:
+                    route_tags.append(t)
+
+            meta = RouteMeta(
+                path=path,
+                method=method_str,
+                summary=summary,
+                description=description,
+                tags=route_tags,
+                status_code=status_code,
+                deprecated=deprecated,
+                has_schema=has_schema or (len(schema.rules) > 0),
+                schema=schema,
+                params=params,
+                security_schemes=security_schemes
+            )
+            self.openapi_generator.add_route(meta)
+
+    def static(self, url_prefix: str, dir_path: str, cache_control: str = "public, max-age=3600") -> None:
+        handler = StaticFilesHandler(dir_path, cache_control)
+        prefix = url_prefix
+        while prefix.endswith("/"):
+            prefix = prefix[:-1]
+        self.router.add(METHOD_GET, prefix + "/*", handler)
+        self.router.add(METHOD_HEAD, prefix + "/*", handler)
+
+    def mount_openapi_routes(self) -> None:
+        if not self.enable_openapi or self.openapi_mounted:
+            return
+        self.openapi_mounted = True
+
+        if len(self.openapi_url) > 0:
+            self.router.add(METHOD_GET, self.openapi_url, OpenAPISpecHandler(self.openapi_generator))
+        if len(self.docs_url) > 0:
+            self.router.add(METHOD_GET, self.docs_url, SwaggerUIHandler(self.openapi_generator, self.openapi_url))
+        if len(self.redoc_url) > 0:
+            self.router.add(METHOD_GET, self.redoc_url, ReDocHandler(self.openapi_generator, self.openapi_url))
+
+    def get(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(
+                METHOD_GET, path, fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return fn
+        return decorator
+
+    def post(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(
+                METHOD_POST, path, fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, schema=schema, has_schema=has_schema or (len(schema.rules) > 0),
+                params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return fn
+        return decorator
+
+    def put(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(
+                METHOD_PUT, path, fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, schema=schema, has_schema=has_schema or (len(schema.rules) > 0),
+                params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return fn
+        return decorator
+
+    def delete(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(
+                METHOD_DELETE, path, fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return fn
+        return decorator
+
+    def patch(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(
+                METHOD_PATCH, path, fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, schema=schema, has_schema=has_schema or (len(schema.rules) > 0),
+                params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+    def add_async_route(
+        self,
+        method: i32,
+        path: str,
+        async_fn: Callable[[Request], Coroutine[Response]],
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ) -> None:
+        async_h = AsyncRouteHandler(async_fn)
+        base_handler: RouteHandler = async_h
+        if dependencies is not None and len(dependencies) > 0:
+            base_handler = DependencyRouteHandler(dependencies, base_handler)
+
+        self.router.add(method, path, base_handler)
+
+        if self.enable_openapi:
+            method_str = "get"
+            if method == METHOD_POST:
+                method_str = "post"
+            elif method == METHOD_PUT:
+                method_str = "put"
+            elif method == METHOD_DELETE:
+                method_str = "delete"
+            elif method == METHOD_PATCH:
+                method_str = "patch"
+            elif method == METHOD_HEAD:
+                method_str = "head"
+            elif method == METHOD_OPTIONS:
+                method_str = "options"
+
+            route_tags = list[str]()
+            if tags is not None:
+                for t in tags:
+                    route_tags.append(t)
+
+            meta = RouteMeta(
+                path=path,
+                method=method_str,
+                summary=summary,
+                description=description,
+                tags=route_tags,
+                status_code=status_code,
+                deprecated=deprecated,
+                has_schema=has_schema or (len(schema.rules) > 0),
+                schema=schema,
+                params=params,
+                security_schemes=security_schemes
+            )
+            self.openapi_generator.add_route(meta)
+
+    def async_get(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(async_fn: Callable[[Request], Coroutine[Response]]):
+            self.add_async_route(
+                METHOD_GET, path, async_fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return async_fn
+        return decorator
+
+    def async_post(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(async_fn: Callable[[Request], Coroutine[Response]]):
+            self.add_async_route(
+                METHOD_POST, path, async_fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, schema=schema, has_schema=has_schema or (len(schema.rules) > 0),
+                params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return async_fn
+        return decorator
+
+    def async_put(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(async_fn: Callable[[Request], Coroutine[Response]]):
+            self.add_async_route(
+                METHOD_PUT, path, async_fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, schema=schema, has_schema=has_schema or (len(schema.rules) > 0),
+                params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return async_fn
+        return decorator
+
+    def async_delete(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(async_fn: Callable[[Request], Coroutine[Response]]):
+            self.add_async_route(
+                METHOD_DELETE, path, async_fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return async_fn
+        return decorator
+
+    def async_patch(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(async_fn: Callable[[Request], Coroutine[Response]]):
+            self.add_async_route(
+                METHOD_PATCH, path, async_fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, schema=schema, has_schema=has_schema or (len(schema.rules) > 0),
+                params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return async_fn
+        return decorator
+
+    def head(self, path: str):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(METHOD_HEAD, path, fn)
+            return fn
+        return decorator
+
+    def options(self, path: str):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(METHOD_OPTIONS, path, fn)
+            return fn
+        return decorator
+
+    def _run_worker(self, worker_id: int) -> None:
+        self.mount_openapi_routes()
+
+        sock = Socket.create_tcp()
+        sock.set_reuse_addr(True)
+        sock.set_reuse_port(True)
+        if self.config.tcp_nodelay:
+            sock.set_tcp_nodelay(True)
+
+        sock.bind(self.config.host, self.config.port)
+        sock.listen(self.config.backlog)
+
+        # Execute startup hooks
+        for i in range(len(self.startup_hooks)):
+            hook = self.startup_hooks[i]
+            hook()
+
+        # Build pipeline: global middlewares wrapping the router
+        base_adapter = RouterAdapter(self.router.radix)
+        pipeline_handler = build_middleware_pipeline(self.middlewares, base_adapter)
+
+        loop = EventLoop(
+            listen_socket=sock,
+            handler=pipeline_handler,
+            max_events=self.config.epoll_max_events,
+            buffer_size=self.config.read_buffer_size,
+            keep_alive_timeout_sec=float(self.config.keep_alive_timeout_ms) / 1000.0
+        )
+        self.event_loop = loop
+        loop.run()
+
+        # Execute shutdown hooks
+        for i in range(len(self.shutdown_hooks)):
+            hook = self.shutdown_hooks[i]
+            hook()
+
+    def run(self, host: str = "", port: int = 0, workers: int = 0) -> None:
+        if len(host) > 0:
+            self.config.host = host
+        if port > 0:
+            self.config.port = port
+        w = workers if workers > 0 else self.config.workers
+        if w <= 0:
+            w = 1
+
+        print("[CodonWeb] Starting server on http://" + self.config.host + ":" + str(self.config.port))
+        if self.enable_openapi:
+            print("[CodonWeb] Interactive API Docs: http://" + self.config.host + ":" + str(self.config.port) + self.docs_url)
+            print("[CodonWeb] ReDoc Docs:           http://" + self.config.host + ":" + str(self.config.port) + self.redoc_url)
+            print("[CodonWeb] OpenAPI 3.0 Spec:     http://" + self.config.host + ":" + str(self.config.port) + self.openapi_url)
+        print("[CodonWeb] Multi-Reactor workers: " + str(w) + ", Active middlewares: " + str(len(self.middlewares)))
+
+        if w == 1:
+            self._run_worker(0)
+            return
+
+        pids: list[i32] = []
+        for i in range(w):
+            pid = c_fork()
+            if pid < i32(0):
+                print("[CodonWeb] Error: failed to fork worker " + str(i))
+            elif pid == i32(0):
+                self._run_worker(i)
+                return
+            else:
+                pids.append(pid)
+
+        print("[CodonWeb] Master process monitoring " + str(len(pids)) + " worker processes")
+        status = i32(0)
+        for i in range(len(pids)):
+            c_waitpid(pids[i], __ptr__(status), i32(0))

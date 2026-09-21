@@ -1,0 +1,364 @@
+# Async MySQL Connection and Cursor Implementation (Pure Wire Protocol + Epoll Async Streams)
+
+from typing import Optional, List
+from src.core.async.stream import AsyncStreamReader, AsyncStreamWriter, open_connection
+from src.core.async.protocols import AsyncDriver
+from src.db.errors import (
+    DatabaseError, InterfaceError, OperationalError, ProgrammingError
+)
+from src.db.types import FieldInfo, Row
+from src.db.drivers.mysql.constants import (
+    COM_QUIT, COM_QUERY, COM_PING,
+    PACKET_OK, PACKET_EOF, PACKET_ERR,
+    DEFAULT_CLIENT_CAPABILITIES,
+    CHARSET_UTF8MB4_GENERAL_CI
+)
+from src.db.drivers.mysql.packet import PacketReader, PacketWriter
+from src.db.drivers.mysql.auth import (
+    scramble_caching_sha2, scramble_native_password
+)
+
+class AsyncMySQLCursor[Conn]:
+    _conn: Conn
+    _rows: List[Row]
+    _row_idx: int
+    _fields: List[FieldInfo]
+    _field_names: List[str]
+    _affected_rows: int
+    _last_insert_id: int
+
+    def __init__(self, conn: Conn):
+        self._conn = conn
+        self._rows = List[Row]()
+        self._row_idx = 0
+        self._fields = List[FieldInfo]()
+        self._field_names = List[str]()
+        self._affected_rows = 0
+        self._last_insert_id = 0
+
+    @property
+    def rowcount(self) -> int:
+        if len(self._rows) > 0:
+            return len(self._rows)
+        return self._affected_rows
+
+    @property
+    def lastrowid(self) -> int:
+        return self._last_insert_id
+
+    @property
+    def description(self) -> List[FieldInfo]:
+        return self._fields
+
+    def _reset(self) -> None:
+        self._rows.clear()
+        self._row_idx = 0
+        self._fields.clear()
+        self._field_names.clear()
+        self._affected_rows = 0
+        self._last_insert_id = 0
+
+    async def _read_packet(self):
+        hdr = await self._conn.stream_reader.readexactly(4)
+        b0 = ord(hdr[0])
+        b1 = ord(hdr[1])
+        b2 = ord(hdr[2])
+        pay_len = b0 | (b1 << 8) | (b2 << 16)
+        seq = ord(hdr[3])
+        payload = await self._conn.stream_reader.readexactly(pay_len)
+        self._conn.reader.load_payload(payload, seq)
+
+    async def execute(self, sql: str):
+        self._reset()
+        if self._conn is None or self._conn.is_closed:
+            raise InterfaceError("Cannot execute on closed Async MySQL connection")
+
+        writer = self._conn.writer
+        reader = self._conn.reader
+
+        # 1. Send COM_QUERY packet (0x03) asynchronously
+        writer.reset()
+        writer.write_uint8(COM_QUERY)
+        writer.write_str(sql)
+        pkt = writer.build_packet(0)
+        await self._conn.stream_writer.write(pkt)
+
+        # 2. Read first response packet asynchronously
+        await self._read_packet()
+
+        # Check for error
+        if reader.is_err():
+            err_code = reader.get_err_code()
+            err_msg = reader.get_err_message()
+            raise ProgrammingError(f"MySQL Error [{err_code}]: {err_msg}")
+
+        # Check for OK packet (INSERT, UPDATE, DELETE, etc.)
+        if reader.is_ok():
+            reader.advance(1) # Skip 0x00
+            self._affected_rows = reader.read_length_encoded_int()
+            self._last_insert_id = reader.read_length_encoded_int()
+            return self._affected_rows
+
+        # 3. Handle Result Set (SELECT, SHOW, etc.)
+        col_count = reader.read_length_encoded_int()
+        if col_count <= 0:
+            return 0
+
+        # Read Column Definition Packets
+        for i in range(col_count):
+            await self._read_packet()
+            if reader.is_err():
+                raise ProgrammingError("Error reading column definition: " + reader.get_err_message())
+
+            _catalog = reader.read_length_encoded_str()
+            _schema = reader.read_length_encoded_str()
+            table = reader.read_length_encoded_str()
+            _org_table = reader.read_length_encoded_str()
+            name = reader.read_length_encoded_str()
+            _org_name = reader.read_length_encoded_str()
+            _fixed_len = reader.read_length_encoded_int()
+
+            _charset = reader.read_uint16()
+            _col_len = reader.read_uint32()
+            col_type = reader.read_uint8()
+            flags = reader.read_uint16()
+            decimals = reader.read_uint8()
+
+            col_name = name if name is not None else f"col_{i}"
+            tbl_name = table if table is not None else ""
+            field = FieldInfo(col_name, tbl_name, col_type, flags, decimals)
+            self._fields.append(field)
+            self._field_names.append(col_name)
+
+        # Read EOF or OK packet after column definitions
+        await self._read_packet()
+        if reader.is_err():
+            raise ProgrammingError("Error after column definitions: " + reader.get_err_message())
+
+        # 4. Read Row Data Packets until EOF packet
+        while True:
+            await self._read_packet()
+            if reader.is_eof() or reader.is_ok():
+                break
+            if reader.is_err():
+                raise ProgrammingError("Error reading row data: " + reader.get_err_message())
+
+            # Decode columns
+            raw_values = List[Optional[str]]()
+            for _ in range(col_count):
+                val = reader.read_length_encoded_str()
+                raw_values.append(val)
+
+            row = Row(list(self._field_names), raw_values)
+            self._rows.append(row)
+
+        return len(self._rows)
+
+    def fetchone(self) -> Optional[Row]:
+        if self._row_idx < len(self._rows):
+            row = self._rows[self._row_idx]
+            self._row_idx += 1
+            return row
+        return None
+
+    def fetchall(self) -> List[Row]:
+        res = List[Row]()
+        while self._row_idx < len(self._rows):
+            res.append(self._rows[self._row_idx])
+            self._row_idx += 1
+        return res
+
+    def close(self) -> None:
+        self._reset()
+
+
+class AsyncMySQLConnection(AsyncDriver):
+    stream_reader: AsyncStreamReader
+    stream_writer: AsyncStreamWriter
+    reader: PacketReader
+    writer: PacketWriter
+    server_version: str
+    connection_id: int
+    auth_plugin_name: str
+    is_closed: bool
+
+    def __init__(
+        self,
+        stream_reader: AsyncStreamReader,
+        stream_writer: AsyncStreamWriter,
+        server_version: str,
+        connection_id: int,
+        auth_plugin_name: str
+    ):
+        self.stream_reader = stream_reader
+        self.stream_writer = stream_writer
+        self.reader = PacketReader()
+        self.writer = PacketWriter()
+        self.server_version = server_version
+        self.connection_id = connection_id
+        self.auth_plugin_name = auth_plugin_name
+        self.is_closed = False
+
+    def cursor(self) -> AsyncMySQLCursor[AsyncMySQLConnection]:
+        if self.is_closed:
+            raise InterfaceError("Connection is closed")
+        return AsyncMySQLCursor[AsyncMySQLConnection](self)
+
+    async def _read_packet(self):
+        hdr = await self.stream_reader.readexactly(4)
+        b0 = ord(hdr[0])
+        b1 = ord(hdr[1])
+        b2 = ord(hdr[2])
+        pay_len = b0 | (b1 << 8) | (b2 << 16)
+        seq = ord(hdr[3])
+        payload = await self.stream_reader.readexactly(pay_len)
+        self.reader.load_payload(payload, seq)
+
+    async def ping(self):
+        if self.is_closed:
+            return False
+        try:
+            self.writer.reset()
+            self.writer.write_uint8(COM_PING)
+            pkt = self.writer.build_packet(0)
+            await self.stream_writer.write(pkt)
+            await self._read_packet()
+            return self.reader.is_ok()
+        except:
+            return False
+
+    def close(self) -> None:
+        if not self.is_closed:
+            self.is_closed = True
+            try:
+                self.writer.reset()
+                self.writer.write_uint8(COM_QUIT)
+                # Best effort quit
+                pkt = self.writer.build_packet(0)
+                self.stream_writer.sock.send_str(pkt)
+            except:
+                pass
+            self.stream_writer.close()
+
+
+async def connect_async(
+    host: str = "127.0.0.1",
+    port: int = 3306,
+    user: str = "root",
+    password: str = "",
+    database: str = "",
+    charset: str = "utf8mb4"
+):
+    """
+    Asynchronously establishes a connection to MySQL server using non-blocking I/O.
+    """
+    stream_reader, stream_writer = await open_connection(host, port)
+    reader = PacketReader()
+    writer = PacketWriter()
+
+    # Helper to read framed packet asynchronously
+    async def read_pkt():
+        hdr = await stream_reader.readexactly(4)
+        b0 = ord(hdr[0])
+        b1 = ord(hdr[1])
+        b2 = ord(hdr[2])
+        pay_len = b0 | (b1 << 8) | (b2 << 16)
+        seq = ord(hdr[3])
+        payload = await stream_reader.readexactly(pay_len)
+        reader.load_payload(payload, seq)
+
+    # 1. Read HandshakeV10 packet asynchronously
+    await read_pkt()
+    if reader.is_err():
+        stream_writer.close()
+        raise OperationalError(f"MySQL Handshake Error [{reader.get_err_code()}]: {reader.get_err_message()}")
+
+    proto_ver = reader.read_uint8()
+    server_ver = reader.read_null_terminated_str()
+    conn_id = reader.read_uint32()
+
+    # Salt part 1 (8 bytes)
+    salt_part1 = reader.read_bytes(8)
+    reader.advance(1) # Filler byte 0x00
+
+    cap_low = reader.read_uint16()
+    _charset = reader.read_uint8()
+    _status = reader.read_uint16()
+    cap_high = reader.read_uint16()
+    server_capabilities = cap_low | (cap_high << 16)
+
+    auth_data_len = reader.read_uint8()
+    reader.advance(10) # 10 reserved bytes
+
+    # Salt part 2 (usually 12 bytes)
+    salt_part2_len = (auth_data_len - 8) if auth_data_len > 8 else 12
+    salt_part2 = reader.read_bytes(salt_part2_len)
+
+    # Reconstruct full 20-byte salt
+    salt = List[byte]()
+    for b in salt_part1:
+        salt.append(b)
+    for b in salt_part2:
+        if b == byte(0):
+            break
+        salt.append(b)
+
+    auth_plugin = reader.read_null_terminated_str()
+    if len(auth_plugin) == 0:
+        auth_plugin = "caching_sha2_password"
+
+    # 2. Compute Auth Scramble
+    auth_data = List[byte]()
+    if len(password) > 0:
+        if auth_plugin == "caching_sha2_password":
+            auth_data = scramble_caching_sha2(password, salt)
+        elif auth_plugin == "mysql_native_password":
+            auth_data = scramble_native_password(password, salt)
+        else:
+            auth_data = scramble_caching_sha2(password, salt)
+
+    # 3. Send HandshakeResponse41
+    client_flags = DEFAULT_CLIENT_CAPABILITIES
+    max_packet_size = 16777216
+
+    writer.reset()
+    writer.write_uint32(client_flags)
+    writer.write_uint32(max_packet_size)
+    writer.write_uint8(CHARSET_UTF8MB4_GENERAL_CI)
+    for _ in range(23):
+        writer.write_uint8(0)
+
+    writer.write_null_terminated_str(user)
+    writer.write_length_encoded_int(len(auth_data))
+    writer.write_bytes(auth_data)
+
+    if len(database) > 0:
+        writer.write_null_terminated_str(database)
+
+    writer.write_null_terminated_str(auth_plugin)
+
+    resp_pkt = writer.build_packet(1)
+    await stream_writer.write(resp_pkt)
+
+    # 4. Handle Fast Auth & OK Packets
+    await read_pkt()
+    if reader.is_err():
+        stream_writer.close()
+        raise OperationalError(f"Access denied for user '{user}': {reader.get_err_message()}")
+
+    # caching_sha2_password fast auth check (0x01 0x03)
+    if reader.length == 2 and int(reader.data[0]) == 1 and int(reader.data[1]) == 3:
+        # Fast auth successful, read final OK packet
+        await read_pkt()
+        if reader.is_err():
+            stream_writer.close()
+            raise OperationalError("Fast auth final OK failed: " + reader.get_err_message())
+
+    conn = AsyncMySQLConnection(
+        stream_reader=stream_reader,
+        stream_writer=stream_writer,
+        server_version=server_ver,
+        connection_id=conn_id,
+        auth_plugin_name=auth_plugin
+    )
+    return conn

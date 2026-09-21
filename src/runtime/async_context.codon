@@ -1,0 +1,38 @@
+# Native Asynchronous Context & Suspend/Resume Engine for CodonWeb
+
+import time
+from typing import Optional
+from src.http.response import Response
+
+class AsyncResumer:
+    def resume(self, fd: i32, resp: Response) -> bool:
+        return False
+
+class AsyncContext:
+    fd: i32
+    resumer: Optional[AsyncResumer]
+    is_completed: bool
+    is_aborted: bool
+    created_time: float
+
+    def __init__(self, fd: i32, resumer: Optional[AsyncResumer] = None):
+        self.fd = fd
+        self.resumer = resumer
+        self.is_completed = False
+        self.is_aborted = False
+        self.created_time = 0.0
+
+    def send(self, resp: Response) -> bool:
+        if self.is_completed or self.is_aborted:
+            return False
+        self.is_completed = True
+        if self.resumer is not None:
+            r = self.resumer
+            return r.resume(self.fd, resp)
+        return False
+
+    def abort(self) -> None:
+        self.is_aborted = True
+
+    def is_alive(self) -> bool:
+        return (not self.is_completed) and (not self.is_aborted)

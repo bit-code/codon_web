@@ -1,0 +1,84 @@
+import time
+from src.core.async import run, sleep
+from src.db.drivers.mysql.async_connection import connect_async
+
+async def test_async_mysql_handshake_and_query():
+    print("Testing Async MySQL Connection (172.23.176.1:13306)...")
+    conn = await connect_async(
+        host="172.23.176.1",
+        port=13306,
+        user="root",
+        password="hujinlong",
+        database="ths"
+    )
+
+    print(f"[PASS] Connected asynchronously! Server version: {conn.server_version}, Conn ID: {conn.connection_id}")
+    assert len(conn.server_version) > 0
+
+    # 1. Ping
+    pong = await conn.ping()
+    assert pong, "Async ping should succeed"
+    print("[PASS] Async ping succeeded!")
+
+    # 2. Constant query
+    cur = conn.cursor()
+    n = await cur.execute("SELECT 12345 AS num, 'codon_async' AS str_val")
+    assert n == 1
+    row = cur.fetchone()
+    assert row is not None
+    assert row.get_int(0) == 12345
+    assert row.get_str(1) == "codon_async"
+    print("[PASS] Constant query succeeded! Row:", row.to_json())
+
+    # 3. Real table query
+    n2 = await cur.execute("SELECT father_name, ds, sum_pq FROM result_pq LIMIT 3")
+    assert n2 > 0
+    rows = cur.fetchall()
+    assert len(rows) > 0
+    for r in rows:
+        print("  Real row -> Name:", r["father_name"], "DS:", r["ds"], "PQ:", r.get_float(2))
+    print("[PASS] Real data query succeeded!")
+
+    cur.close()
+    conn.close()
+    print("[PASS] Async MySQL Connection closed cleanly!")
+
+async def test_async_mysql_pool():
+    print("Testing Async MySQL Connection Pool...")
+    from src.db.async_pool import AsyncMySQLPool
+    pool = AsyncMySQLPool(
+        host="172.23.176.1",
+        port=13306,
+        user="root",
+        password="hujinlong",
+        database="ths",
+        min_size=2,
+        max_size=6
+    )
+    await pool.init_pool()
+    print("[PASS] Async pool pre-warmed successfully!")
+
+    # Acquire and query
+    conn = await pool.acquire()
+    cur = conn.cursor()
+    await cur.execute("SELECT father_name FROM result_pq LIMIT 1")
+    row = cur.fetchone()
+    assert row is not None
+    print("[PASS] Pool acquired connection executed query ->", row.to_json())
+    cur.close()
+    pool.release(conn)
+    print("[PASS] Connection returned to pool cleanly!")
+    pool.close()
+
+async def main():
+    print("=== Testing Industrial-Grade Async MySQL Driver & Pool ===")
+    await test_async_mysql_handshake_and_query()
+    await test_async_mysql_pool()
+    print("=== ALL ASYNC MYSQL & POOL TESTS PASSED! ===")
+
+def run():
+    from src.core.async import run as aio_run
+    aio_run(main())
+
+if __name__ == "__main__":
+    run()

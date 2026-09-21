@@ -1,0 +1,156 @@
+# High Performance MySQL Benchmark Server (worker=4)
+# Demonstrates unified single-reactor async database queries under heavy load
+
+from codon_web import App, Request, Response, AsyncMySQLPool
+import json
+
+app = App(enable_openapi=False)
+
+pool = AsyncMySQLPool(
+    host="172.23.176.1",
+    port=13306,
+    user="root",
+    password="hujinlong",
+    database="test",
+    min_size=10,
+    max_size=64
+)
+
+@app.get("/api/plaintext")
+def plaintext_handler(req: Request) -> Response:
+    return Response.text("Hello, World!", 200)
+
+# ==============================================================================
+# 性能对比组 1：纯 JSON 序列化对比（无 DB 瓶颈，纯 CPU / 序列化吞吐）
+# ==============================================================================
+
+# 接口 A（未使用 fast_json）：采用 Codon 官方标准库 json.dumps(d) 序列化
+@app.get("/api/json-std")
+def json_std_handler(req: Request) -> Response:
+    d = {
+        "status": "success",
+        "message": "User query processed successfully",
+        "user_id": "1022578",
+        "username": "antigravity_admin",
+        "email": "developer@codon-web.io",
+        "role": "system_administrator",
+        "region": "ap-east-1",
+        "tier": "enterprise_gold",
+        "server": "CodonWeb/0.1-Release",
+        "language": "Codon-Native-LLVM",
+        "active": "true"
+    }
+    return Response.json(json.dumps(d), 200)
+
+# 接口 B（使用 fast_json）：直接传入 dict 调用 FastJson yyjson 原生 SIMD 序列化
+@app.get("/api/json-fast")
+def json_fast_handler(req: Request) -> Response:
+    d = {
+        "status": "success",
+        "message": "User query processed successfully",
+        "user_id": "1022578",
+        "username": "antigravity_admin",
+        "email": "developer@codon-web.io",
+        "role": "system_administrator",
+        "region": "ap-east-1",
+        "tier": "enterprise_gold",
+        "server": "CodonWeb/0.1-Release",
+        "language": "Codon-Native-LLVM",
+        "active": "true"
+    }
+    return Response.json(d, 200)
+
+# ==============================================================================
+# 性能对比组 2：真实数据库查询结果序列化对比
+# ==============================================================================
+
+@app.async_get("/api/db-constant")
+async def db_constant_handler(req: Request):
+    async with pool.connection() as conn:
+        cur = conn.cursor()
+        await cur.execute("SELECT 1 AS num, 'codon' AS lang")
+        row = cur.fetchone()
+        cur.close()
+        if row is not None:
+            return Response.json(row.to_json(), 200)
+        return Response.json("{}", 200)
+
+# 接口 C（未使用 fast_json）：通过手写逐字段拼接生成 JSON
+@app.async_get("/api/db-real")
+async def db_real_handler(req: Request):
+    async with pool.connection() as conn:
+        cur = conn.cursor()
+        await cur.execute("SELECT * FROM mass_data where id=1022578")
+        row = cur.fetchone()
+        cur.close()
+        if row is not None:
+            return Response.json(row.to_json(), 200)
+        return Response.json("{}", 200)
+
+# 接口 D（使用 fast_json）：通过 FastJson yyjson SIMD 序列化字典
+@app.async_get("/api/db-real-fast")
+async def db_real_fast_handler(req: Request):
+    async with pool.connection() as conn:
+        cur = conn.cursor()
+        await cur.execute("SELECT * FROM mass_data where id=1022578")
+        row = cur.fetchone()
+        cur.close()
+        if row is not None:
+            return Response.json(row.to_dict(), 200)
+        return Response.json("{}", 200)
+
+if __name__ == "__main__":
+    import sys
+
+    workers = 4
+    port = 18080
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg.startswith("--workers="):
+            try:
+                workers = int(arg[10:])
+            except:
+                pass
+            i += 1
+        elif (arg == "-w" or arg == "--workers") and i + 1 < len(sys.argv):
+            try:
+                workers = int(sys.argv[i + 1])
+            except:
+                pass
+            i += 2
+        elif arg.startswith("--port="):
+            try:
+                port = int(arg[7:])
+            except:
+                pass
+            i += 1
+        elif (arg == "-p" or arg == "--port") and i + 1 < len(sys.argv):
+            try:
+                port = int(sys.argv[i + 1])
+            except:
+                pass
+            i += 2
+        else:
+            try:
+                val = int(arg)
+                if val > 0:
+                    workers = val
+            except:
+                pass
+            i += 1
+
+    if workers <= 0:
+        workers = 1
+
+    print("[CodonWeb] Dynamic workers configured: " + str(workers) + ", port: " + str(port))
+    app.run(host="0.0.0.0", port=port, workers=workers)
+
+
+    # 编译：CODON_PATH=. codon build -release --linker-flags 'src/native/libcfastjson.a' -o bench_mysql_server examples/bench_mysql_server.codon
+    # 运行：./bench_mysql_server --workers=4 --port=18080
+
+    #Wrk 压测脚本 (Wrk benchmarking script)wrk -t4 -c100 -d10s http://localhost:18080/api/json-std1
+    #Wrk 压测脚本 (Wrk benchmarking script)wrk -t4 -c100 -d10s http://localhost:18080/api/json-fast1
+    #Wrk 压测脚本 (Wrk benchmarking script)wrk -t4 -c100 -d10s http://localhost:18080/api/db-real1
+    #Wrk 压测脚本 (Wrk benchmarking script)wrk -t4 -c100 -d10s http://localhost:18080/api/db-real-fast

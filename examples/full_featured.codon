@@ -1,0 +1,59 @@
+from codon_web import (
+    App, Request, Response, CORSMiddleware, TimingMiddleware
+)
+
+app = App(workers=4)
+
+# Register global middleware
+app.use(TimingMiddleware())
+app.use(CORSMiddleware(allow_origin="*"))
+
+@app.get("/")
+def index(req: Request) -> Response:
+    return Response.json("{\"app\":\"CodonWeb\",\"version\":\"0.2\",\"status\":\"running\"}")
+
+# 1. API Route Grouping: /api/v1
+v1 = app.group("/api/v1")
+
+@v1.get("/health")
+def health(req: Request) -> Response:
+    return Response.json("{\"status\":\"healthy\",\"uptime\":\"ok\"}")
+
+# 2. Sub-group: /api/v1/users
+users = v1.group("/users")
+
+@users.get("/{id:int}")
+def get_user(req: Request) -> Response:
+    uid = req.param_int("id")
+    page = req.query_param_int("page", 1)
+    limit = req.query_param_int("limit", 20)
+    return Response.json(
+        "{\"id\":" + str(uid) + ",\"page\":" + str(page) + ",\"limit\":" + str(limit) + "}"
+    )
+
+@users.post("")
+def create_user(req: Request) -> Response:
+    data = req.json()
+    name = data["name"] if "name" in data else "Anonymous"
+    role = data["role"] if "role" in data else "user"
+    return Response.json(
+        "{\"created\":true,\"name\":\"" + name + "\",\"role\":\"" + role + "\"}",
+        201
+    )
+
+# 3. Auth Token Inspection
+@v1.get("/profile")
+def get_profile(req: Request) -> Response:
+    token = req.bearer_token()
+    if len(token) == 0:
+        return Response.json("{\"error\":\"Unauthorized\",\"message\":\"Missing Bearer Token\"}", 401)
+    return Response.json("{\"authenticated\":true,\"token_hash\":\"" + token[:8] + "...\"}")
+
+# 4. Resilience & Panic Guard Demonstration
+@app.get("/crash")
+def simulate_crash(req: Request) -> Response:
+    # Deliberately raise exception to test RecoveryMiddleware
+    raise RuntimeError("Simulated critical DB failure!")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, workers=4)

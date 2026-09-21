@@ -1,0 +1,203 @@
+# Full-featured FastAPI & Modern Web Framework Experience in CodonWeb
+# Native LLVM Ahead-of-Time Compiled Web Runtime with Sub-Microsecond Routing
+
+from typing import Callable
+from codon_web import (
+    App, Request, Response, Json, Schema,
+    Param, ParamsBinder,
+    HTTPBearer, SecurityScheme,
+    ServerSentEvent, ChunkedEncoder,
+    CORSMiddleware, TimingMiddleware, SecurityHeadersMiddleware,
+    RequestIdMiddleware, RateLimiterMiddleware, TrustedHostMiddleware,
+    HTTPException, BadRequestException, UnauthorizedException,
+    NotFoundException, UnprocessableEntityException,
+    UploadedFile, BackgroundTasks
+)
+
+# 1. Initialize Application with OpenAPI, Swagger UI & ReDoc Metadata
+app = App(
+    host="0.0.0.0",
+    port=8000,
+    workers=4,
+    title="CodonWeb Enterprise API",
+    version="1.0.0",
+    description="High-performance native compiled REST & Real-time Web API powered by Codon LLVM",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
+)
+
+# 2. Register Global Production Middlewares (Onion Pipeline)
+app.use(TrustedHostMiddleware(["*", "localhost", "127.0.0.1"]))
+app.use(CORSMiddleware(allow_origin="*", allow_credentials=True))
+app.use(SecurityHeadersMiddleware())
+app.use(RequestIdMiddleware())
+app.use(TimingMiddleware())
+app.use(RateLimiterMiddleware(max_requests=500000, window_sec=1.0))
+
+# 3. Application Global State Management (FastAPI app.state equivalent)
+app.state.set("app_name", "CodonWeb Enterprise")
+app.state.set("db_pool", "postgresql://app_user:secret@localhost:5432/production_db")
+app.state.set("redis_conn", "redis://localhost:6379/0")
+
+# 4. FastAPI-Style Security Scheme & Dependency (Swagger UI Authorize)
+security_bearer = HTTPBearer(
+    scheme_name="HTTPBearer",
+    bearer_format="JWT",
+    description="Enter JWT Bearer token for protected resources"
+)
+app.add_security_scheme(security_bearer.get_security_scheme())
+
+# 5. Application Lifecycle Hooks
+def on_boot():
+    print("[Lifecycle] CodonWeb worker initialized and ready to serve traffic.")
+    print("[Lifecycle] Connected to database: " + app.state.get("db_pool"))
+
+def on_stop():
+    print("[Lifecycle] CodonWeb worker gracefully shutting down.")
+
+app.on_startup(on_boot)
+app.on_shutdown(on_stop)
+
+# 6. Custom Exception Handlers (FastAPI @app.exception_handler equivalent)
+def custom_not_found(req: Request, exc: HTTPException) -> Response:
+    return Response.json(
+        "{\"code\":40401,\"error\":\"Resource Not Found\",\"requested\":\"" + req.path_str() + "\",\"detail\":\"" + exc.detail + "\"}",
+        404
+    )
+
+app.add_exception_handler(404, custom_not_found)
+
+# 7. Static Files Mounting
+app.static("/static", "tests/static_fixture")
+
+# 8. Dependency Injection Providers (FastAPI Depends() Equivalent)
+def require_auth(req: Request) -> None:
+    # Uses HTTPBearer security dependency and caches token in request lifecycle
+    token = security_bearer(req)
+    req.set_state("auth_user", "user_from_token_" + token)
+
+# 9. Post-Response Background Tasks
+def send_welcome_email():
+    print("[Background Task] Welcome email notification dispatched successfully!")
+
+def log_audit_trail():
+    print("[Background Task] Security audit trail appended to disk.")
+
+# 10. Root Welcome Endpoint
+@app.get("/", summary="Welcome Index", tags=["General"])
+def home(req: Request) -> Response:
+    trace_id = req.get_state("request_id")
+    return Response.html(
+        "<h1>Welcome to CodonWeb</h1>"
+        "<p>High Performance Compiled Web Runtime (FastAPI-Parity)</p>"
+        "<p><a href='/docs'>Interactive Swagger API Docs (with Authorize)</a> | <a href='/redoc'>ReDoc API Docs</a></p>"
+        "<small>Trace ID: " + trace_id + "</small>"
+    )
+
+# 11. Multi-Source Parameter Binding & 422 Validation (FastAPI Query/Path/Header)
+item_query_params = [
+    Param.path_int("item_id", description="Unique numeric item ID"),
+    Param.query_int("page", required=False, default_val=1, min_val=1, max_val=100, description="Page number"),
+    Param.query("sort", required=False, default_val="desc", choices=["asc", "desc"], description="Sort order"),
+    Param.header("X-Tenant-Id", required=False, default_val="default-tenant", description="Multi-tenant identifier")
+]
+
+@app.get(
+    "/api/items/{item_id}",
+    summary="Get Item Details with Multi-Source Params",
+    tags=["Catalog"],
+    params=item_query_params
+)
+def get_item_details(req: Request) -> Response:
+    # Validates Path, Query, Header parameters automatically
+    binder = ParamsBinder(item_query_params)
+    params = binder.bind_or_raise(req)
+
+    item_id = params["item_id"]
+    page = params["page"]
+    sort = params["sort"]
+    tenant = params["X-Tenant-Id"]
+
+    return Response.json(
+        "{\"item_id\":" + item_id + ",\"page\":" + page + ",\"sort\":\"" + sort + "\",\"tenant\":\"" + tenant + "\"}"
+    )
+
+# 12. Real-time Streaming & Server-Sent Events (AI / LLM Chat Streaming)
+@app.get("/api/llm/stream", summary="AI Token Stream (SSE)", tags=["AI / Streaming"])
+def llm_stream(req: Request) -> Response:
+    events = [
+        ServerSentEvent(data="CodonWeb is", event="token", id="1"),
+        ServerSentEvent(data="blazingly fast,", event="token", id="2"),
+        ServerSentEvent(data="compiled with LLVM", event="token", id="3"),
+        ServerSentEvent(data="[DONE]", event="finish", id="4")
+    ]
+    return Response.event_stream(events)
+
+# 13. Typed Schema Validation & Background Tasks (FastAPI Pydantic Equivalent)
+product_create_schema = Schema()
+product_create_schema.field_str("name", required=True, min_len=3, max_len=50)
+product_create_schema.field_float("price", required=True, min_val=0.01, max_val=99999.0)
+product_create_schema.field_int("stock", required=True, min_val=0, max_val=100000)
+product_create_schema.field_bool("is_published", required=False, default_val=True)
+product_create_schema.field_str("category", required=False, choices=["electronics", "clothing", "books"], default_val="electronics")
+
+@app.post("/api/products", summary="Create Product", tags=["Catalog"], schema=product_create_schema)
+def create_product(req: Request) -> Response:
+    data = req.json()
+    is_valid, bound_data, errors = product_create_schema.bind(data)
+    if not is_valid:
+        return Schema.validation_error_response(errors)
+
+    # Queue post-response background tasks
+    req.background_tasks.add_task(log_audit_trail)
+    req.background_tasks.add_task(send_welcome_email)
+
+    name = bound_data["name"]
+    price = bound_data["price"]
+    stock = bound_data["stock"]
+    cat = bound_data["category"]
+    pub = bound_data["is_published"]
+
+    return Response.json(
+        "{\"status\":\"created\",\"product\":{\"name\":\"" + name + "\",\"price\":" + price + ",\"stock\":" + stock + ",\"category\":\"" + cat + "\",\"is_published\":" + pub + "}}",
+        201
+    )
+
+# 14. File Uploads (multipart/form-data)
+@app.post("/api/upload", summary="File Upload", tags=["Media"])
+def handle_upload(req: Request) -> Response:
+    avatar = req.file("avatar")
+    if avatar is None:
+        raise BadRequestException("Missing 'avatar' file in multipart payload")
+
+    title = req.form_param("title", "Untitled")
+    filename = avatar.filename
+    size_bytes = avatar.size
+    return Response.json(
+        "{\"status\":\"uploaded\",\"title\":\"" + title + "\",\"filename\":\"" + filename + "\",\"bytes\":" + str(size_bytes) + "}"
+    )
+
+# 15. Protected Admin Router Group with HTTPBearer Security
+api = app.group("/api/v1", tags=["V1 API"])
+
+admin_deps = list[Callable[[Request], None]]()
+admin_deps.append(require_auth)
+admin = api.group(
+    "/admin",
+    dependencies=admin_deps,
+    tags=["Admin"]
+)
+
+@admin.get(
+    "/metrics",
+    summary="Admin Protected Metrics",
+    security_schemes=["HTTPBearer"]
+)
+def admin_metrics(req: Request) -> Response:
+    auth_user = req.get_state("auth_user")
+    app_name = app.state.get("app_name")
+    return Response.json("{\"app\":\"" + app_name + "\",\"operator\":\"" + auth_user + "\",\"active_workers\":4}")
+
+if __name__ == "__main__":
+    app.run()

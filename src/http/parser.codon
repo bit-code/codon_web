@@ -1,0 +1,157 @@
+from src.memory.slice import ByteSlice
+from src.http.method import HttpMethod, METHOD_UNKNOWN
+from src.http.request import Request
+
+PARSE_OK: i32 = i32(0)
+PARSE_NEED_MORE: i32 = i32(1)
+PARSE_ERROR: i32 = i32(2)
+
+class HttpParser:
+    max_header_size: int
+
+    def __init__(self, max_header_size: int = 8192):
+        self.max_header_size = max_header_size
+
+    def parse(self, src: ByteSlice, req: Request) -> Tuple[i32, int]:
+        # Returns (result_code, bytes_consumed)
+        if src.len == 0:
+            return (PARSE_NEED_MORE, 0)
+
+        # 1. Search for header terminator \r\n\r\n
+        header_end = -1
+        delim_len = 4
+        limit = src.len - 3
+        idx = 0
+        while idx < limit:
+            if src.ptr[idx] == byte(13) and src.ptr[idx + 1] == byte(10): # \r\n
+                if src.ptr[idx + 2] == byte(13) and src.ptr[idx + 3] == byte(10): # \r\n\r\n
+                    header_end = idx
+                    delim_len = 4
+                    break
+            idx += 1
+
+        # Fallback check for \n\n (RFC tolerant)
+        if header_end < 0:
+            idx = 0
+            limit_lf = src.len - 1
+            while idx < limit_lf:
+                if src.ptr[idx] == byte(10) and src.ptr[idx + 1] == byte(10): # \n\n
+                    header_end = idx
+                    delim_len = 2
+                    break
+                idx += 1
+
+        if header_end < 0:
+            if src.len > self.max_header_size:
+                return (PARSE_ERROR, 0)
+            return (PARSE_NEED_MORE, 0)
+
+        total_headers_len = header_end + delim_len
+
+        # 2. Parse Request Line: METHOD PATH[?QUERY] VERSION \r\n
+        line_end = -1
+        for i in range(header_end):
+            if src.ptr[i] == byte(10): # \n
+                line_end = i if i == 0 or src.ptr[i - 1] != byte(13) else i - 1
+                break
+        if line_end <= 0:
+            return (PARSE_ERROR, 0)
+
+        # Parse Method
+        cur = 0
+        while cur < line_end and src.ptr[cur] == byte(32): # skip spaces
+            cur += 1
+        m_start = cur
+        while cur < line_end and src.ptr[cur] != byte(32):
+            cur += 1
+        m_slice = src.slice(m_start, cur)
+        method = HttpMethod.from_slice(m_slice)
+        if method == METHOD_UNKNOWN:
+            return (PARSE_ERROR, 0)
+        req.method = method
+
+        # Parse Target (Path + Query)
+        while cur < line_end and src.ptr[cur] == byte(32):
+            cur += 1
+        target_start = cur
+        while cur < line_end and src.ptr[cur] != byte(32):
+            cur += 1
+        target_end = cur
+        if target_end <= target_start:
+            return (PARSE_ERROR, 0)
+
+        # Split target into path and query
+        q_pos = -1
+        for i in range(target_start, target_end):
+            if src.ptr[i] == byte(63): # '?'
+                q_pos = i
+                break
+        if q_pos >= 0:
+            req.path = src.slice(target_start, q_pos)
+            req.query = src.slice(q_pos + 1, target_end)
+        else:
+            req.path = src.slice(target_start, target_end)
+            req.query = ByteSlice(Ptr[byte](0), 0)
+
+        # Parse Version
+        while cur < line_end and src.ptr[cur] == byte(32):
+            cur += 1
+        req.version = src.slice(cur, line_end)
+
+        # 3. Parse Headers
+        cur = line_end + (2 if src.ptr[line_end] == byte(13) else 1)
+        content_length = 0
+
+        while cur < header_end:
+            # Find end of header line
+            h_line_end = header_end
+            for i in range(cur, header_end):
+                if src.ptr[i] == byte(10): # \n
+                    h_line_end = i if i == cur or src.ptr[i - 1] != byte(13) else i - 1
+                    break
+            
+            if h_line_end > cur:
+                colon_pos = -1
+                for i in range(cur, h_line_end):
+                    if src.ptr[i] == byte(58): # ':'
+                        colon_pos = i
+                        break
+                if colon_pos > cur:
+                    name_slice = src.slice(cur, colon_pos)
+                    val_start = colon_pos + 1
+                    while val_start < h_line_end and (src.ptr[val_start] == byte(32) or src.ptr[val_start] == byte(9)):
+                        val_start += 1
+                    val_slice = src.slice(val_start, h_line_end)
+                    req.headers.add(name_slice, val_slice)
+
+                    if name_slice.equals_case_insensitive("content-length"):
+                        ok, cl = val_slice.parse_int()
+                        if ok and cl >= 0:
+                            content_length = cl
+                    elif name_slice.equals_case_insensitive("connection"):
+                        if val_slice.equals_case_insensitive("close"):
+                            req.keep_alive = False
+                        elif val_slice.equals_case_insensitive("keep-alive"):
+                            req.keep_alive = True
+
+            next_cur = h_line_end
+            if next_cur < header_end and src.ptr[next_cur] == byte(13):
+                next_cur += 1
+            if next_cur < header_end and src.ptr[next_cur] == byte(10):
+                next_cur += 1
+            if next_cur <= cur:
+                break
+            cur = next_cur
+
+        # 4. Check Body
+        body_available = src.len - total_headers_len
+        if body_available < content_length:
+            return (PARSE_NEED_MORE, 0)
+
+        if content_length > 0:
+            req.body = src.slice(total_headers_len, total_headers_len + content_length)
+        else:
+            req.body = ByteSlice(Ptr[byte](0), 0)
+
+        consumed = total_headers_len + content_length
+        return (PARSE_OK, consumed)

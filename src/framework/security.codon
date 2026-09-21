@@ -1,0 +1,266 @@
+# FastAPI-Style Security & Authentication Subsystem for CodonWeb
+
+from typing import Optional, Tuple
+from src.http.request import Request
+from src.http.exceptions import UnauthorizedException, ForbiddenException
+
+# Pure Codon base64 decoder for HTTPBasic auth
+def _base64_decode(s: str) -> str:
+    tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    lookup = dict[int, int]()
+    for idx in range(len(tbl)):
+        lookup[ord(tbl[idx])] = idx
+
+    buf = 0
+    bits = 0
+    res = list[str]()
+
+    for i in range(len(s)):
+        c = s[i]
+        if c == '=':
+            break
+        code = ord(c)
+        if code in lookup:
+            buf = (buf << 6) | lookup[code]
+            bits += 6
+            if bits >= 8:
+                bits -= 8
+                byte_val = (buf >> bits) & 0xFF
+                res.append(chr(byte_val))
+
+    return "".join(res)
+
+class SecurityScheme:
+    name: str
+    scheme_type: str # "http", "apiKey"
+    scheme: str # "bearer", "basic"
+    bearer_format: str # "JWT"
+    in_location: str # "header", "query", "cookie"
+    param_name: str # e.g. "X-API-Key"
+    description: str
+
+    def __init__(
+        self,
+        name: str,
+        scheme_type: str = "http",
+        scheme: str = "bearer",
+        bearer_format: str = "",
+        in_location: str = "header",
+        param_name: str = "",
+        description: str = ""
+    ):
+        self.name = name
+        self.scheme_type = scheme_type
+        self.scheme = scheme
+        self.bearer_format = bearer_format
+        self.in_location = in_location
+        self.param_name = param_name
+        self.description = description
+
+    def to_openapi_dict_str(self) -> str:
+        parts: list[str] = ["\"type\":\"" + self.scheme_type + "\""]
+        if len(self.description) > 0:
+            parts.append("\"description\":\"" + self.description + "\"")
+        if self.scheme_type == "http":
+            parts.append("\"scheme\":\"" + self.scheme + "\"")
+            if len(self.bearer_format) > 0:
+                parts.append("\"bearerFormat\":\"" + self.bearer_format + "\"")
+        elif self.scheme_type == "apiKey":
+            parts.append("\"in\":\"" + self.in_location + "\"")
+            parts.append("\"name\":\"" + self.param_name + "\"")
+        return "{" + ",".join(parts) + "}"
+
+class HTTPBearer:
+    scheme_name: str
+    auto_error: bool
+    bearer_format: str
+    description: str
+
+    def __init__(
+        self,
+        scheme_name: str = "HTTPBearer",
+        bearer_format: str = "JWT",
+        auto_error: bool = True,
+        description: str = "Enter Bearer token"
+    ):
+        self.scheme_name = scheme_name
+        self.bearer_format = bearer_format
+        self.auto_error = auto_error
+        self.description = description
+
+    def __call__(self, req: Request) -> str:
+        token = req.bearer_token()
+        if len(token) == 0:
+            if self.auto_error:
+                exc = UnauthorizedException("Not authenticated")
+                exc.add_header("WWW-Authenticate", "Bearer")
+                raise exc
+            return ""
+        req.set_state("auth_token", token)
+        return token
+
+    def get_security_scheme(self) -> SecurityScheme:
+        return SecurityScheme(
+            name=self.scheme_name,
+            scheme_type="http",
+            scheme="bearer",
+            bearer_format=self.bearer_format,
+            description=self.description
+        )
+
+class HTTPBasicCredentials:
+    username: str
+    password: str
+
+    def __init__(self, username: str = "", password: str = ""):
+        self.username = username
+        self.password = password
+
+class HTTPBasic:
+    scheme_name: str
+    auto_error: bool
+    description: str
+
+    def __init__(
+        self,
+        scheme_name: str = "HTTPBasic",
+        auto_error: bool = True,
+        description: str = "Enter HTTP Basic credentials"
+    ):
+        self.scheme_name = scheme_name
+        self.auto_error = auto_error
+        self.description = description
+
+    def __call__(self, req: Request) -> HTTPBasicCredentials:
+        auth = req.header("Authorization")
+        if auth.startswith("Basic ") and len(auth) > 6:
+            encoded = auth[6:].strip()
+            decoded = _base64_decode(encoded)
+            colon = decoded.find(":")
+            if colon >= 0:
+                user = decoded[:colon]
+                pwd = decoded[colon + 1:]
+                req.set_state("auth_user", user)
+                return HTTPBasicCredentials(user, pwd)
+
+        if self.auto_error:
+            exc = UnauthorizedException("Not authenticated with HTTP Basic")
+            exc.add_header("WWW-Authenticate", "Basic")
+            raise exc
+        return HTTPBasicCredentials("", "")
+
+    def get_security_scheme(self) -> SecurityScheme:
+        return SecurityScheme(
+            name=self.scheme_name,
+            scheme_type="http",
+            scheme="basic",
+            description=self.description
+        )
+
+class APIKeyHeader:
+    name: str
+    scheme_name: str
+    auto_error: bool
+    description: str
+
+    def __init__(
+        self,
+        name: str = "X-API-Key",
+        scheme_name: str = "APIKeyHeader",
+        auto_error: bool = True,
+        description: str = "API Key via HTTP Header"
+    ):
+        self.name = name
+        self.scheme_name = scheme_name
+        self.auto_error = auto_error
+        self.description = description
+
+    def __call__(self, req: Request) -> str:
+        key = req.header(self.name)
+        if len(key) == 0:
+            if self.auto_error:
+                raise ForbiddenException("Missing required API key in header '" + self.name + "'")
+            return ""
+        req.set_state("api_key", key)
+        return key
+
+    def get_security_scheme(self) -> SecurityScheme:
+        return SecurityScheme(
+            name=self.scheme_name,
+            scheme_type="apiKey",
+            in_location="header",
+            param_name=self.name,
+            description=self.description
+        )
+
+class APIKeyQuery:
+    name: str
+    scheme_name: str
+    auto_error: bool
+    description: str
+
+    def __init__(
+        self,
+        name: str = "api_key",
+        scheme_name: str = "APIKeyQuery",
+        auto_error: bool = True,
+        description: str = "API Key via Query Parameter"
+    ):
+        self.name = name
+        self.scheme_name = scheme_name
+        self.auto_error = auto_error
+        self.description = description
+
+    def __call__(self, req: Request) -> str:
+        key = req.query_param(self.name)
+        if len(key) == 0:
+            if self.auto_error:
+                raise ForbiddenException("Missing required API key in query '" + self.name + "'")
+            return ""
+        req.set_state("api_key", key)
+        return key
+
+    def get_security_scheme(self) -> SecurityScheme:
+        return SecurityScheme(
+            name=self.scheme_name,
+            scheme_type="apiKey",
+            in_location="query",
+            param_name=self.name,
+            description=self.description
+        )
+
+class APIKeyCookie:
+    name: str
+    scheme_name: str
+    auto_error: bool
+    description: str
+
+    def __init__(
+        self,
+        name: str = "session_token",
+        scheme_name: str = "APIKeyCookie",
+        auto_error: bool = True,
+        description: str = "API Key via Cookie"
+    ):
+        self.name = name
+        self.scheme_name = scheme_name
+        self.auto_error = auto_error
+        self.description = description
+
+    def __call__(self, req: Request) -> str:
+        key = req.cookie(self.name)
+        if len(key) == 0:
+            if self.auto_error:
+                raise ForbiddenException("Missing required API key in cookie '" + self.name + "'")
+            return ""
+        req.set_state("api_key", key)
+        return key
+
+    def get_security_scheme(self) -> SecurityScheme:
+        return SecurityScheme(
+            name=self.scheme_name,
+            scheme_type="apiKey",
+            in_location="cookie",
+            param_name=self.name,
+            description=self.description
+        )

@@ -1,0 +1,40 @@
+# Unit Test for Static Files ETag & 304 Not Modified Caching
+
+from codon_web import App, TestClient
+
+app = App()
+app.static("/static", "tests/static_fixture")
+
+client = TestClient(app)
+
+print("=== Testing Static Files ETag & HTTP 304 Caching Negotiation ===")
+
+# 1. Initial GET: should return 200 OK and ETag header
+r1 = client.get("/static/hello.txt")
+assert r1.status_code == 200, "Expected 200 OK, got: " + str(r1.status_code)
+assert len(r1.text) > 0, "Expected file body"
+etag = r1.header("etag")
+assert len(etag) > 0, "Missing ETag header in response"
+assert etag.startswith("W/\""), "Expected weak ETag format W/... got: " + etag
+print("[PASS] 1. Initial file request returned 200 OK with ETag: " + etag)
+
+# 2. Conditional GET with matching If-None-Match: should return 304 Not Modified
+cond_headers = dict[str, str]()
+cond_headers["If-None-Match"] = etag
+
+r2 = client.get("/static/hello.txt", headers=cond_headers)
+assert r2.status_code == 304, "Expected 304 Not Modified, got: " + str(r2.status_code)
+assert len(r2.text) == 0, "304 response body must be empty, got: " + r2.text
+assert r2.header("etag") == etag, "304 response missing ETag header"
+print("[PASS] 2. Conditional request with matching ETag returned 304 Not Modified (zero body)")
+
+# 3. Conditional GET with mismatched ETag: should return 200 OK
+mismatch_headers = dict[str, str]()
+mismatch_headers["If-None-Match"] = "W/\"999-mismatch\""
+
+r3 = client.get("/static/hello.txt", headers=mismatch_headers)
+assert r3.status_code == 200, "Expected 200 OK on ETag mismatch, got: " + str(r3.status_code)
+assert len(r3.text) > 0, "Expected body on mismatch"
+print("[PASS] 3. Conditional request with mismatched ETag returned 200 OK")
+
+print("\n>>> ALL STATIC ETAG & 304 CACHING TESTS PASSED! <<<")

@@ -1,0 +1,68 @@
+from src.http.request import Request
+from src.http.response import Response
+from src.http.exceptions import UnauthorizedException
+from src.framework.app import App
+from src.framework.route import SimpleHandler, DependencyRouteHandler
+from src.memory.slice import ByteSlice
+
+provider_calls = 0
+
+def get_current_user(req: Request) -> str:
+    global provider_calls
+    provider_calls += 1
+    token = req.bearer_token()
+    if len(token) == 0:
+        raise UnauthorizedException("Missing bearer authorization")
+    return "user_" + token
+
+def test_dependency_injection():
+    global provider_calls
+    provider_calls = 0
+
+    req = Request()
+    req.headers.set("Authorization", "Bearer secret123")
+
+    # 1. Test request-scoped caching
+    u1 = req.depends_str("user", get_current_user)
+    assert u1 == "user_secret123"
+    assert provider_calls == 1
+
+    # Second call uses cache, provider_calls remains 1
+    u2 = req.depends_str("user", get_current_user)
+    assert u2 == "user_secret123"
+    assert provider_calls == 1
+
+    # 2. Test DependencyRouteHandler auth guard
+    def auth_guard(r: Request) -> None:
+        u = r.depends_str("user", get_current_user)
+        r.set_state("auth_user", u)
+
+    def protected_endpoint(r: Request) -> Response:
+        return Response.text("Hello " + r.get_state("auth_user"), 200)
+
+    deps = list[Callable[[Request], None]]()
+    deps.append(auth_guard)
+    handler = DependencyRouteHandler(deps, SimpleHandler(protected_endpoint))
+
+    # Request with auth token succeeds
+    resp = handler.handle(req)
+    assert resp.status_code == 200
+    assert resp.body == "Hello user_secret123"
+
+    # Request without auth token raises UnauthorizedException
+    unauth_req = Request()
+    threw_unauth = False
+    try:
+        handler.handle(unauth_req)
+    except UnauthorizedException as e:
+        threw_unauth = True
+        assert e.status_code == 401
+    assert threw_unauth
+
+    print("[PASS] test_dependency_injection")
+
+def run():
+    test_dependency_injection()
+
+if __name__ == "__main__":
+    run()

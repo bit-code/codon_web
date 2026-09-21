@@ -1,0 +1,139 @@
+# Comprehensive Verification Test for Unified Async Reactor & Async Routes
+# Tests async route registration, coroutine execution, error recovery, client abort guard, and async with pooling
+
+import time
+from typing import Optional
+from src.http.request import Request
+from src.http.response import Response
+from src.http.exceptions import HTTPException, ForbiddenException
+from src.runtime.async_context import AsyncContext, AsyncResumer
+from src.framework.app import App
+from src.framework.route import RouteHandler
+from src.memory.slice import ByteSlice
+from src.http.method import METHOD_GET
+from src.core.async.loop import get_event_loop, create_task
+from asyncio import sleep
+
+class MockClientResumer(AsyncResumer):
+    resumed_fd: i32
+    received_status: int
+    received_body: str
+    call_count: int
+
+    def __init__(self):
+        self.resumed_fd = i32(-1)
+        self.received_status = 0
+        self.received_body = ""
+        self.call_count = 0
+
+    def resume(self, fd: i32, resp: Response) -> bool:
+        self.resumed_fd = fd
+        self.received_status = resp.status_code
+        self.received_body = resp.body
+        self.call_count += 1
+        return True
+
+app = App()
+
+# 1. Register Async Compute Route
+@app.async_get("/api/v1/async-compute")
+async def async_compute_handler(req: Request):
+    await sleep(0.01)
+    return Response.json("{\"tag\":\"compute_v1\",\"processed\":true}", 200)
+
+# 2. Register Async Route with HTTPException
+@app.async_get("/api/v1/secure")
+async def secure_handler(req: Request):
+    await sleep(0.005)
+    raise ForbiddenException("Access Denied: Missing API Token")
+    return Response.text("", 200)
+
+# 3. Register Async Route for Abort Guard
+@app.async_get("/api/v1/long-poll")
+async def long_poll_handler(req: Request):
+    await sleep(0.05)
+    return Response.text("should_not_send", 200)
+
+# ----------------- Execution & Verification -----------------
+print("=== Testing CodonWeb Unified Async Reactor & Async Routes ===")
+loop = get_event_loop()
+
+# Test 1: Async Route Dispatch & Suspend/Resume
+print("\n--- Test 1: Async Route Dispatch & Suspend/Resume ---")
+resumer1 = MockClientResumer()
+base_r1: AsyncResumer = resumer1
+
+req1 = Request()
+req1.method = METHOD_GET
+req1.fd = i32(42)
+req1.async_resumer = base_r1
+p1 = "/api/v1/async-compute"
+req1.path = ByteSlice(p1.c_str(), len(p1))
+
+deferred_resp1 = app.router.dispatch(req1)
+assert deferred_resp1.is_deferred, "Handler must return deferred response"
+assert resumer1.call_count == 0, "Response must not be sent synchronously"
+
+start1 = time.time()
+while resumer1.call_count == 0 and (time.time() - start1 < 1.0):
+    loop.run_one_iteration(5)
+
+assert resumer1.call_count == 1, "Resumer should be called once"
+assert resumer1.resumed_fd == i32(42)
+assert resumer1.received_status == 200
+assert "compute_v1" in resumer1.received_body
+print("[PASS] Test 1: Async route executed and resumed cleanly! Body:", resumer1.received_body)
+
+# Test 2: Exception Guard (HTTPException Handling in Coroutine)
+print("\n--- Test 2: Exception Guard in Coroutine ---")
+resumer2 = MockClientResumer()
+base_r2: AsyncResumer = resumer2
+
+req2 = Request()
+req2.method = METHOD_GET
+req2.fd = i32(88)
+req2.async_resumer = base_r2
+p2 = "/api/v1/secure"
+req2.path = ByteSlice(p2.c_str(), len(p2))
+
+deferred_resp2 = app.router.dispatch(req2)
+assert deferred_resp2.is_deferred
+
+start2 = time.time()
+while resumer2.call_count == 0 and (time.time() - start2 < 1.0):
+    loop.run_one_iteration(5)
+
+assert resumer2.call_count == 1
+assert resumer2.received_status == 403
+assert "Access Denied" in resumer2.received_body
+print("[PASS] Test 2: ForbiddenException caught and 403 returned! Body:", resumer2.received_body)
+
+# Test 3: Client Abort Guard
+print("\n--- Test 3: Client Abort Guard ---")
+resumer3 = MockClientResumer()
+base_r3: AsyncResumer = resumer3
+
+req3 = Request()
+req3.method = METHOD_GET
+req3.fd = i32(99)
+req3.async_resumer = base_r3
+p3 = "/api/v1/long-poll"
+req3.path = ByteSlice(p3.c_str(), len(p3))
+
+deferred_resp3 = app.router.dispatch(req3)
+assert deferred_resp3.is_deferred
+assert req3.async_ctx is not None
+if req3.async_ctx is not None:
+    c = req3.async_ctx
+    c.abort()
+
+start3 = time.time()
+while (time.time() - start3 < 0.1):
+    loop.run_one_iteration(5)
+
+assert resumer3.call_count == 0, "Aborted request must not trigger socket write"
+print("[PASS] Test 3: Client abort guard verified (zero writes to aborted socket)!")
+
+print("\n=======================================================")
+print(">>> ALL UNIFIED ASYNC REACTOR & ROUTE TESTS PASSED! <<<")
+print("=======================================================")

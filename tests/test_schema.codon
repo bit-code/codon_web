@@ -1,0 +1,78 @@
+from src.http.schema import Schema
+
+def test_schema_valid():
+    schema = Schema()
+    schema.field_str("username", required=True, min_len=3, max_len=20)
+    schema.field_int("age", required=True, min_val=18, max_val=120)
+
+    data = {"username": "alice", "age": "25"}
+    is_valid, errors = schema.validate(data)
+    assert is_valid
+    assert len(errors) == 0
+    print("[PASS] test_schema_valid")
+
+def test_schema_missing_and_invalid():
+    schema = Schema()
+    schema.field_str("username", required=True, min_len=3)
+    schema.field_int("age", required=True, min_val=18)
+    schema.field_str("optional_tag", required=False)
+
+    # Missing username, age under 18
+    data = {"age": "16"}
+    is_valid, errors = schema.validate(data)
+    assert not is_valid
+    assert len(errors) == 2
+    assert "Field 'username' is required" in errors[0]
+    assert "Field 'age' must be >= 18" in errors[1]
+
+    # Non-integer age
+    data_bad_int = {"username": "bob", "age": "not_an_int"}
+    is_valid2, errors2 = schema.validate(data_bad_int)
+    assert not is_valid2
+    assert "Field 'age' must be a valid integer" in errors2[0]
+
+    # Test 422 Response generation
+    resp_422 = Schema.validation_error_response(errors)
+    assert resp_422.status_code == 422
+    assert "Unprocessable Entity" in resp_422.body
+    print("[PASS] test_schema_missing_and_invalid")
+
+def test_schema_advanced():
+    schema = Schema()
+    schema.field_float("price", required=True, min_val=0.5, max_val=999.9)
+    schema.field_bool("in_stock", required=True)
+    schema.field_str("email", required=True, is_email=True)
+    schema.field_str("tier", required=False, choices=["free", "pro", "enterprise"], default_val="free")
+
+    # Valid data
+    valid_data = {
+        "price": "19.99",
+        "in_stock": "true",
+        "email": "dev@example.com"
+    }
+    ok, bound, errs = schema.bind(valid_data)
+    assert ok
+    assert len(errs) == 0
+    assert bound["tier"] == "free" # default applied
+    assert bound["price"] == "19.99"
+    assert bound["in_stock"] == "true"
+
+    # Invalid email & out of range price & invalid choice
+    bad_data = {
+        "price": "1500.0",
+        "in_stock": "yes",
+        "email": "not_an_email",
+        "tier": "invalid_tier"
+    }
+    ok2, _, errs2 = schema.bind(bad_data)
+    assert not ok2
+    assert len(errs2) == 3
+    print("[PASS] test_schema_advanced")
+
+def run():
+    test_schema_valid()
+    test_schema_missing_and_invalid()
+    test_schema_advanced()
+
+if __name__ == "__main__":
+    run()

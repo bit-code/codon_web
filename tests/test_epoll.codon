@@ -1,0 +1,38 @@
+from src.runtime.epoll import Epoll, EpollEvent
+from src.os.constants import EPOLLIN, EPOLLET
+from src.os.linux import pipe as c_pipe, close as c_close, write as c_write, read as c_read
+
+ep = Epoll(10)
+fds = (i32(0), i32(0))
+ret = c_pipe(__ptr__(fds[0]))
+assert ret == i32(0)
+
+rfd = fds[0]
+wfd = fds[1]
+
+ep.add(rfd, EPOLLIN)
+
+# Initially no events with 0 timeout
+events = ep.wait(0)
+assert len(events) == 0
+
+# Write 4 bytes to pipe
+msg = "ping"
+c_write(wfd, msg.c_str(), 4)
+
+# Now wait should return event
+events = ep.wait(100)
+assert len(events) == 1
+assert events[0].fd == rfd
+assert (events[0].events & EPOLLIN) != u32(0)
+
+# Read from pipe
+buf = Ptr[byte](16)
+n = c_read(rfd, buf, 16)
+assert n == 4
+
+ep.remove(rfd)
+c_close(rfd)
+c_close(wfd)
+ep.close()
+print("Epoll tests PASSED successfully!")

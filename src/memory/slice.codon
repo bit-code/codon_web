@@ -1,0 +1,90 @@
+# ByteSlice is an unboxed, zero-allocation reference to a contiguous byte segment.
+# In Codon, @tuple gives it value-semantics (stored on stack or in registers).
+
+@tuple
+class ByteSlice:
+    ptr: Ptr[byte]
+    len: int
+
+    def __bool__(self) -> bool:
+        return self.len > 0
+
+    def is_empty(self) -> bool:
+        return self.len == 0
+
+    def get(self, idx: int) -> byte:
+        if idx < 0 or idx >= self.len:
+            raise IndexError("ByteSlice index out of range")
+        return self.ptr[idx]
+
+    def slice(self, start: int, end: int) -> ByteSlice:
+        s = start if start >= 0 else 0
+        e = end if end <= self.len else self.len
+        if s >= e:
+            return ByteSlice(Ptr[byte](0), 0)
+        return ByteSlice(self.ptr + s, e - s)
+
+    def equals_ascii(self, other: str) -> bool:
+        if self.len != len(other):
+            return False
+        # Byte-by-byte direct comparison
+        c_str = other.c_str()
+        for i in range(self.len):
+            if self.ptr[i] != c_str[i]:
+                return False
+        return True
+
+    def equals_case_insensitive(self, other: str) -> bool:
+        if self.len != len(other):
+            return False
+        c_str = other.c_str()
+        for i in range(self.len):
+            b1 = int(self.ptr[i])
+            b2 = int(c_str[i])
+            # Lowercase 'A'..'Z' -> 'a'..'z'
+            if 65 <= b1 <= 90:
+                b1 += 32
+            if 65 <= b2 <= 90:
+                b2 += 32
+            if b1 != b2:
+                return False
+        return True
+
+    def equals_slice(self, other: ByteSlice) -> bool:
+        if self.len != other.len:
+            return False
+        for i in range(self.len):
+            if self.ptr[i] != other.ptr[i]:
+                return False
+        return True
+
+    def to_str(self) -> str:
+        if self.len <= 0:
+            return ""
+        buf = Ptr[byte](self.len + 1)
+        for i in range(self.len):
+            buf[i] = self.ptr[i]
+        buf[self.len] = byte(0)
+        return str(buf, self.len)
+
+    def parse_int(self) -> Tuple[bool, int]:
+        # Fast ASCII integer parser without allocations or exceptions
+        if self.len == 0:
+            return (False, 0)
+        val = 0
+        idx = 0
+        neg = False
+        if self.ptr[0] == byte(45): # '-'
+            neg = True
+            idx = 1
+        elif self.ptr[0] == byte(43): # '+'
+            idx = 1
+        if idx >= self.len:
+            return (False, 0)
+        while idx < self.len:
+            b = int(self.ptr[idx])
+            if b < 48 or b > 57: # '0'..'9'
+                return (False, 0)
+            val = val * 10 + (b - 48)
+            idx += 1
+        return (True, -val if neg else val)

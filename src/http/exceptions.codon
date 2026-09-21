@@ -1,0 +1,51 @@
+# First-class HTTP Exception Hierarchy for CodonWeb
+
+from src.http.status import HttpStatus
+
+class HTTPException(Exception):
+    status_code: int
+    detail: str
+    headers: list[Tuple[str, str]]
+
+    def __init__(self, status_code: int, detail: str = "", headers: Optional[list[Tuple[str, str]]] = None):
+        self.status_code = status_code
+        if len(detail) == 0:
+            self.detail = HttpStatus.get_reason_phrase(status_code)
+        else:
+            self.detail = detail
+        if headers is not None:
+            self.headers = headers
+        else:
+            self.headers = list[Tuple[str, str]]()
+        super().__init__(self.detail)
+
+    def add_header(self, name: str, value: str) -> None:
+        self.headers.append((name, value))
+
+class BadRequestException(HTTPException):
+    def __init__(self, detail: str = "Bad Request", headers: Optional[list[Tuple[str, str]]] = None):
+        super().__init__(400, detail, headers)
+
+class UnauthorizedException(HTTPException):
+    def __init__(self, detail: str = "Unauthorized", headers: Optional[list[Tuple[str, str]]] = None):
+        super().__init__(401, detail, headers)
+
+class ForbiddenException(HTTPException):
+    def __init__(self, detail: str = "Forbidden", headers: Optional[list[Tuple[str, str]]] = None):
+        super().__init__(403, detail, headers)
+
+class NotFoundException(HTTPException):
+    def __init__(self, detail: str = "Not Found", headers: Optional[list[Tuple[str, str]]] = None):
+        super().__init__(404, detail, headers)
+
+class MethodNotAllowedException(HTTPException):
+    def __init__(self, detail: str = "Method Not Allowed", headers: Optional[list[Tuple[str, str]]] = None):
+        super().__init__(405, detail, headers)
+
+class UnprocessableEntityException(HTTPException):
+    def __init__(self, detail: str = "Unprocessable Entity", headers: Optional[list[Tuple[str, str]]] = None):
+        super().__init__(422, detail, headers)
+
+class InternalServerErrorException(HTTPException):
+    def __init__(self, detail: str = "Internal Server Error", headers: Optional[list[Tuple[str, str]]] = None):
+        super().__init__(500, detail, headers)

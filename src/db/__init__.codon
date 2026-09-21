@@ -1,0 +1,42 @@
+# Codon Native Database Driver Framework (DB-API 2.0 / PEP 249)
+
+from src.db.errors import (
+    DatabaseError, InterfaceError, OperationalError, ProgrammingError,
+    DataError, IntegrityError, NotSupportedError
+)
+from src.db.types import FieldInfo, Row
+from src.db.drivers.mysql.connection import MySQLConnection, MySQLCursor
+from src.db.drivers.mysql.async_connection import connect_async as connect_mysql_async, AsyncMySQLConnection, AsyncMySQLCursor
+from src.db.drivers.sqlite.connection import SQLiteConnection, SQLiteCursor
+from src.db.pool import MySQLPool, PooledMySQLConnection
+from src.db.async_pool import AsyncMySQLPool, AsyncPooledConnection
+
+# Module namespaces
+import src.db.drivers.mysql as mysql
+import src.db.drivers.sqlite as sqlite
+
+def connect_mysql(
+    host: str = "127.0.0.1",
+    port: int = 3306,
+    user: str = "root",
+    password: str = "",
+    database: str = "",
+    charset: str = "utf8mb4",
+    autocommit: bool = True,
+    connect_timeout: int = 10
+) -> MySQLConnection:
+    """Connects to MySQL natively using pure wire protocol"""
+    return MySQLConnection(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        charset=charset,
+        autocommit=autocommit,
+        connect_timeout=connect_timeout
+    )
+
+def connect_sqlite(database: str = ":memory:") -> SQLiteConnection:
+    """Connects to SQLite database in-memory or on disk"""
+    return SQLiteConnection(database=database)

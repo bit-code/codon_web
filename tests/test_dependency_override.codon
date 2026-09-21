@@ -1,0 +1,49 @@
+# Unit Test for FastAPI-Style Dependency Overrides in CodonWeb
+
+from codon_web import App, Request, Response, TestClient, resolve_dependency
+
+app = App()
+
+def real_current_user(req: Request) -> None:
+    req.set_state("user", "real_user_alice")
+
+def mock_current_user(req: Request) -> None:
+    req.set_state("user", "mock_admin_root")
+
+def auth_dependency(req: Request) -> None:
+    resolve_dependency("auth", req, real_current_user)
+
+from typing import Callable
+auth_deps = list[Callable[[Request], None]]()
+auth_deps.append(auth_dependency)
+
+@app.get("/profile", dependencies=auth_deps)
+def profile(req: Request) -> Response:
+    u = req.get_state("user")
+    return Response.json("{\"user\":\"" + u + "\"}")
+
+client = TestClient(app)
+
+print("=== Testing Dependency Overrides (FastAPI app.dependency_overrides Parity) ===")
+
+# 1. Before override: uses real dependency
+r1 = client.get("/profile")
+assert r1.status_code == 200
+assert r1.json()["user"] == "real_user_alice", "Expected real_user_alice, got: " + r1.text
+print("[PASS] 1. Real dependency executed cleanly")
+
+# 2. After override: uses mock dependency without altering route definition
+app.override_dependency("auth", mock_current_user)
+r2 = client.get("/profile")
+assert r2.status_code == 200
+assert r2.json()["user"] == "mock_admin_root", "Expected mock_admin_root, got: " + r2.text
+print("[PASS] 2. Mock dependency executed cleanly")
+
+# 3. After clear: restored to original
+app.clear_dependency_overrides()
+r3 = client.get("/profile")
+assert r3.status_code == 200
+assert r3.json()["user"] == "real_user_alice", "Expected real_user_alice, got: " + r3.text
+print("[PASS] 3. Dependency overrides cleared successfully")
+
+print("\n>>> ALL DEPENDENCY OVERRIDE TESTS PASSED! <<<")

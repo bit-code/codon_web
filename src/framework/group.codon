@@ -1,0 +1,305 @@
+from typing import Callable, Optional
+from src.http.request import Request
+from src.http.response import Response
+from src.http.method import (
+    METHOD_GET, METHOD_POST, METHOD_PUT, METHOD_DELETE,
+    METHOD_HEAD, METHOD_OPTIONS, METHOD_PATCH
+)
+from src.http.schema import Schema
+from src.http.params import Param
+from src.framework.route import RouteHandler, SimpleHandler, DependencyRouteHandler
+from src.framework.router import Router
+from src.framework.middleware import Middleware, build_middleware_pipeline
+from src.framework.openapi import OpenAPIGenerator, RouteMeta
+
+class RouterGroup:
+    prefix: str
+    router: Router
+    middlewares: list[Middleware]
+    group_dependencies: list[Callable[[Request], None]]
+    group_tags: list[str]
+    openapi_generator: Optional[OpenAPIGenerator]
+
+    def __init__(
+        self,
+        prefix: str,
+        router: Router,
+        middlewares: list[Middleware],
+        group_dependencies: Optional[list[Callable[[Request], None]]] = None,
+        group_tags: Optional[list[str]] = None,
+        openapi_generator: Optional[OpenAPIGenerator] = None
+    ):
+        self.prefix = self._normalize_prefix(prefix)
+        self.router = router
+        self.middlewares = middlewares
+        if group_dependencies is not None:
+            self.group_dependencies = group_dependencies
+        else:
+            self.group_dependencies = list[Callable[[Request], None]]()
+
+        if group_tags is not None:
+            self.group_tags = group_tags
+        else:
+            self.group_tags = list[str]()
+
+        self.openapi_generator = openapi_generator
+
+    def _normalize_prefix(self, p: str) -> str:
+        res = p.strip()
+        if len(res) == 0:
+            return ""
+        if not res.startswith("/"):
+            res = "/" + res
+        if res.endswith("/") and len(res) > 1:
+            res = res[:-1]
+        return res
+
+    def _combine_path(self, path: str) -> str:
+        sub = path.strip()
+        if not sub.startswith("/"):
+            sub = "/" + sub
+        if self.prefix == "/":
+            return sub
+        return self.prefix + sub
+
+    def use(self, middleware: Middleware) -> None:
+        self.middlewares.append(middleware)
+
+    def group(
+        self,
+        prefix: str,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        tags: Optional[list[str]] = None
+    ) -> RouterGroup:
+        full_prefix = self._combine_path(prefix)
+        inherited_mws: list[Middleware] = []
+        for m in self.middlewares:
+            inherited_mws.append(m)
+
+        combined_deps = list[Callable[[Request], None]]()
+        for d in self.group_dependencies:
+            combined_deps.append(d)
+        if dependencies is not None:
+            for d in dependencies:
+                combined_deps.append(d)
+
+        combined_tags = list[str]()
+        for t in self.group_tags:
+            combined_tags.append(t)
+        if tags is not None:
+            for t in tags:
+                combined_tags.append(t)
+
+        return RouterGroup(
+            full_prefix,
+            self.router,
+            inherited_mws,
+            combined_deps,
+            combined_tags,
+            self.openapi_generator
+        )
+
+    def add_route(
+        self,
+        method: i32,
+        path: str,
+        fn: Callable[[Request], Response],
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ) -> None:
+        full_path = self._combine_path(path)
+        base_handler: RouteHandler = SimpleHandler(fn)
+
+        # Merge group dependencies and route dependencies
+        all_deps = list[Callable[[Request], None]]()
+        for d in self.group_dependencies:
+            all_deps.append(d)
+        if dependencies is not None:
+            for d in dependencies:
+                all_deps.append(d)
+
+        if len(all_deps) > 0:
+            base_handler = DependencyRouteHandler(all_deps, base_handler)
+
+        if len(self.middlewares) > 0:
+            pipeline_handler = build_middleware_pipeline(self.middlewares, base_handler)
+            self.router.add(method, full_path, pipeline_handler)
+        else:
+            self.router.add(method, full_path, base_handler)
+
+        # Register metadata for OpenAPI
+        if self.openapi_generator is not None:
+            all_tags = list[str]()
+            for t in self.group_tags:
+                all_tags.append(t)
+            if tags is not None:
+                for t in tags:
+                    all_tags.append(t)
+
+            method_str = "get"
+            if method == METHOD_POST:
+                method_str = "post"
+            elif method == METHOD_PUT:
+                method_str = "put"
+            elif method == METHOD_DELETE:
+                method_str = "delete"
+            elif method == METHOD_PATCH:
+                method_str = "patch"
+            elif method == METHOD_HEAD:
+                method_str = "head"
+            elif method == METHOD_OPTIONS:
+                method_str = "options"
+
+            meta = RouteMeta(
+                path=full_path,
+                method=method_str,
+                summary=summary,
+                description=description,
+                tags=all_tags,
+                status_code=status_code,
+                deprecated=deprecated,
+                has_schema=has_schema or (len(schema.rules) > 0),
+                schema=schema,
+                params=params,
+                security_schemes=security_schemes
+            )
+            self.openapi_generator.add_route(meta)
+
+    def get(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(
+                METHOD_GET, path, fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return fn
+        return decorator
+
+    def post(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(
+                METHOD_POST, path, fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, schema=schema, has_schema=has_schema or (len(schema.rules) > 0),
+                params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return fn
+        return decorator
+
+    def put(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(
+                METHOD_PUT, path, fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, schema=schema, has_schema=has_schema or (len(schema.rules) > 0),
+                params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return fn
+        return decorator
+
+    def delete(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(
+                METHOD_DELETE, path, fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return fn
+        return decorator
+
+    def patch(
+        self,
+        path: str,
+        summary: str = "",
+        description: str = "",
+        tags: Optional[list[str]] = None,
+        dependencies: Optional[list[Callable[[Request], None]]] = None,
+        schema: Schema = Schema(),
+        has_schema: bool = False,
+        params: Optional[list[Param]] = None,
+        security_schemes: Optional[list[str]] = None,
+        status_code: int = 200,
+        deprecated: bool = False
+    ):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(
+                METHOD_PATCH, path, fn,
+                summary=summary, description=description, tags=tags,
+                dependencies=dependencies, schema=schema, has_schema=has_schema or (len(schema.rules) > 0),
+                params=params, security_schemes=security_schemes,
+                status_code=status_code, deprecated=deprecated
+            )
+            return fn
+        return decorator
+
+    def head(self, path: str):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(METHOD_HEAD, path, fn)
+            return fn
+        return decorator
+
+    def options(self, path: str):
+        def decorator(fn: Callable[[Request], Response]):
+            self.add_route(METHOD_OPTIONS, path, fn)
+            return fn
+        return decorator

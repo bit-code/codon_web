@@ -1,0 +1,136 @@
+# Authentication and Crypto Engine for MySQL (caching_sha2_password and mysql_native_password)
+
+from C import dlopen(Ptr[byte], i32) -> Ptr[byte]
+from C import dlsym(Ptr[byte], Ptr[byte]) -> Ptr[byte]
+from src.db.errors import OperationalError
+
+class CryptoEngine:
+    _sha256_fn: Function[Tuple[Ptr[byte], int, Ptr[byte]], Ptr[byte]]
+    _sha1_fn: Function[Tuple[Ptr[byte], int, Ptr[byte]], Ptr[byte]]
+    _initialized: bool
+
+    def __init__(self):
+        self._initialized = False
+        # Try finding standard libcrypto locations
+        candidates = [
+            "libcrypto.so.3",
+            "libcrypto.so.1.1",
+            "libcrypto.so",
+            "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+            "/lib/x86_64-linux-gnu/libcrypto.so.3"
+        ]
+        handle = Ptr[byte]()
+        for lib in candidates:
+            handle = dlopen(lib.c_str(), i32(2)) # RTLD_NOW
+            if handle:
+                break
+
+        if not handle:
+            raise OperationalError("Failed to dynamically load libcrypto.so for MySQL authentication")
+
+        p256 = dlsym(handle, "SHA256".c_str())
+        if not p256:
+            raise OperationalError("Symbol SHA256 not found in libcrypto")
+
+        p1 = dlsym(handle, "SHA1".c_str())
+        if not p1:
+            raise OperationalError("Symbol SHA1 not found in libcrypto")
+
+        self._sha256_fn = Function[Tuple[Ptr[byte], int, Ptr[byte]], Ptr[byte]](p256)
+        self._sha1_fn = Function[Tuple[Ptr[byte], int, Ptr[byte]], Ptr[byte]](p1)
+        self._initialized = True
+
+    def sha256_buf(self, buf: Ptr[byte], length: int) -> List[byte]:
+        out = Ptr[byte](32)
+        self._sha256_fn(buf, length, out)
+        res = List[byte]()
+        for i in range(32):
+            res.append(out[i])
+        return res
+
+    def sha256_bytes(self, data: List[byte]) -> List[byte]:
+        n = len(data)
+        buf = Ptr[byte](n)
+        for i in range(n):
+            buf[i] = data[i]
+        return self.sha256_buf(buf, n)
+
+    def sha256_str(self, s: str) -> List[byte]:
+        return self.sha256_buf(s.c_str(), len(s))
+
+    def sha1_buf(self, buf: Ptr[byte], length: int) -> List[byte]:
+        out = Ptr[byte](20)
+        self._sha1_fn(buf, length, out)
+        res = List[byte]()
+        for i in range(20):
+            res.append(out[i])
+        return res
+
+    def sha1_bytes(self, data: List[byte]) -> List[byte]:
+        n = len(data)
+        buf = Ptr[byte](n)
+        for i in range(n):
+            buf[i] = data[i]
+        return self.sha1_buf(buf, n)
+
+    def sha1_str(self, s: str) -> List[byte]:
+        return self.sha1_buf(s.c_str(), len(s))
+
+# Global crypto engine instance
+_engine: Optional[CryptoEngine] = None
+
+def get_crypto_engine() -> CryptoEngine:
+    global _engine
+    if _engine is None:
+        _engine = CryptoEngine()
+    return _engine
+
+def scramble_caching_sha2(password: str, nonce: List[byte]) -> List[byte]:
+    """
+    MySQL 8.0 caching_sha2_password fast auth token calculation:
+    XOR(SHA256(password), SHA256(SHA256(SHA256(password)) + nonce))
+    """
+    if len(password) == 0:
+        return List[byte]()
+    engine = get_crypto_engine()
+    p1 = engine.sha256_str(password)
+    p2 = engine.sha256_bytes(p1)
+
+    comb = List[byte]()
+    for b in p2:
+        comb.append(b)
+    for b in nonce:
+        comb.append(b)
+
+    p3 = engine.sha256_bytes(comb)
+    res = List[byte]()
+    for i in range(32):
+        res.append(byte(int(p1[i]) ^ int(p3[i])))
+    return res
+
+def scramble_native_password(password: str, message: List[byte]) -> List[byte]:
+    """
+    MySQL 5.7 / mysql_native_password token calculation:
+    stage1 = SHA1(password)
+    stage2 = SHA1(stage1)
+    stage3 = SHA1(message[:20] + stage2)
+    token = stage1 XOR stage3
+    """
+    if len(password) == 0:
+        return List[byte]()
+    engine = get_crypto_engine()
+    stage1 = engine.sha1_str(password)
+    stage2 = engine.sha1_bytes(stage1)
+
+    comb = List[byte]()
+    scramble_len = 20 if len(message) >= 20 else len(message)
+    for i in range(scramble_len):
+        comb.append(message[i])
+    for b in stage2:
+        comb.append(b)
+
+    stage3 = engine.sha1_bytes(comb)
+    res = List[byte]()
+    for i in range(20):
+        res.append(byte(int(stage1[i]) ^ int(stage3[i])))
+    return res

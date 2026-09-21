@@ -1,0 +1,33 @@
+from src.memory.slice import ByteSlice
+from src.memory.buffer import ByteBuffer
+
+buf = ByteBuffer(1024)
+buf.append_str("GET /users/42 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+s = buf.readable_slice()
+print("Buffer readable bytes:", buf.readable_bytes())
+assert buf.readable_bytes() == 43
+assert s.equals_ascii("GET /users/42 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+# Test slicing
+method_slice = s.slice(0, 3)
+assert method_slice.equals_ascii("GET")
+assert method_slice.equals_case_insensitive("get")
+
+path_slice = s.slice(4, 13)
+assert path_slice.equals_ascii("/users/42")
+
+# Test parse_int
+id_slice = s.slice(11, 13)
+ok, val = id_slice.parse_int()
+print("parse_int ok:", ok, "val:", val)
+assert ok and val == 42
+
+# Consume part of buffer
+buf.consume(4)
+print("After consume 4, readable bytes:", buf.readable_bytes())
+assert buf.readable_bytes() == 39
+
+buf.reset()
+assert buf.readable_bytes() == 0
+print("Memory slice and buffer tests PASSED!")

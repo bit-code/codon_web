@@ -1,0 +1,54 @@
+from src.http.request import Request
+from src.http.response import Response
+from src.framework.route import RouteHandler
+
+def _compute_etag(content: str) -> str:
+    n = len(content)
+    h = 2166136261
+    for i in range(n):
+        h = (h ^ ord(content[i])) * 16777619
+        h = h & 0xFFFFFFFF
+    return "W/\"" + str(n) + "-" + str(h) + "\""
+
+class StaticFilesHandler(RouteHandler):
+    base_dir: str
+    cache_control: str
+
+    def __init__(self, base_dir: str, cache_control: str = "public, max-age=3600"):
+        # Strip trailing slash
+        clean_dir = base_dir
+        while clean_dir.endswith("/"):
+            clean_dir = clean_dir[:-1]
+        self.base_dir = clean_dir
+        self.cache_control = cache_control
+
+    def handle(self, req: Request) -> Response:
+        # Obtain relative path from wildcard parameter
+        rel_path = req.param("*")
+        if len(rel_path) == 0:
+            rel_path = "index.html"
+
+        # Security check: Prevent path traversal attacks (../)
+        if ".." in rel_path:
+            return Response.text("Forbidden: Path traversal is not permitted", 403)
+        if rel_path.startswith("/"):
+            rel_path = rel_path[1:]
+
+        full_path = self.base_dir + "/" + rel_path
+        resp = Response.file(full_path)
+        if resp.status_code != 200:
+            return resp
+
+        # Compute ETag for HTTP caching & 304 Not Modified negotiation
+        etag = _compute_etag(resp.body)
+        if_none_match = req.header("If-None-Match")
+        if len(if_none_match) > 0 and if_none_match == etag:
+            not_modified_resp = Response.not_modified(etag)
+            if len(self.cache_control) > 0:
+                not_modified_resp.set_header("Cache-Control", self.cache_control)
+            return not_modified_resp
+
+        resp.set_header("ETag", etag)
+        if len(self.cache_control) > 0:
+            resp.set_header("Cache-Control", self.cache_control)
+        return resp

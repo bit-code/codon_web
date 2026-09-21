@@ -1,0 +1,137 @@
+# End-to-End Test: Async MySQL Integration with CodonWeb Async Routes
+# Tests async with pool.connection(), non-blocking SQL queries inside route handlers,
+# and client resume on unified single-reactor multiplexing.
+
+import time
+from typing import Optional
+from src.http.request import Request
+from src.http.response import Response
+from src.runtime.async_context import AsyncResumer
+from src.framework.app import App
+from src.memory.slice import ByteSlice
+from src.http.method import METHOD_GET
+from src.core.async.loop import get_event_loop
+from src.db.async_pool import AsyncMySQLPool
+
+class MockClientResumer(AsyncResumer):
+    resumed_fd: i32
+    received_status: int
+    received_body: str
+    call_count: int
+
+    def __init__(self):
+        self.resumed_fd = i32(-1)
+        self.received_status = 0
+        self.received_body = ""
+        self.call_count = 0
+
+    def resume(self, fd: i32, resp: Response) -> bool:
+        self.resumed_fd = fd
+        self.received_status = resp.status_code
+        self.received_body = resp.body
+        self.call_count += 1
+        return True
+
+app = App()
+
+# Create MySQL pool instance
+pool = AsyncMySQLPool(
+    host="172.23.176.1",
+    port=13306,
+    user="root",
+    password="hujinlong",
+    database="ths",
+    min_size=2,
+    max_size=5
+)
+
+@app.async_get("/api/db-calc")
+async def db_calc_handler(req: Request):
+    async with pool.connection() as conn:
+        cur = conn.cursor()
+        await cur.execute("SELECT 999 * 2 AS result, 'codon_unified' AS framework")
+        row = cur.fetchone()
+        cur.close()
+        if row is not None:
+            ans = row.get_int(0)
+            fw = row.get_str(1)
+            return Response.json('{"result":' + str(ans) + ',"framework":"' + fw + '"}', 200)
+        return Response.json('{"error":"no row"}', 500)
+
+@app.async_get("/api/real-query")
+async def real_query_handler(req: Request):
+    async with pool.connection() as conn:
+        cur = conn.cursor()
+        await cur.execute("SELECT father_name FROM result_pq LIMIT 1")
+        row = cur.fetchone()
+        cur.close()
+        if row is not None:
+            return Response.json('{"status":"ok","row":' + row.to_json() + '}', 200)
+        return Response.json('{"status":"empty"}', 200)
+
+print("=== Testing End-to-End Async MySQL in CodonWeb Route Handlers ===")
+loop = get_event_loop()
+
+# 1. Initialize Pool
+print("\n--- 1. Pre-warming Async Connection Pool ---")
+init_task = loop.create_task(pool.init_pool())
+loop.run_until_complete(init_task)
+print("[PASS] Async pool initialized with connections! Available:", pool.available_count())
+
+# 2. Test Route 1: Constant calculation via MySQL socket
+print("\n--- 2. Dispatching Route 1: /api/db-calc ---")
+resumer1 = MockClientResumer()
+base_r1: AsyncResumer = resumer1
+
+req1 = Request()
+req1.method = METHOD_GET
+req1.fd = i32(101)
+req1.async_resumer = base_r1
+p1 = "/api/db-calc"
+req1.path = ByteSlice(p1.c_str(), len(p1))
+
+deferred1 = app.router.dispatch(req1)
+assert deferred1.is_deferred, "Handler must defer response"
+assert resumer1.call_count == 0
+
+start1 = time.time()
+while resumer1.call_count == 0 and (time.time() - start1 < 2.0):
+    loop.run_one_iteration(5)
+
+assert resumer1.call_count == 1, "Client resumer must be called"
+assert resumer1.received_status == 200
+assert '"result":1998' in resumer1.received_body
+assert '"framework":"codon_unified"' in resumer1.received_body
+print("[PASS] Route 1 finished successfully! Response body:", resumer1.received_body)
+print("Pool connections available after request 1:", pool.available_count())
+
+# 3. Test Route 2: Real table query via MySQL socket
+print("\n--- 3. Dispatching Route 2: /api/real-query ---")
+resumer2 = MockClientResumer()
+base_r2: AsyncResumer = resumer2
+
+req2 = Request()
+req2.method = METHOD_GET
+req2.fd = i32(102)
+req2.async_resumer = base_r2
+p2 = "/api/real-query"
+req2.path = ByteSlice(p2.c_str(), len(p2))
+
+deferred2 = app.router.dispatch(req2)
+assert deferred2.is_deferred
+
+start2 = time.time()
+while resumer2.call_count == 0 and (time.time() - start2 < 2.0):
+    loop.run_one_iteration(5)
+
+assert resumer2.call_count == 1
+assert resumer2.received_status == 200
+assert '"status":"ok"' in resumer2.received_body
+print("[PASS] Route 2 finished successfully! Response body:", resumer2.received_body)
+print("Pool connections available after request 2:", pool.available_count())
+
+# Clean up pool
+pool.close()
+print("\n=======================================================")
+print(">>> END-TO-END ASYNC MYSQL ROUTE INTEGRATION PASSED! <<<")
+print("=======================================================")
