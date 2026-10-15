@@ -1,0 +1,107 @@
+import time
+from src.db.types import Row, RowView
+from src.memory.buffer import ByteBuffer
+from src.http.response import Response
+from src.runtime.connection import Connection
+from src.runtime.epoll import Epoll
+
+def test_row_to_dict():
+    print("Testing Row.to_dict() backward compatibility...")
+    fields = ["id", "name", "email"]
+    values = ["1001", "alice", "alice@example.com"]
+    row = Row(fields, values)
+    d = row.to_dict()
+    assert d["id"] == "1001"
+    assert d["name"] == "alice"
+    assert d["email"] == "alice@example.com"
+    print("  PASS: to_dict() intact")
+
+def test_row_write_json_direct():
+    print("Testing Row.write_json_direct()...")
+    fields = ["id", "username", "status"]
+    values = ["1022578", "antigravity_admin", "active"]
+    row = Row(fields, values)
+    buf = ByteBuffer(4096)
+    written = row.write_json_direct(buf)
+    assert written > 0
+    s = str(buf.readable_slice().ptr, buf.readable_slice().len)
+    assert '"id":"1022578"' in s
+    assert '"username":"antigravity_admin"' in s
+    assert '"status":"active"' in s
+    print("  PASS: Row.write_json_direct() matches valid JSON payload")
+
+def test_row_view():
+    print("Testing RowView delta overlay view...")
+    fields = ["id", "name", "role", "secret"]
+    values = ["101", "bob", "developer", "top_secret_token"]
+    row = Row(fields, values)
+    view = RowView(row)
+    view.set("role", "admin")
+    view.set("status", "VERIFIED")
+    buf = ByteBuffer(4096)
+    written = view.write_json_direct(buf)
+    assert written > 0
+    s = str(buf.readable_slice().ptr, buf.readable_slice().len)
+    assert '"id":"101"' in s
+    assert '"role":"admin"' in s
+    assert '"status":"VERIFIED"' in s
+    print("  PASS: RowView delta modifications correctly serialized")
+
+def test_response_json_row():
+    print("Testing Response.json(Row) & Response.json(RowView)...")
+    fields = ["id", "msg"]
+    values = ["1", "hello"]
+    row = Row(fields, values)
+    resp = Response.json(row, 200)
+    dest = ByteBuffer(4096)
+    resp.serialize(dest, True)
+    output = str(dest.readable_slice().ptr, dest.readable_slice().len)
+    assert "HTTP/1.1 200 OK" in output
+    assert '"id":"1"' in output
+    assert '"msg":"hello"' in output
+
+    view = RowView(row)
+    view.set("msg", "world")
+    resp_v = Response.json(view, 200)
+    dest_v = ByteBuffer(4096)
+    resp_v.serialize(dest_v, True)
+    out_v = str(dest_v.readable_slice().ptr, dest_v.readable_slice().len)
+    assert "HTTP/1.1 200 OK" in out_v
+    assert '"msg":"world"' in out_v
+    print("  PASS: Response serialization of Row and RowView zero-copy verified")
+
+def test_connection_reset_pool():
+    print("Testing Connection.reset_pool()...")
+    conn = Connection(i32(10), "127.0.0.1", 8080, 4096)
+    conn.reset_pool(i32(20), "10.0.0.1", 9090)
+    assert conn.fd == i32(20)
+    assert conn.client_ip == "10.0.0.1"
+    assert conn.client_port == 9090
+    assert conn.read_buf.readable_bytes() == 0
+    assert conn.write_buf.readable_bytes() == 0
+    print("  PASS: Connection.reset_pool() cleanly resets state without reallocations")
+
+def test_pipelining():
+    print("Testing HTTP pipelining batch processing...")
+    conn = Connection(i32(10), "127.0.0.1", 8080, 4096)
+    resp1 = Response.text("One", 200)
+    resp2 = Response.text("Two", 200)
+    conn.append_response(resp1)
+    conn.append_response(resp2)
+    assert conn.write_buf.readable_bytes() > 0
+    out = str(conn.write_buf.readable_slice().ptr, conn.write_buf.readable_bytes())
+    assert "One" in out and "Two" in out
+    print("  PASS: HTTP pipelining batch successfully aggregates responses in single buffer")
+
+def main():
+    print("=== RUNNING PHASE 1 & PHASE 2 TESTS ===")
+    test_row_to_dict()
+    test_row_write_json_direct()
+    test_row_view()
+    test_response_json_row()
+    test_connection_reset_pool()
+    test_pipelining()
+    print("=== ALL OPTIMIZATION TESTS PASSED SUCCESSFULLY! ===")
+
+if __name__ == "__main__":
+    main()

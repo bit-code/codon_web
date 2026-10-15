@@ -1,0 +1,219 @@
+# Industrial-Grade Pure-Codon AOT Schema CLI
+# Supports both In-Place @extend injection and standalone out-of-tree compilation.
+#
+# Usage:
+#   1. In-Place Mode (Primary / Recommended):
+#      codon run tools/codegen/main.codon --in-place <file1.codon> [file2.codon ...]
+#   2. Batch Out-Of-Tree Mode:
+#      codon run tools/codegen/main.codon --out-dir <output_dir> <input1.codon> [input2.codon ...]
+#   3. Single File 1-to-1 Mode:
+#      codon run tools/codegen/main.codon <input_file.codon> <output_file.codon>
+import sys
+from tools.codegen.schema_parser import parse_schema_source
+from tools.codegen.schema_generator import (
+    generate_source_file, generate_in_place_content,
+    compute_source_checksum, extract_existing_checksum, extract_user_source
+)
+
+def _get_base_name(path: str) -> str:
+    clean = path
+    slash_idx = -1
+    for i in range(len(clean)):
+        if clean[i] == '/' or clean[i] == '\\':
+            slash_idx = i
+    if slash_idx >= 0:
+        clean = clean[slash_idx + 1:]
+    if clean.endswith(".codon"):
+        clean = clean[:-6]
+    return clean
+
+def _process_in_place(file_path: str, force: bool = False) -> Tuple[bool, int]:
+    """Safely and incrementally injects/updates the @extend block in-place.
+    Returns (is_cached, class_count).
+    """
+    try:
+        with open(file_path, "r") as f:
+            src_text = f.read()
+    except:
+        print("[CodeGen Error] Failed to read input file: " + file_path)
+        return (False, 0)
+
+    clean_src = extract_user_source(src_text)
+    curr_checksum = compute_source_checksum(clean_src)
+    existing_checksum = extract_existing_checksum(src_text)
+
+    # 增量预编译检查：若未指定强制重编译且校验和一致，直接零开销跳过（默认开启）
+    if not force and len(existing_checksum) > 0 and existing_checksum == curr_checksum:
+        print(f"[CodeGen In-Place CACHED] {file_path} (up to date, checksum: {curr_checksum})")
+        return (True, 1)
+
+    classes = parse_schema_source(src_text)
+    if len(classes) == 0:
+        print("[CodeGen Warning] No schema classes detected in: " + file_path)
+        return (False, 0)
+
+    new_content = generate_in_place_content(src_text, classes)
+
+    # 二级保护：若文件内容完全未改变，不执行写入以保护文件系统时间戳 mtime
+    if not force and new_content == src_text:
+        print(f"[CodeGen In-Place CACHED] {file_path} (byte-identical, preserved mtime)")
+        return (True, len(classes))
+
+    try:
+        with open(file_path, "w") as f:
+            f.write(new_content)
+    except:
+        print("[CodeGen Error] Failed to write in-place output to: " + file_path)
+        return (False, 0)
+
+    cnames = List[str]()
+    for c in classes:
+        cnames.append(c.name)
+
+    print(f"[CodeGen In-Place UPDATED] Injected @extend for {len(classes)} classes ({', '.join(cnames)}) in {file_path} (checksum: {curr_checksum})")
+    return (False, len(classes))
+
+def _process_single(in_path: str, out_path: str) -> List[str]:
+    """Compiles a single schema file and returns the list of generated class names."""
+    try:
+        with open(in_path, "r") as f:
+            src_text = f.read()
+    except:
+        print("[CodeGen Error] Failed to read input file: " + in_path)
+        return List[str]()
+
+    classes = parse_schema_source(src_text)
+    if len(classes) == 0:
+        print("[CodeGen Warning] No schema classes detected in: " + in_path)
+        return List[str]()
+
+    generated_code = generate_source_file(classes)
+
+    try:
+        with open(out_path, "w") as f:
+            f.write(generated_code)
+    except:
+        print("[CodeGen Error] Failed to write generated output to: " + out_path)
+        return List[str]()
+
+    class_names = List[str]()
+    for c in classes:
+        class_names.append(c.name)
+
+    print(f"[CodeGen SUCCESS] Processed {len(classes)} classes from {in_path} -> {out_path}")
+    return class_names
+
+def main():
+    argc = len(sys.argv)
+    if argc < 2:
+        print("Usage:")
+        print("  In-Place Mode: codon run tools/codegen/main.codon --in-place <file1.codon> [file2.codon ...]")
+        print("  Batch Mode:    codon run tools/codegen/main.codon --out-dir <output_dir> <file1.codon> [file2.codon ...]")
+        print("  Single Mode:   codon run tools/codegen/main.codon <input.codon> <output.codon>")
+        return
+
+    # Check for in-place mode: --in-place [--force] <files...>
+    if sys.argv[1] == "--in-place":
+        if argc < 3:
+            print("[CodeGen Error] --in-place requires at least one source file.")
+            return
+
+        force = False
+        start_idx = 2
+        if argc > 2 and (sys.argv[2] == "--force" or sys.argv[2] == "-f"):
+            force = True
+            start_idx = 3
+
+        if start_idx >= argc:
+            print("[CodeGen Error] --in-place requires at least one source file.")
+            return
+
+        cached_files = 0
+        updated_files = 0
+        total_classes = 0
+
+        for i in range(start_idx, argc):
+            in_path = sys.argv[i]
+            if in_path == "--force" or in_path == "-f":
+                force = True
+                continue
+            if len(in_path.strip()) == 0:
+                continue
+
+            is_cached, n_cls = _process_in_place(in_path, force=force)
+            if n_cls > 0:
+                if is_cached:
+                    cached_files += 1
+                else:
+                    updated_files += 1
+                total_classes += n_cls
+
+        if force:
+            print(f"\n[CodeGen In-Place Summary] Force re-generated {updated_files} schema files ({total_classes} models).")
+        else:
+            print(f"\n[CodeGen In-Place Summary] Incremental scan: {cached_files} cached (skipped), {updated_files} updated across {cached_files + updated_files} schema files.")
+        return
+
+    # Check for batch mode: --out-dir <output_dir> <files...>
+    if sys.argv[1] == "--out-dir":
+        if argc < 4:
+            print("[CodeGen Error] --out-dir requires target directory and at least one source file.")
+            return
+
+        out_dir = sys.argv[2]
+        while out_dir.endswith("/") or out_dir.endswith("\\"):
+            out_dir = out_dir[:-1]
+
+        all_exports = List[Tuple[str, str]]() # List of (module_name, class_name)
+        total_files = 0
+        total_classes = 0
+
+        for i in range(3, argc):
+            in_path = sys.argv[i]
+            if len(in_path.strip()) == 0:
+                continue
+
+            base = _get_base_name(in_path)
+            module_name = base + "_schema"
+            out_path = out_dir + "/" + module_name + ".codon"
+
+            cnames = _process_single(in_path, out_path)
+            if len(cnames) > 0:
+                total_files += 1
+                total_classes += len(cnames)
+                for cn in cnames:
+                    all_exports.append((module_name, cn))
+
+        # Automatically update barrel __init__.codon in target directory
+        if len(all_exports) > 0:
+            init_lines = List[str]()
+            init_lines.append("# Auto-generated unified barrel exports for CodonWeb schemas")
+            init_lines.append("# DO NOT EDIT DIRECTLY.")
+            init_lines.append("")
+            for mod_name, cls_name in all_exports:
+                init_lines.append(f"from src.generated.{mod_name} import {cls_name}")
+            init_lines.append("")
+
+            init_path = out_dir + "/__init__.codon"
+            try:
+                with open(init_path, "w") as f:
+                    f.write("\n".join(init_lines))
+                print(f"[CodeGen Barrel] Created unified export {init_path} with {len(all_exports)} models.")
+            except:
+                print(f"[CodeGen Warning] Could not write barrel {init_path}")
+
+        print(f"\n[CodeGen Summary] Batch compiled {total_files} files, {total_classes} schema models.")
+        return
+
+    if argc < 3:
+        print("Usage:")
+        print("  In-Place Mode: codon run tools/codegen/main.codon --in-place <file1.codon> [file2.codon ...]")
+        return
+
+    # Default: 1-to-1 Pair Mode
+    in_path = sys.argv[1]
+    out_path = sys.argv[2]
+    _process_single(in_path, out_path)
+
+if __name__ == "__main__":
+    main()

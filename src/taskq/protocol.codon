@@ -1,0 +1,307 @@
+# Distributed Task Queue Protocol Specification
+# Production-grade task message, result models, and serialization
+
+import time
+from typing import Optional
+
+def _escape_json(s: str) -> str:
+    res: list[str] = []
+    for i in range(len(s)):
+        c = s[i]
+        if c == '"':
+            res.append('\\"')
+        elif c == '\\':
+            res.append('\\\\')
+        elif c == '\n':
+            res.append('\\n')
+        elif c == '\r':
+            res.append('\\r')
+        elif c == '\t':
+            res.append('\\t')
+        elif c == '\b':
+            res.append('\\b')
+        else:
+            res.append(c)
+    return "".join(res)
+
+def _unescape_json(s: str) -> str:
+    res: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == '\\' and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt == '"':
+                res.append('"')
+                i += 2
+            elif nxt == '\\':
+                res.append('\\')
+                i += 2
+            elif nxt == 'n':
+                res.append('\n')
+                i += 2
+            elif nxt == 'r':
+                res.append('\r')
+                i += 2
+            elif nxt == 't':
+                res.append('\t')
+                i += 2
+            elif nxt == 'b':
+                res.append('\b')
+                i += 2
+            elif nxt == '/':
+                res.append('/')
+                i += 2
+            else:
+                res.append(s[i])
+                i += 1
+        else:
+            res.append(s[i])
+            i += 1
+    return "".join(res)
+
+TASK_STATUS_PENDING: str = "PENDING"
+TASK_STATUS_STARTED: str = "STARTED"
+TASK_STATUS_SUCCESS: str = "SUCCESS"
+TASK_STATUS_FAILURE: str = "FAILURE"
+TASK_STATUS_RETRY: str = "RETRY"
+TASK_STATUS_TIMEOUT: str = "TIMEOUT"
+TASK_STATUS_CANCELLED: str = "CANCELLED"
+TASK_STATUS_REVOKED: str = "REVOKED"
+
+class _TaskStatusType:
+    PENDING: str
+    STARTED: str
+    SUCCESS: str
+    FAILURE: str
+    RETRY: str
+    TIMEOUT: str
+    CANCELLED: str
+    REVOKED: str
+
+    def __init__(self):
+        self.PENDING = "PENDING"
+        self.STARTED = "STARTED"
+        self.SUCCESS = "SUCCESS"
+        self.FAILURE = "FAILURE"
+        self.RETRY = "RETRY"
+        self.TIMEOUT = "TIMEOUT"
+        self.CANCELLED = "CANCELLED"
+        self.REVOKED = "REVOKED"
+
+TaskStatus: _TaskStatusType = _TaskStatusType()
+
+class TaskCancelledError(Exception):
+    task_id: str
+    reason: str
+
+    def __init__(self, task_id: str = "", reason: str = "Task was cancelled"):
+        super().__init__(f"Task '{task_id}' was cancelled: {reason}")
+        self.task_id = task_id
+        self.reason = reason
+
+class TaskMessage:
+    task_id: str
+    task_name: str
+    payload: str
+    queue: str
+    retry_count: int
+    max_retries: int
+    timeout_ms: int
+    eta: int
+    created_at: int
+
+    def __init__(
+        self,
+        task_id: str,
+        task_name: str,
+        payload: str,
+        queue: str = "default",
+        retry_count: int = 0,
+        max_retries: int = 3,
+        timeout_ms: int = 0,
+        eta: int = 0,
+        created_at: int = 0
+    ):
+        self.task_id = task_id
+        self.task_name = task_name
+        self.payload = payload
+        self.queue = queue
+        self.retry_count = retry_count
+        self.max_retries = max_retries
+        self.timeout_ms = timeout_ms
+        self.eta = eta
+        self.created_at = created_at if created_at > 0 else int(time.time() * 1000.0)
+
+    def to_json(self) -> str:
+        parts: list[str] = [
+            f'"task_id":"{_escape_json(self.task_id)}"',
+            f'"task_name":"{_escape_json(self.task_name)}"',
+            f'"payload":"{_escape_json(self.payload)}"',
+            f'"queue":"{_escape_json(self.queue)}"',
+            f'"retry_count":{self.retry_count}',
+            f'"max_retries":{self.max_retries}',
+            f'"timeout_ms":{self.timeout_ms}',
+            f'"eta":{self.eta}',
+            f'"created_at":{self.created_at}'
+        ]
+        return "{" + ",".join(parts) + "}"
+
+    @staticmethod
+    def from_json(raw: str) -> TaskMessage:
+        raw_map = _parse_simple_json_map(raw)
+        task_id = raw_map.get("task_id", "")
+        task_name = raw_map.get("task_name", "")
+        payload = raw_map.get("payload", "")
+        queue = raw_map.get("queue", "default")
+        
+        retry_count = int(raw_map.get("retry_count", "0"))
+        max_retries = int(raw_map.get("max_retries", "3"))
+        timeout_ms = int(raw_map.get("timeout_ms", "0"))
+        eta = int(raw_map.get("eta", "0"))
+        created_at = int(raw_map.get("created_at", "0"))
+
+        return TaskMessage(
+            task_id=task_id,
+            task_name=task_name,
+            payload=payload,
+            queue=queue,
+            retry_count=retry_count,
+            max_retries=max_retries,
+            timeout_ms=timeout_ms,
+            eta=eta,
+            created_at=created_at
+        )
+
+class TaskResult:
+    task_id: str
+    status: str
+    result: str
+    error: str
+    execution_time_ms: int
+    completed_at: int
+
+    def __init__(
+        self,
+        task_id: str,
+        status: str,
+        result: str = "",
+        error: str = "",
+        execution_time_ms: int = 0,
+        completed_at: int = 0
+    ):
+        self.task_id = task_id
+        self.status = status
+        self.result = result
+        self.error = error
+        self.execution_time_ms = execution_time_ms
+        self.completed_at = completed_at if completed_at > 0 else int(time.time() * 1000.0)
+
+    def to_json(self) -> str:
+        parts: list[str] = [
+            f'"task_id":"{_escape_json(self.task_id)}"',
+            f'"status":"{_escape_json(self.status)}"',
+            f'"result":"{_escape_json(self.result)}"',
+            f'"error":"{_escape_json(self.error)}"',
+            f'"execution_time_ms":{self.execution_time_ms}',
+            f'"completed_at":{self.completed_at}'
+        ]
+        return "{" + ",".join(parts) + "}"
+
+    @staticmethod
+    def from_json(raw: str) -> TaskResult:
+        raw_map = _parse_simple_json_map(raw)
+        task_id = raw_map.get("task_id", "")
+        status = raw_map.get("status", TaskStatus.FAILURE)
+        result = raw_map.get("result", "")
+        error = raw_map.get("error", "")
+        exec_ms = int(raw_map.get("execution_time_ms", "0"))
+        completed_at = int(raw_map.get("completed_at", "0"))
+
+        return TaskResult(
+            task_id=task_id,
+            status=status,
+            result=result,
+            error=error,
+            execution_time_ms=exec_ms,
+            completed_at=completed_at
+        )
+
+def _parse_simple_json_map(raw: str) -> dict[str, str]:
+    # Production parser for top-level JSON key-value pairs
+    res: dict[str, str] = {}
+    s = raw.strip()
+    if len(s) < 2 or not s.startswith("{") or not s.endswith("}"):
+        return res
+
+    i = 1
+    n = len(s) - 1
+    while i < n:
+        # Skip delimiters
+        while i < n and (s[i] == ' ' or s[i] == '\t' or s[i] == '\r' or s[i] == '\n' or s[i] == ','):
+            i += 1
+        if i >= n:
+            break
+
+        if s[i] != '"':
+            break
+        i += 1
+        k_start = i
+        while i < n and s[i] != '"':
+            if s[i] == '\\' and i + 1 < n:
+                i += 2
+            else:
+                i += 1
+        key = _unescape_json(s[k_start:i])
+        if i < n:
+            i += 1
+
+        while i < n and (s[i] == ' ' or s[i] == '\t' or s[i] == ':'):
+            i += 1
+        if i >= n:
+            break
+
+        if s[i] == '"':
+            i += 1
+            v_start = i
+            while i < n:
+                if s[i] == '\\' and i + 1 < n:
+                    i += 2
+                elif s[i] == '"':
+                    break
+                else:
+                    i += 1
+            val = _unescape_json(s[v_start:i])
+            if i < n:
+                i += 1
+            res[key] = val
+        elif s[i] == '{' or s[i] == '[':
+            v_start = i
+            brace_stack = 0
+            in_quote = False
+            while i < n:
+                ch = s[i]
+                if ch == '\\' and in_quote and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_quote = not in_quote
+                elif not in_quote:
+                    if ch == '{' or ch == '[':
+                        brace_stack += 1
+                    elif ch == '}' or ch == ']':
+                        brace_stack -= 1
+                        if brace_stack == 0:
+                            i += 1
+                            break
+                i += 1
+            val = s[v_start:i].strip()
+            res[key] = val
+        else:
+            v_start = i
+            while i < n and s[i] != ',' and s[i] != '}' and s[i] != ' ' and s[i] != '\t' and s[i] != '\r' and s[i] != '\n':
+                i += 1
+            val = s[v_start:i].strip()
+            res[key] = val
+
+    return res

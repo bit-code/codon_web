@@ -6,6 +6,7 @@ from src.framework.route import RouteHandler
 from src.http.method import METHOD_OPTIONS
 from src.http.status import HttpStatus
 from src.http.exceptions import HTTPException
+from src.ws.crypto import hmac_sha256_hex, constant_time_compare
 
 # Base Middleware Class
 class Middleware:
@@ -15,12 +16,18 @@ class Middleware:
 # Recovery Middleware (Panic Isolation, HTTPException handling & Custom Exception Handlers)
 class RecoveryMiddleware(Middleware):
     handlers: dict[int, Callable[[Request, HTTPException], Response]]
+    debug: bool
 
-    def __init__(self, handlers: Optional[dict[int, Callable[[Request, HTTPException], Response]]] = None):
+    def __init__(
+        self,
+        handlers: Optional[dict[int, Callable[[Request, HTTPException], Response]]] = None,
+        debug: bool = True
+    ):
         if handlers is not None:
             self.handlers = handlers
         else:
             self.handlers = dict[int, Callable[[Request, HTTPException], Response]]()
+        self.debug = debug
 
     def add_handler(self, status_code: int, handler: Callable[[Request, HTTPException], Response]) -> None:
         self.handlers[status_code] = handler
@@ -44,10 +51,16 @@ class RecoveryMiddleware(Middleware):
         except Exception as e:
             err_msg = str(e)
             print("[ERROR] Panic recovered in request " + req.path_str() + ": " + err_msg)
-            return Response.json(
-                "{\"error\":\"Internal Server Error\",\"detail\":\"" + err_msg + "\"}",
-                500
-            )
+            if self.debug:
+                return Response.json(
+                    "{\"error\":\"Internal Server Error\",\"detail\":\"" + err_msg + "\"}",
+                    500
+                )
+            else:
+                return Response.json(
+                    "{\"error\":\"Internal Server Error\",\"status\":500}",
+                    500
+                )
 
 # Access Log Middleware
 class AccessLogMiddleware(Middleware):
@@ -70,12 +83,15 @@ class CORSMiddleware(Middleware):
         allow_origin: str = "*",
         allow_methods: str = "GET, POST, PUT, DELETE, OPTIONS, PATCH",
         allow_headers: str = "Content-Type, Authorization, X-Requested-With",
-        allow_credentials: bool = True
+        allow_credentials: bool = False
     ):
         self.allow_origin = allow_origin
         self.allow_methods = allow_methods
         self.allow_headers = allow_headers
-        self.allow_credentials = allow_credentials
+        if allow_origin == "*":
+            self.allow_credentials = False
+        else:
+            self.allow_credentials = allow_credentials
 
     def handle(self, req: Request, next_handler: RouteHandler) -> Response:
         if req.method == METHOD_OPTIONS:
@@ -130,30 +146,40 @@ class RequestIdMiddleware(Middleware):
         resp.set_header("X-Request-ID", req_id)
         return resp
 
-# Rate Limiter Middleware
+# Rate Limiter Middleware (Per-Client-IP Tracking)
 class RateLimiterMiddleware(Middleware):
     max_requests: int
     window_sec: float
-    current_window_start: float
-    request_count: int
+    windows: dict[str, Tuple[float, int]]
 
     def __init__(self, max_requests: int = 100000, window_sec: float = 1.0):
         self.max_requests = max_requests
         self.window_sec = window_sec
-        self.current_window_start = time.time()
-        self.request_count = 0
+        self.windows = dict[str, Tuple[float, int]]()
 
     def handle(self, req: Request, next_handler: RouteHandler) -> Response:
+        ip = req.client_ip()
         now = time.time()
-        if now - self.current_window_start >= self.window_sec:
-            self.current_window_start = now
-            self.request_count = 0
 
-        self.request_count += 1
-        if self.request_count > self.max_requests:
-            resp = Response.text("Too Many Requests", 429)
-            resp.set_header("Retry-After", "1")
-            return resp
+        if ip in self.windows:
+            start_time, count = self.windows[ip]
+            if now - start_time >= self.window_sec:
+                self.windows[ip] = (now, 1)
+            else:
+                if count >= self.max_requests:
+                    resp = Response.text("Too Many Requests", 429)
+                    resp.set_header("Retry-After", "1")
+                    return resp
+                self.windows[ip] = (start_time, count + 1)
+        else:
+            if len(self.windows) > 10000:
+                to_del = list[str]()
+                for k, v in self.windows.items():
+                    if now - v[0] >= self.window_sec:
+                        to_del.append(k)
+                for k in to_del:
+                    del self.windows[k]
+            self.windows[ip] = (now, 1)
 
         return next_handler.handle(req)
 
@@ -216,14 +242,10 @@ class HTTPSRedirectMiddleware(Middleware):
             return Response.redirect(new_url, 307)
         return next_handler.handle(req)
 
-# Signed Cookie Session Helpers
+# Signed Cookie Session Helpers (Cryptographic HMAC-SHA256)
 def _sign_session_data(data: str, secret: str) -> str:
-    h = 2166136261
-    combined = secret + ":" + data
-    for i in range(len(combined)):
-        h = (h ^ ord(combined[i])) * 16777619
-        h = h & 0xFFFFFFFF
-    return data + "." + str(h)
+    sig = hmac_sha256_hex(secret, data)
+    return data + "." + sig
 
 def _verify_session_data(signed_data: str, secret: str) -> str:
     dot_idx = signed_data.rfind(".")
@@ -231,12 +253,8 @@ def _verify_session_data(signed_data: str, secret: str) -> str:
         return ""
     data = signed_data[:dot_idx]
     sig = signed_data[dot_idx + 1:]
-    h = 2166136261
-    combined = secret + ":" + data
-    for i in range(len(combined)):
-        h = (h ^ ord(combined[i])) * 16777619
-        h = h & 0xFFFFFFFF
-    if str(h) == sig:
+    expected_sig = hmac_sha256_hex(secret, data)
+    if constant_time_compare(sig, expected_sig):
         return data
     return ""
 

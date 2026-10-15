@@ -1,6 +1,7 @@
 from src.os.constants import (
     AF_INET, SOCK_STREAM, SOCK_NONBLOCK, SOCK_CLOEXEC,
     SOL_SOCKET, SO_REUSEADDR, SO_REUSEPORT, IPPROTO_TCP, TCP_NODELAY,
+    TCP_DEFER_ACCEPT, TCP_QUICKACK,
     F_GETFL, F_SETFL, O_NONBLOCK, EINTR, EAGAIN, EWOULDBLOCK, EINPROGRESS
 )
 from src.os.linux import (
@@ -24,10 +25,12 @@ from src.os.linux import (
 class Socket:
     fd: i32
     is_closed: bool
+    _addr_buf: Ptr[byte]
 
     def __init__(self, fd: i32 = i32(-1)):
         self.fd = fd
         self.is_closed = (fd < i32(0))
+        self._addr_buf = Ptr[byte](16)
 
     @staticmethod
     def create_tcp() -> Socket:
@@ -70,11 +73,27 @@ class Socket:
     def set_tcp_nodelay(self, enabled: bool = True) -> None:
         if self.is_closed:
             return
+        Socket.set_fd_tcp_nodelay(self.fd, enabled)
+
+    @staticmethod
+    def set_fd_tcp_nodelay(fd: i32, enabled: bool = True) -> None:
+        if fd < i32(0):
+            return
         val = i32(1 if enabled else 0)
-        ret = c_setsockopt(self.fd, IPPROTO_TCP, TCP_NODELAY, __ptr__(val).as_byte(), i32(4))
-        if ret < i32(0):
-            err = get_errno()
-            raise OSError("setsockopt TCP_NODELAY failed: " + get_error_message(err))
+        c_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, __ptr__(val).as_byte(), i32(4))
+
+    def set_defer_accept(self, timeout_sec: int = 1) -> None:
+        if self.is_closed:
+            return
+        val = i32(timeout_sec)
+        c_setsockopt(self.fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, __ptr__(val).as_byte(), i32(4))
+
+    @staticmethod
+    def set_fd_quickack(fd: i32, enabled: bool = True) -> None:
+        if fd < i32(0):
+            return
+        val = i32(1 if enabled else 0)
+        c_setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, __ptr__(val).as_byte(), i32(4))
 
     def bind(self, host: str, port: int) -> None:
         if self.is_closed:
@@ -119,10 +138,8 @@ class Socket:
         if self.is_closed:
             return (i32(-1), "", 0)
 
-        addr_buf = Ptr[byte](16)
-        for i in range(16):
-            addr_buf[i] = byte(0)
         addr_len = i32(16)
+        addr_buf = self._addr_buf
 
         client_fd = c_accept4(
             self.fd,
@@ -190,11 +207,10 @@ class Socket:
             raise OSError("connect failed: " + get_error_message(err))
         return True
 
-    def send_str(self, s: str) -> int:
+    def send_raw(self, p: Ptr[byte], n: int) -> int:
+        """Transmits raw bytes directly to socket. Binary-safe and zero-allocation."""
         if self.is_closed:
             return -1
-        p = s.c_str()
-        n = len(s)
         sent = 0
         while sent < n:
             ret = c_send(self.fd, p + sent, n - sent, i32(0))
@@ -205,6 +221,19 @@ class Socket:
                 return -1
             sent += ret
         return sent
+
+    def send_bytes(self, b: bytes) -> int:
+        """Zero-copy transmission of binary bytes."""
+        if self.is_closed:
+            return -1
+        return self.send_raw(Ptr[byte](b._ptr), len(b))
+
+    def send_str(self, s: str) -> int:
+        """Sends string payload encoded as UTF-8. Preserves multibyte characters and embedded nulls."""
+        if self.is_closed:
+            return -1
+        b = s.encode("utf-8")
+        return self.send_raw(Ptr[byte](b._ptr), len(b))
 
     def recv_str(self, max_len: int = 4096) -> str:
         if self.is_closed:

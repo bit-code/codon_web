@@ -1,0 +1,58 @@
+# ==============================================================================
+# Smart Fulfillment Hub - Application Configuration Layer
+# ==============================================================================
+
+class FulfillmentConfig:
+    """Enterprise Configuration for Order Fulfillment Service & Real Database."""
+    env: str
+    service_name: str
+    port: int
+    free_shipping_threshold: float
+    max_batch_items: int
+    db_url: str
+    db_host: str
+    db_port: int
+    db_user: str
+    db_password: str
+    db_name: str
+
+    def __init__(
+        self,
+        env: str = "production",
+        service_name: str = "SmartFulfillmentHub",
+        port: int = 8088,
+        free_shipping_threshold: float = 99.0,
+        max_batch_items: int = 20,
+        db_url: str = "mysql://root:hujinlong@172.23.176.1:3306/ths",
+        db_host: str = "172.23.176.1",
+        db_port: int = 3306,
+        db_user: str = "root",
+        db_password: str = "hujinlong",
+        db_name: str = "ths"
+    ):
+        self.env = env
+        self.service_name = service_name
+        self.port = port
+        self.free_shipping_threshold = free_shipping_threshold
+        self.max_batch_items = max_batch_items
+        self.db_url = db_url
+        self.db_host = db_host
+        self.db_port = db_port
+        self.db_user = db_user
+        self.db_password = db_password
+        self.db_name = db_name
+
+    def is_production(self) -> bool:
+        return self.env == "production"
+
+    def calculate_shipping(self, subtotal: float, speed: str) -> float:
+        base_fee = 0.0 if subtotal >= self.free_shipping_threshold else 10.0
+        if speed == "same_day":
+            return base_fee + 25.0
+        elif speed == "express":
+            return base_fee + 12.0
+        return base_fee
+
+
+# Singleton configuration instance
+app_config = FulfillmentConfig()

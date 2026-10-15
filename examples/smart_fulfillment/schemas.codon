@@ -1,0 +1,1615 @@
+from typing import List, Optional
+from src.schema import (
+    SchemaModel,
+    StrField, IntField, FloatField, BoolField, StrListField, ItemsField, ModelField, Field,
+    ValidationError
+)
+
+class AddressSchema(SchemaModel):
+    city: str = StrField(min_length=2, max_length=50)
+    detail: str = StrField(min_length=5, max_length=120, strip_whitespace=True)
+    zip_code: str = StrField(alias="zipCode", pattern=r"^[0-9]{6}$")
+
+class FulfillmentItemSchema(SchemaModel):
+    sku_id: str = StrField(min_length=3, max_length=32, pattern=r"^[A-Z0-9_-]+$")
+    quantity: int = IntField(default=1, ge=1, le=100)
+    unit_price: float = FloatField(default=0.01, ge=0.01, le=50000.0, alias="unitPrice")
+
+class FulfillmentRequest(SchemaModel):
+    tracking_sn: str = StrField(pattern=r"^SF-[0-9]{8}$")
+    customer_email: str = StrField(format="email")
+    delivery_speed: str = StrField(default="standard", choices=["standard", "express", "same_day"], alias="deliverySpeed")
+    priority: int = IntField(default=1, gt=0, lt=10)
+    fragile: bool = BoolField(default=False)
+    insured_amount: float = FloatField(default=0.0, ge=0.0, le=20000.0)
+    memo: Optional[str] = None
+    discount_code: Optional[str] = None
+    tags: List[str] = StrListField(min_items=1, max_items=5)
+    address: AddressSchema = ModelField(AddressSchema())
+    items: List[FulfillmentItemSchema] = ItemsField(FulfillmentItemSchema(), min_items=1, max_items=10)
+
+    def custom_validate(self) -> List[ValidationError]:
+        errs = List[ValidationError]()
+        if self.delivery_speed == "same_day":
+            valid_cities = ["Shanghai", "Beijing", "Shenzhen", "Hangzhou"]
+            city_ok = False
+            for c in valid_cities:
+                if self.address.city == c:
+                    city_ok = True
+                    break
+            if not city_ok:
+                errs.append(ValidationError("delivery_speed", "Same-day delivery only in tier 1", "value_error.unsupported_region", loc=["body", "deliverySpeed"]))
+        if self.fragile:
+            total_qty = 0
+            for item in self.items:
+                total_qty += item.quantity
+            if total_qty > 20:
+                errs.append(ValidationError("items", "Fragile limit", "value_error.fragile_item_limit", loc=["body", "items"]))
+        if self.delivery_speed in ("express", "same_day"):
+            if len(self.address.detail.strip()) < 10:
+                errs.append(ValidationError("detail", "Detail len", "value_error.address_detail_insufficient", loc=["body", "address", "detail"]))
+        return errs
+
+class FulfillmentOrderUpdateSchema(SchemaModel):
+    delivery_speed: str = StrField(default="standard", choices=["standard", "express", "same_day"], alias="deliverySpeed")
+    priority: int = IntField(default=1, gt=0, lt=10)
+    memo: Optional[str] = None
+    insured_amount: float = FloatField(default=0.0, ge=0.0, le=20000.0)
+    status_code: int = IntField(default=1, ge=0, le=10)
+
+class WarehouseInventorySchema(SchemaModel):
+    sku_id: str = StrField(min_length=3, max_length=32, pattern=r"^[A-Z0-9_-]+$")
+    warehouse_code: str = StrField(choices=["WH-EAST-01", "WH-NORTH-02", "WH-SOUTH-03"])
+    zone_id: int = IntField(default=1, ge=1, le=999)
+    total_stock: int = IntField(default=100, ge=0, le=1000000)
+    reserved_stock: int = IntField(default=0, ge=0, le=1000000)
+    unit_weight_kg: float = FloatField(default=1.0, ge=0.01, le=500.0)
+    temperature_controlled: bool = BoolField(default=False)
+    target_temperature: Optional[float] = None
+    min_reorder_level: Optional[int] = None
+    is_quarantine: Optional[bool] = None
+    dimensions_cm: List[int] = ItemsField(0, min_items=3, max_items=3)
+    inspection_flags: List[bool] = ItemsField(False, min_items=2, max_items=5)
+
+    def custom_validate(self) -> List[ValidationError]:
+        errs = List[ValidationError]()
+        if self.total_stock < self.reserved_stock:
+            errs.append(ValidationError("total_stock", "Total stock cannot be less than reserved stock", "value_error.stock_inconsistent", loc=["body", "total_stock"]))
+        if self.temperature_controlled and self.target_temperature is None:
+            errs.append(ValidationError("target_temperature", "Temperature-controlled items must specify target temperature", "value_error.missing_target_temp", loc=["body", "target_temperature"]))
+        return errs
+
+class InventoryUpdateSchema(SchemaModel):
+    total_stock: int = IntField(default=0, ge=0, le=1000000)
+    reserved_stock: int = IntField(default=0, ge=0, le=1000000)
+    min_reorder_level: Optional[int] = None
+    is_quarantine: Optional[bool] = None
+
+    def custom_validate(self) -> List[ValidationError]:
+        errs = List[ValidationError]()
+        if self.total_stock < self.reserved_stock:
+            errs.append(ValidationError("total_stock", "Total stock cannot be less than reserved stock", "value_error.stock_inconsistent", loc=["body", "total_stock"]))
+        return errs
+
+class LogisticsRoutePointSchema(SchemaModel):
+    station_name: str = StrField(min_length=2, max_length=50)
+    city: str = StrField(min_length=2, max_length=50)
+    passed: bool = BoolField(default=True)
+
+class ShipmentTrackingSchema(SchemaModel):
+    waybill_no: str = StrField(pattern=r"^WB-[A-Z0-9]{10}$")
+    carrier_code: str = StrField(choices=["SF_EXPRESS", "JD_LOGISTICS", "EMS_GLOBAL"])
+    status_code: int = IntField(default=0, ge=0, le=10)
+    dispatcher_email: str = StrField(format="email")
+    gross_weight_kg: float = FloatField(default=1.0, ge=0.01, le=1000.0)
+    signature_required: Optional[bool] = None
+    delivery_deadline_hours: Optional[int] = None
+    carbon_footprint_kg: Optional[float] = None
+    gps_coordinates: List[float] = ItemsField(0.0, min_items=2, max_items=2)
+    route_stations: List[LogisticsRoutePointSchema] = ItemsField(LogisticsRoutePointSchema(), min_items=1, max_items=5)
+
+    def custom_validate(self) -> List[ValidationError]:
+        errs = List[ValidationError]()
+        if self.carrier_code == "SF_EXPRESS" and self.gross_weight_kg > 500.0:
+            errs.append(ValidationError("gross_weight_kg", "SF Express single waybill cannot exceed 500kg", "value_error.overweight_sf", loc=["body", "gross_weight_kg"]))
+        if len(self.gps_coordinates) == 2:
+            lat = self.gps_coordinates[0]
+            lng = self.gps_coordinates[1]
+            if lat < -90.0 or lat > 90.0:
+                errs.append(ValidationError("gps_coordinates", "Latitude must be between -90 and 90", "value_error.latitude", loc=["body", "gps_coordinates", "0"]))
+            if lng < -180.0 or lng > 180.0:
+                errs.append(ValidationError("gps_coordinates", "Longitude must be between -180 and 180", "value_error.longitude", loc=["body", "gps_coordinates", "1"]))
+        return errs
+
+class ShipmentUpdateSchema(SchemaModel):
+    status_code: int = IntField(default=0, ge=0, le=10)
+    status_remark: str = StrField(min_length=1, max_length=200)
+    carbon_footprint_kg: Optional[float] = None
+
+
+# ==================== AUTO-GENERATED METHODS (DO NOT EDIT) ====================
+# Generated by CodonWeb Modern Jinja2 Schema Generator. DO NOT EDIT DIRECTLY.
+# CodeGen-Checksum: 6a50bebd2daaffc9
+# Supports IDE code folding. All modifications above remain 100% preserved.
+import re
+from src.http.fast_json import FastJson, FastJsonVal, FastJsonDoc, FastJsonWriter
+from src.memory.buffer import ByteBuffer
+from src.schema.errors import ValidationError, ValidationResult
+from src.schema.validator import (
+    extract_str_field, extract_opt_str_field,
+    extract_int_field, extract_opt_int_field,
+    extract_float_field, extract_opt_float_field,
+    extract_bool_field, extract_opt_bool_field,
+    extract_dict_str, extract_dict_opt_str,
+    extract_dict_int, extract_dict_opt_int,
+    extract_dict_float, extract_dict_opt_float,
+    extract_dict_bool, extract_dict_opt_bool,
+    parse_json_payload
+)
+
+@extend
+class AddressSchema:
+
+    def to_dict(self) -> Dict[str, str]:
+        d = Dict[str, str]()
+        d["city"] = self.city
+        d["detail"] = self.detail
+        d["zip_code"] = self.zip_code
+        return d
+
+    def _write_json_fields(self, w: FastJsonWriter):
+        w.write_str("city", self.city)
+        w.write_str("detail", self.detail)
+        w.write_str("zipCode", self.zip_code)
+
+    @staticmethod
+    def from_fast_json(val: FastJsonVal) -> ValidationResult[AddressSchema]:
+        errors = List[ValidationError]()
+        if not val.is_obj():
+            errors.append(ValidationError("", "Expected JSON object", "type_error.object", loc=["body"]))
+            return ValidationResult[AddressSchema](None, errors)
+
+        _city = extract_str_field(val["city"], "city", errors, required=True, default="", min_len=2, max_len=50, strip_ws=False, fmt="", pattern=r"", choices=[], alias="")
+        _detail = extract_str_field(val["detail"], "detail", errors, required=True, default="", min_len=5, max_len=120, strip_ws=True, fmt="", pattern=r"", choices=[], alias="")
+        _zip_code = extract_str_field(val["zipCode"], "zip_code", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, fmt="", pattern=r"^[0-9]{6}$", choices=[], alias="zipCode")
+
+        if len(errors) > 0:
+            return ValidationResult[AddressSchema](None, errors)
+        _inst = AddressSchema(_city, _detail, _zip_code)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def from_json(raw: str) -> ValidationResult[AddressSchema]:
+        try:
+            doc = FastJson.loads(raw)
+            res = AddressSchema.from_fast_json(doc.root)
+            doc.close()
+            return res
+        except:
+            errors = List[ValidationError]()
+            errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))
+            return ValidationResult[AddressSchema](None, errors)
+
+    @staticmethod
+    def model_validate_json(raw: str) -> ValidationResult[AddressSchema]:
+        return AddressSchema.from_json(raw)
+
+    @staticmethod
+    def from_json_doc(doc: FastJsonDoc) -> ValidationResult[AddressSchema]:
+        return AddressSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_dict(d: Dict[str, str]) -> ValidationResult[AddressSchema]:
+        errors = List[ValidationError]()
+        _d_city = extract_dict_str(d, "city", errors, required=True, default="", min_len=2, max_len=50, strip_ws=False, choices=[], alias="")
+        _d_detail = extract_dict_str(d, "detail", errors, required=True, default="", min_len=5, max_len=120, strip_ws=True, choices=[], alias="")
+        _d_zip_code = extract_dict_str(d, "zip_code", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, choices=[], alias="zipCode")
+
+        if len(errors) > 0:
+            return ValidationResult[AddressSchema](None, errors)
+        _inst = AddressSchema(_d_city, _d_detail, _d_zip_code)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def model_validate(d: Dict[str, str]) -> ValidationResult[AddressSchema]:
+        return AddressSchema.from_dict(d)
+
+    @staticmethod
+    def model_validate(val: FastJsonVal) -> ValidationResult[AddressSchema]:
+        return AddressSchema.from_fast_json(val)
+
+    @staticmethod
+    def model_validate(doc: FastJsonDoc) -> ValidationResult[AddressSchema]:
+        return AddressSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_orm[M](entity: M) -> ValidationResult[AddressSchema]:
+        """Zero-alloc direct attribute borrowing from ORM entity (no intermediate Dict)."""
+        _city = entity["city"]
+        _detail = entity["detail"]
+        _zip_code = entity["zip_code"]
+        _inst = AddressSchema(_city,_detail,_zip_code)
+        return ValidationResult.ok(_inst)
+
+    def copy_to[T](self, target: T) -> None:
+        """Zero-alloc direct attribute transfer to target entity (no intermediate Dict)."""
+        target["city"] = self.city
+        target["detail"] = self.detail
+        target["zip_code"] = self.zip_code
+
+    @staticmethod
+    def openapi_schema_json() -> str:
+        return '{"type":"object","title":"AddressSchema","properties":{"city":{"type":"string","minLength":2,"maxLength":50},"detail":{"type":"string","minLength":5,"maxLength":120},"zipCode":{"type":"string","pattern":"^[0-9]{6}$"}},"required":["city","detail","zipCode"]}'
+
+    @staticmethod
+    def model_json_schema() -> str:
+        return AddressSchema.openapi_schema_json()
+
+@extend
+class FulfillmentItemSchema:
+
+    def to_dict(self) -> Dict[str, str]:
+        d = Dict[str, str]()
+        d["sku_id"] = self.sku_id
+        d["quantity"] = str(self.quantity)
+        d["unit_price"] = str(self.unit_price)
+        return d
+
+    def _write_json_fields(self, w: FastJsonWriter):
+        w.write_str("sku_id", self.sku_id)
+        w.write_int("quantity", self.quantity)
+        w.write_float("unitPrice", self.unit_price)
+
+    @staticmethod
+    def from_fast_json(val: FastJsonVal) -> ValidationResult[FulfillmentItemSchema]:
+        errors = List[ValidationError]()
+        if not val.is_obj():
+            errors.append(ValidationError("", "Expected JSON object", "type_error.object", loc=["body"]))
+            return ValidationResult[FulfillmentItemSchema](None, errors)
+
+        _sku_id = extract_str_field(val["sku_id"], "sku_id", errors, required=True, default="", min_len=3, max_len=32, strip_ws=False, fmt="", pattern=r"^[A-Z0-9_-]+$", choices=[], alias="")
+        _quantity = extract_int_field(val["quantity"], "quantity", errors, required=False, default=1, ge=1, le=100, gt=-999999999999, lt=999999999999, alias="")
+        _unit_price = extract_float_field(val["unitPrice"], "unit_price", errors, required=False, default=0.01, ge=0.01, le=50000.0, gt=-1e+18, lt=1e+18, alias="unitPrice")
+
+        if len(errors) > 0:
+            return ValidationResult[FulfillmentItemSchema](None, errors)
+        _inst = FulfillmentItemSchema(_sku_id, _quantity, _unit_price)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def from_json(raw: str) -> ValidationResult[FulfillmentItemSchema]:
+        try:
+            doc = FastJson.loads(raw)
+            res = FulfillmentItemSchema.from_fast_json(doc.root)
+            doc.close()
+            return res
+        except:
+            errors = List[ValidationError]()
+            errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))
+            return ValidationResult[FulfillmentItemSchema](None, errors)
+
+    @staticmethod
+    def model_validate_json(raw: str) -> ValidationResult[FulfillmentItemSchema]:
+        return FulfillmentItemSchema.from_json(raw)
+
+    @staticmethod
+    def from_json_doc(doc: FastJsonDoc) -> ValidationResult[FulfillmentItemSchema]:
+        return FulfillmentItemSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_dict(d: Dict[str, str]) -> ValidationResult[FulfillmentItemSchema]:
+        errors = List[ValidationError]()
+        _d_sku_id = extract_dict_str(d, "sku_id", errors, required=True, default="", min_len=3, max_len=32, strip_ws=False, choices=[], alias="")
+        _d_quantity = extract_dict_int(d, "quantity", errors, required=False, default=1, ge=1, le=100, gt=-999999999999, lt=999999999999, alias="")
+        _d_unit_price = extract_dict_float(d, "unit_price", errors, required=False, default=0.01, ge=0.01, le=50000.0, gt=-1e+18, lt=1e+18, alias="unitPrice")
+
+        if len(errors) > 0:
+            return ValidationResult[FulfillmentItemSchema](None, errors)
+        _inst = FulfillmentItemSchema(_d_sku_id, _d_quantity, _d_unit_price)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def model_validate(d: Dict[str, str]) -> ValidationResult[FulfillmentItemSchema]:
+        return FulfillmentItemSchema.from_dict(d)
+
+    @staticmethod
+    def model_validate(val: FastJsonVal) -> ValidationResult[FulfillmentItemSchema]:
+        return FulfillmentItemSchema.from_fast_json(val)
+
+    @staticmethod
+    def model_validate(doc: FastJsonDoc) -> ValidationResult[FulfillmentItemSchema]:
+        return FulfillmentItemSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_orm[M](entity: M) -> ValidationResult[FulfillmentItemSchema]:
+        """Zero-alloc direct attribute borrowing from ORM entity (no intermediate Dict)."""
+        _sku_id = entity["sku_id"]
+        _raw_quantity = entity["quantity"].strip()
+        _quantity = int(_raw_quantity) if len(_raw_quantity) > 0 else 1
+        _raw_unit_price = entity["unit_price"].strip()
+        _unit_price = float(_raw_unit_price) if len(_raw_unit_price) > 0 else 0.01
+        _inst = FulfillmentItemSchema(_sku_id,_quantity,_unit_price)
+        return ValidationResult.ok(_inst)
+
+    def copy_to[T](self, target: T) -> None:
+        """Zero-alloc direct attribute transfer to target entity (no intermediate Dict)."""
+        target["sku_id"] = self.sku_id
+        target["quantity"] = self.quantity
+        target["unit_price"] = self.unit_price
+
+    @staticmethod
+    def openapi_schema_json() -> str:
+        return '{"type":"object","title":"FulfillmentItemSchema","properties":{"sku_id":{"type":"string","minLength":3,"maxLength":32,"pattern":"^[A-Z0-9_-]+$"},"quantity":{"type":"integer","minimum":1,"maximum":100,"default":1},"unitPrice":{"type":"number","minimum":0.01,"maximum":50000.0,"default":0.01}},"required":["sku_id"]}'
+
+    @staticmethod
+    def model_json_schema() -> str:
+        return FulfillmentItemSchema.openapi_schema_json()
+
+@extend
+class FulfillmentRequest:
+
+    def to_dict(self) -> Dict[str, str]:
+        d = Dict[str, str]()
+        d["tracking_sn"] = self.tracking_sn
+        d["customer_email"] = self.customer_email
+        d["delivery_speed"] = self.delivery_speed
+        d["priority"] = str(self.priority)
+        d["fragile"] = "true" if self.fragile else "false"
+        d["insured_amount"] = str(self.insured_amount)
+        d["memo"] = str(self.memo)
+        d["discount_code"] = str(self.discount_code)
+        d["tags"] = ",".join(self.tags)
+        d["address"] = self.address.to_json()
+        _sub_items_items = List[str]()
+        for _x in self.items:
+            _sub_items_items.append(_x.to_json())
+        d["items"] = "[" + ",".join(_sub_items_items) + "]"
+        return d
+
+    def _write_json_fields(self, w: FastJsonWriter):
+        w.write_str("tracking_sn", self.tracking_sn)
+        w.write_str("customer_email", self.customer_email)
+        w.write_str("deliverySpeed", self.delivery_speed)
+        w.write_int("priority", self.priority)
+        w.write_bool("fragile", self.fragile)
+        w.write_float("insured_amount", self.insured_amount)
+        if self.memo is not None:
+            w.write_str("memo", self.memo)
+        else:
+            w.write_null("memo")
+        if self.discount_code is not None:
+            w.write_str("discount_code", self.discount_code)
+        else:
+            w.write_null("discount_code")
+        w.begin_array("tags")
+        for _x in self.tags:
+            w.append_arr_str(_x)
+        w.end_array()
+        w.write_raw("address", self.address.to_json())
+        w.begin_array("items")
+        for _x in self.items:
+            w.append_arr_raw(_x.to_json())
+        w.end_array()
+
+    @staticmethod
+    def from_fast_json(val: FastJsonVal) -> ValidationResult[FulfillmentRequest]:
+        errors = List[ValidationError]()
+        if not val.is_obj():
+            errors.append(ValidationError("", "Expected JSON object", "type_error.object", loc=["body"]))
+            return ValidationResult[FulfillmentRequest](None, errors)
+
+        _tracking_sn = extract_str_field(val["tracking_sn"], "tracking_sn", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, fmt="", pattern=r"^SF-[0-9]{8}$", choices=[], alias="")
+        _customer_email = extract_str_field(val["customer_email"], "customer_email", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, fmt="email", pattern=r"", choices=[], alias="")
+        _delivery_speed = extract_str_field(val["deliverySpeed"], "delivery_speed", errors, required=False, default="standard", min_len=0, max_len=0, strip_ws=False, fmt="", pattern=r"", choices=["standard", "express", "same_day"], alias="deliverySpeed")
+        _priority = extract_int_field(val["priority"], "priority", errors, required=False, default=1, ge=-999999999999, le=999999999999, gt=0, lt=10, alias="")
+        _fragile = extract_bool_field(val["fragile"], "fragile", errors, required=False, default=False, alias="")
+        _insured_amount = extract_float_field(val["insured_amount"], "insured_amount", errors, required=False, default=0.0, ge=0.0, le=20000.0, gt=-1e+18, lt=1e+18, alias="")
+        _memo = extract_opt_str_field(val["memo"], "memo", errors, min_len=0, max_len=0, strip_ws=False, fmt="", pattern=r"", choices=[], alias="")
+        _discount_code = extract_opt_str_field(val["discount_code"], "discount_code", errors, min_len=0, max_len=0, strip_ws=False, fmt="", pattern=r"", choices=[], alias="")
+        _tags = List[str]()
+        _v_tags = val["tags"]
+        if _v_tags.is_null():
+            errors.append(ValidationError("tags", "Field 'tags' is required", "missing", loc=["body", "tags"]))
+        elif not _v_tags.is_arr():
+            errors.append(ValidationError("tags", "Field 'tags' must be a list/array", "type_error.list", loc=["body", "tags"]))
+        else:
+            _n_tags = _v_tags.len()
+            if _n_tags < 1:
+                errors.append(ValidationError("tags", "Field 'tags' requires at least 1 items", "value_error.list.min_items", loc=["body", "tags"]))
+            if _n_tags > 5:
+                errors.append(ValidationError("tags", "Field 'tags' must not exceed 5 items", "value_error.list.max_items", loc=["body", "tags"]))
+            for _idx_tags in range(_n_tags):
+                _item_tags = _v_tags[_idx_tags]
+                if not _item_tags.is_str():
+                    errors.append(ValidationError("tags", "Item at index " + str(_idx_tags) + " must be a string", "type_error.str", loc=["body", "tags", str(_idx_tags)]))
+                else:
+                    _tags.append(_item_tags.as_str())
+        _v_address = val["address"]
+        if _v_address.is_null():
+            errors.append(ValidationError("address", "Field 'address' is required", "missing", loc=["body", "address"]))
+            _address = AddressSchema()
+        elif not _v_address.is_obj():
+            errors.append(ValidationError("address", "Field 'address' must be an object", "type_error.object", loc=["body", "address"]))
+            _address = AddressSchema()
+        else:
+            _sub_res_address = AddressSchema.from_fast_json(_v_address)
+            if not _sub_res_address.is_ok():
+                for _s_err in _sub_res_address.errors:
+                    errors.append(_s_err.with_prefix("address"))
+                _address = AddressSchema()
+            else:
+                _address = _sub_res_address.unwrap()
+        _items = List[FulfillmentItemSchema]()
+        _v_items = val["items"]
+        if _v_items.is_null():
+            errors.append(ValidationError("items", "Field 'items' is required", "missing", loc=["body", "items"]))
+        elif not _v_items.is_arr():
+            errors.append(ValidationError("items", "Field 'items' must be a list/array", "type_error.list", loc=["body", "items"]))
+        else:
+            _n_items = _v_items.len()
+            if _n_items < 1:
+                errors.append(ValidationError("items", "Field 'items' requires at least 1 items", "value_error.list.min_items", loc=["body", "items"]))
+            if _n_items > 10:
+                errors.append(ValidationError("items", "Field 'items' must not exceed 10 items", "value_error.list.max_items", loc=["body", "items"]))
+            for _idx_items in range(_n_items):
+                _item_items = _v_items[_idx_items]
+                _sub_res_items = FulfillmentItemSchema.from_fast_json(_item_items)
+                if not _sub_res_items.is_ok():
+                    for _s_err in _sub_res_items.errors:
+                        errors.append(_s_err.with_prefix(str(_idx_items)).with_prefix("items"))
+                else:
+                    _items.append(_sub_res_items.unwrap())
+
+        if len(errors) > 0:
+            return ValidationResult[FulfillmentRequest](None, errors)
+        _inst = FulfillmentRequest(_tracking_sn, _customer_email, _delivery_speed, _priority, _fragile, _insured_amount, _memo, _discount_code, _tags, _address, _items)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            for _ce in _custom_errs:
+                errors.append(_ce)
+            return ValidationResult[FulfillmentRequest](None, errors)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def from_json(raw: str) -> ValidationResult[FulfillmentRequest]:
+        try:
+            doc = FastJson.loads(raw)
+            res = FulfillmentRequest.from_fast_json(doc.root)
+            doc.close()
+            return res
+        except:
+            errors = List[ValidationError]()
+            errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))
+            return ValidationResult[FulfillmentRequest](None, errors)
+
+    @staticmethod
+    def model_validate_json(raw: str) -> ValidationResult[FulfillmentRequest]:
+        return FulfillmentRequest.from_json(raw)
+
+    @staticmethod
+    def from_json_doc(doc: FastJsonDoc) -> ValidationResult[FulfillmentRequest]:
+        return FulfillmentRequest.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_dict(d: Dict[str, str]) -> ValidationResult[FulfillmentRequest]:
+        errors = List[ValidationError]()
+        _d_tracking_sn = extract_dict_str(d, "tracking_sn", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, choices=[], alias="")
+        _d_customer_email = extract_dict_str(d, "customer_email", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, choices=[], alias="")
+        _d_delivery_speed = extract_dict_str(d, "delivery_speed", errors, required=False, default="standard", min_len=0, max_len=0, strip_ws=False, choices=["standard", "express", "same_day"], alias="deliverySpeed")
+        _d_priority = extract_dict_int(d, "priority", errors, required=False, default=1, ge=-999999999999, le=999999999999, gt=0, lt=10, alias="")
+        _d_fragile = extract_dict_bool(d, "fragile", errors, required=False, default=False, alias="")
+        _d_insured_amount = extract_dict_float(d, "insured_amount", errors, required=False, default=0.0, ge=0.0, le=20000.0, gt=-1e+18, lt=1e+18, alias="")
+        _d_memo = extract_dict_opt_str(d, "memo", errors, min_len=0, max_len=0, strip_ws=False, choices=[], alias="")
+        _d_discount_code = extract_dict_opt_str(d, "discount_code", errors, min_len=0, max_len=0, strip_ws=False, choices=[], alias="")
+        _has_tags = ("tags" in d and len(d["tags"].strip()) > 0)
+        _d_tags = List[str]()
+        if _has_tags:
+            _raw_tags = d["tags"].strip()
+            _items_tags = _raw_tags.split(',')
+            for _sub_item in _items_tags:
+                _clean_sub = _sub_item.strip()
+                _d_tags.append(_clean_sub)
+        _d_address = AddressSchema()
+        if "address" in d and len(d["address"].strip()) > 0:
+            _sub_dict_res_address = AddressSchema.from_json(d["address"])
+            if _sub_dict_res_address.is_ok():
+                _d_address = _sub_dict_res_address.unwrap()
+            else:
+                for _s_err in _sub_dict_res_address.errors:
+                    errors.append(_s_err.with_prefix("address"))
+        elif True:
+            errors.append(ValidationError("address", "Field 'address' is required", "missing", loc=["query", "address"]))
+        _has_items = ("items" in d and len(d["items"].strip()) > 0)
+        _d_items = List[FulfillmentItemSchema]()
+        if _has_items:
+            _raw_items = d["items"].strip()
+            try:
+                _sub_arr_doc_items = FastJson.loads(_raw_items)
+                if _sub_arr_doc_items.root.is_arr():
+                    for _idx_items in range(_sub_arr_doc_items.root.len()):
+                        _sub_item_res = FulfillmentItemSchema.from_fast_json(_sub_arr_doc_items.root[_idx_items])
+                        if _sub_item_res.is_ok():
+                            _d_items.append(_sub_item_res.unwrap())
+                        else:
+                            for _s_err in _sub_item_res.errors:
+                                errors.append(_s_err.with_prefix(str(_idx_items)).with_prefix("items"))
+                _sub_arr_doc_items.close()
+            except:
+                errors.append(ValidationError("items", "Invalid JSON array", "type_error.list", loc=["query", "items"]))
+
+        if len(errors) > 0:
+            return ValidationResult[FulfillmentRequest](None, errors)
+        _inst = FulfillmentRequest(_d_tracking_sn, _d_customer_email, _d_delivery_speed, _d_priority, _d_fragile, _d_insured_amount, _d_memo, _d_discount_code, _d_tags, _d_address, _d_items)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            for _ce in _custom_errs:
+                errors.append(_ce)
+            return ValidationResult[FulfillmentRequest](None, errors)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def model_validate(d: Dict[str, str]) -> ValidationResult[FulfillmentRequest]:
+        return FulfillmentRequest.from_dict(d)
+
+    @staticmethod
+    def model_validate(val: FastJsonVal) -> ValidationResult[FulfillmentRequest]:
+        return FulfillmentRequest.from_fast_json(val)
+
+    @staticmethod
+    def model_validate(doc: FastJsonDoc) -> ValidationResult[FulfillmentRequest]:
+        return FulfillmentRequest.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_orm[M](entity: M) -> ValidationResult[FulfillmentRequest]:
+        """Zero-alloc direct attribute borrowing from ORM entity (no intermediate Dict)."""
+        _tracking_sn = entity["tracking_sn"]
+        _customer_email = entity["customer_email"]
+        _delivery_speed = entity["delivery_speed"]
+        _raw_priority = entity["priority"].strip()
+        _priority = int(_raw_priority) if len(_raw_priority) > 0 else 1
+        _raw_fragile = entity["fragile"].strip()
+        _fragile = (_raw_fragile == "1" or _raw_fragile.lower() == "true") if len(_raw_fragile) > 0 else False
+        _raw_insured_amount = entity["insured_amount"].strip()
+        _insured_amount = float(_raw_insured_amount) if len(_raw_insured_amount) > 0 else 0.0
+        _raw_memo = entity["memo"].strip()
+        _memo = Optional[str](_raw_memo) if len(_raw_memo) > 0 else None
+        _raw_discount_code = entity["discount_code"].strip()
+        _discount_code = Optional[str](_raw_discount_code) if len(_raw_discount_code) > 0 else None
+        _tags = List[str]()
+        _raw_tags = entity["tags"].strip()
+        if len(_raw_tags) > 0:
+            for _s in _raw_tags.split(","):
+                _c = _s.strip()
+                if len(_c) > 0:
+                    _tags.append(_c)
+        _sub_res_address = AddressSchema.from_orm(entity)
+        _address = _sub_res_address.unwrap() if _sub_res_address.is_ok() else AddressSchema()
+        _items = List[FulfillmentItemSchema]()
+        _raw_items = entity["items"].strip()
+        if len(_raw_items) > 0 and _raw_items.startswith("["):
+            try:
+                _doc_items = FastJson.loads(_raw_items)
+                if _doc_items.root.is_arr():
+                    for _idx_items in range(_doc_items.root.len()):
+                        _sub_item_res_items = FulfillmentItemSchema.from_fast_json(_doc_items.root[_idx_items])
+                        if _sub_item_res_items.is_ok():
+                            _items.append(_sub_item_res_items.unwrap())
+                _doc_items.close()
+            except:
+                pass
+        _inst = FulfillmentRequest(_tracking_sn,_customer_email,_delivery_speed,_priority,_fragile,_insured_amount,_memo,_discount_code,_tags,_address,_items)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            return ValidationResult[FulfillmentRequest](None, _custom_errs)
+        return ValidationResult.ok(_inst)
+
+    def copy_to[T](self, target: T) -> None:
+        """Zero-alloc direct attribute transfer to target entity (no intermediate Dict)."""
+        target["tracking_sn"] = self.tracking_sn
+        target["customer_email"] = self.customer_email
+        target["delivery_speed"] = self.delivery_speed
+        target["priority"] = self.priority
+        target["fragile"] = self.fragile
+        target["insured_amount"] = self.insured_amount
+        if self.memo is not None:
+            target["memo"] = self.memo
+        if self.discount_code is not None:
+            target["discount_code"] = self.discount_code
+        target["tags"] = ",".join(self.tags)
+        self.address.copy_to(target)
+        _sub_items_items = List[str]()
+        for _x in self.items:
+            _sub_items_items.append(_x.to_json())
+        target["items"] = "[" + ",".join(_sub_items_items) + "]"
+
+    @staticmethod
+    def openapi_schema_json() -> str:
+        return '{"type":"object","title":"FulfillmentRequest","properties":{"tracking_sn":{"type":"string","pattern":"^SF-[0-9]{8}$"},"customer_email":{"type":"string","format":"email"},"deliverySpeed":{"type":"string","enum":["standard","express","same_day"],"default":"standard"},"priority":{"type":"integer","exclusiveMinimum":0,"exclusiveMaximum":10,"default":1},"fragile":{"type":"boolean","default":false},"insured_amount":{"type":"number","minimum":0.0,"maximum":20000.0,"default":0.0},"memo":{"type":"string","default":"None"},"discount_code":{"type":"string","default":"None"},"tags":{"type":"array","minItems":1,"maxItems":5,"items":{"type":"string"}},"address":{"type":"object","title":"AddressSchema"},"items":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","title":"FulfillmentItemSchema"}}},"required":["tracking_sn","customer_email","tags","address","items"]}'
+
+    @staticmethod
+    def model_json_schema() -> str:
+        return FulfillmentRequest.openapi_schema_json()
+
+@extend
+class FulfillmentOrderUpdateSchema:
+
+    def to_dict(self) -> Dict[str, str]:
+        d = Dict[str, str]()
+        d["delivery_speed"] = self.delivery_speed
+        d["priority"] = str(self.priority)
+        d["memo"] = str(self.memo)
+        d["insured_amount"] = str(self.insured_amount)
+        d["status_code"] = str(self.status_code)
+        return d
+
+    def _write_json_fields(self, w: FastJsonWriter):
+        w.write_str("deliverySpeed", self.delivery_speed)
+        w.write_int("priority", self.priority)
+        if self.memo is not None:
+            w.write_str("memo", self.memo)
+        else:
+            w.write_null("memo")
+        w.write_float("insured_amount", self.insured_amount)
+        w.write_int("status_code", self.status_code)
+
+    @staticmethod
+    def from_fast_json(val: FastJsonVal) -> ValidationResult[FulfillmentOrderUpdateSchema]:
+        errors = List[ValidationError]()
+        if not val.is_obj():
+            errors.append(ValidationError("", "Expected JSON object", "type_error.object", loc=["body"]))
+            return ValidationResult[FulfillmentOrderUpdateSchema](None, errors)
+
+        _delivery_speed = extract_str_field(val["deliverySpeed"], "delivery_speed", errors, required=False, default="standard", min_len=0, max_len=0, strip_ws=False, fmt="", pattern=r"", choices=["standard", "express", "same_day"], alias="deliverySpeed")
+        _priority = extract_int_field(val["priority"], "priority", errors, required=False, default=1, ge=-999999999999, le=999999999999, gt=0, lt=10, alias="")
+        _memo = extract_opt_str_field(val["memo"], "memo", errors, min_len=0, max_len=0, strip_ws=False, fmt="", pattern=r"", choices=[], alias="")
+        _insured_amount = extract_float_field(val["insured_amount"], "insured_amount", errors, required=False, default=0.0, ge=0.0, le=20000.0, gt=-1e+18, lt=1e+18, alias="")
+        _status_code = extract_int_field(val["status_code"], "status_code", errors, required=False, default=1, ge=0, le=10, gt=-999999999999, lt=999999999999, alias="")
+
+        if len(errors) > 0:
+            return ValidationResult[FulfillmentOrderUpdateSchema](None, errors)
+        _inst = FulfillmentOrderUpdateSchema(_delivery_speed, _priority, _memo, _insured_amount, _status_code)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def from_json(raw: str) -> ValidationResult[FulfillmentOrderUpdateSchema]:
+        try:
+            doc = FastJson.loads(raw)
+            res = FulfillmentOrderUpdateSchema.from_fast_json(doc.root)
+            doc.close()
+            return res
+        except:
+            errors = List[ValidationError]()
+            errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))
+            return ValidationResult[FulfillmentOrderUpdateSchema](None, errors)
+
+    @staticmethod
+    def model_validate_json(raw: str) -> ValidationResult[FulfillmentOrderUpdateSchema]:
+        return FulfillmentOrderUpdateSchema.from_json(raw)
+
+    @staticmethod
+    def from_json_doc(doc: FastJsonDoc) -> ValidationResult[FulfillmentOrderUpdateSchema]:
+        return FulfillmentOrderUpdateSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_dict(d: Dict[str, str]) -> ValidationResult[FulfillmentOrderUpdateSchema]:
+        errors = List[ValidationError]()
+        _d_delivery_speed = extract_dict_str(d, "delivery_speed", errors, required=False, default="standard", min_len=0, max_len=0, strip_ws=False, choices=["standard", "express", "same_day"], alias="deliverySpeed")
+        _d_priority = extract_dict_int(d, "priority", errors, required=False, default=1, ge=-999999999999, le=999999999999, gt=0, lt=10, alias="")
+        _d_memo = extract_dict_opt_str(d, "memo", errors, min_len=0, max_len=0, strip_ws=False, choices=[], alias="")
+        _d_insured_amount = extract_dict_float(d, "insured_amount", errors, required=False, default=0.0, ge=0.0, le=20000.0, gt=-1e+18, lt=1e+18, alias="")
+        _d_status_code = extract_dict_int(d, "status_code", errors, required=False, default=1, ge=0, le=10, gt=-999999999999, lt=999999999999, alias="")
+
+        if len(errors) > 0:
+            return ValidationResult[FulfillmentOrderUpdateSchema](None, errors)
+        _inst = FulfillmentOrderUpdateSchema(_d_delivery_speed, _d_priority, _d_memo, _d_insured_amount, _d_status_code)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def model_validate(d: Dict[str, str]) -> ValidationResult[FulfillmentOrderUpdateSchema]:
+        return FulfillmentOrderUpdateSchema.from_dict(d)
+
+    @staticmethod
+    def model_validate(val: FastJsonVal) -> ValidationResult[FulfillmentOrderUpdateSchema]:
+        return FulfillmentOrderUpdateSchema.from_fast_json(val)
+
+    @staticmethod
+    def model_validate(doc: FastJsonDoc) -> ValidationResult[FulfillmentOrderUpdateSchema]:
+        return FulfillmentOrderUpdateSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_orm[M](entity: M) -> ValidationResult[FulfillmentOrderUpdateSchema]:
+        """Zero-alloc direct attribute borrowing from ORM entity (no intermediate Dict)."""
+        _delivery_speed = entity["delivery_speed"]
+        _raw_priority = entity["priority"].strip()
+        _priority = int(_raw_priority) if len(_raw_priority) > 0 else 1
+        _raw_memo = entity["memo"].strip()
+        _memo = Optional[str](_raw_memo) if len(_raw_memo) > 0 else None
+        _raw_insured_amount = entity["insured_amount"].strip()
+        _insured_amount = float(_raw_insured_amount) if len(_raw_insured_amount) > 0 else 0.0
+        _raw_status_code = entity["status_code"].strip()
+        _status_code = int(_raw_status_code) if len(_raw_status_code) > 0 else 1
+        _inst = FulfillmentOrderUpdateSchema(_delivery_speed,_priority,_memo,_insured_amount,_status_code)
+        return ValidationResult.ok(_inst)
+
+    def copy_to[T](self, target: T) -> None:
+        """Zero-alloc direct attribute transfer to target entity (no intermediate Dict)."""
+        target["delivery_speed"] = self.delivery_speed
+        target["priority"] = self.priority
+        if self.memo is not None:
+            target["memo"] = self.memo
+        target["insured_amount"] = self.insured_amount
+        target["status_code"] = self.status_code
+
+    @staticmethod
+    def openapi_schema_json() -> str:
+        return '{"type":"object","title":"FulfillmentOrderUpdateSchema","properties":{"deliverySpeed":{"type":"string","enum":["standard","express","same_day"],"default":"standard"},"priority":{"type":"integer","exclusiveMinimum":0,"exclusiveMaximum":10,"default":1},"memo":{"type":"string","default":"None"},"insured_amount":{"type":"number","minimum":0.0,"maximum":20000.0,"default":0.0},"status_code":{"type":"integer","minimum":0,"maximum":10,"default":1}}}'
+
+    @staticmethod
+    def model_json_schema() -> str:
+        return FulfillmentOrderUpdateSchema.openapi_schema_json()
+
+@extend
+class WarehouseInventorySchema:
+
+    def to_dict(self) -> Dict[str, str]:
+        d = Dict[str, str]()
+        d["sku_id"] = self.sku_id
+        d["warehouse_code"] = self.warehouse_code
+        d["zone_id"] = str(self.zone_id)
+        d["total_stock"] = str(self.total_stock)
+        d["reserved_stock"] = str(self.reserved_stock)
+        d["unit_weight_kg"] = str(self.unit_weight_kg)
+        d["temperature_controlled"] = "true" if self.temperature_controlled else "false"
+        d["target_temperature"] = str(self.target_temperature)
+        d["min_reorder_level"] = str(self.min_reorder_level)
+        d["is_quarantine"] = str(self.is_quarantine)
+        _s_items_dimensions_cm = List[str]()
+        for _x in self.dimensions_cm:
+            _s_items_dimensions_cm.append(str(_x))
+        d["dimensions_cm"] = ",".join(_s_items_dimensions_cm)
+        _s_items_inspection_flags = List[str]()
+        for _x in self.inspection_flags:
+            _s_items_inspection_flags.append(str(_x))
+        d["inspection_flags"] = ",".join(_s_items_inspection_flags)
+        return d
+
+    def _write_json_fields(self, w: FastJsonWriter):
+        w.write_str("sku_id", self.sku_id)
+        w.write_str("warehouse_code", self.warehouse_code)
+        w.write_int("zone_id", self.zone_id)
+        w.write_int("total_stock", self.total_stock)
+        w.write_int("reserved_stock", self.reserved_stock)
+        w.write_float("unit_weight_kg", self.unit_weight_kg)
+        w.write_bool("temperature_controlled", self.temperature_controlled)
+        if self.target_temperature is not None:
+            w.write_float("target_temperature", self.target_temperature)
+        else:
+            w.write_null("target_temperature")
+        if self.min_reorder_level is not None:
+            w.write_int("min_reorder_level", self.min_reorder_level)
+        else:
+            w.write_null("min_reorder_level")
+        if self.is_quarantine is not None:
+            w.write_bool("is_quarantine", self.is_quarantine)
+        else:
+            w.write_null("is_quarantine")
+        w.begin_array("dimensions_cm")
+        for _x in self.dimensions_cm:
+            w.append_arr_int(_x)
+        w.end_array()
+        w.begin_array("inspection_flags")
+        for _x in self.inspection_flags:
+            w.append_arr_bool(_x)
+        w.end_array()
+
+    @staticmethod
+    def from_fast_json(val: FastJsonVal) -> ValidationResult[WarehouseInventorySchema]:
+        errors = List[ValidationError]()
+        if not val.is_obj():
+            errors.append(ValidationError("", "Expected JSON object", "type_error.object", loc=["body"]))
+            return ValidationResult[WarehouseInventorySchema](None, errors)
+
+        _sku_id = extract_str_field(val["sku_id"], "sku_id", errors, required=True, default="", min_len=3, max_len=32, strip_ws=False, fmt="", pattern=r"^[A-Z0-9_-]+$", choices=[], alias="")
+        _warehouse_code = extract_str_field(val["warehouse_code"], "warehouse_code", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, fmt="", pattern=r"", choices=["WH-EAST-01", "WH-NORTH-02", "WH-SOUTH-03"], alias="")
+        _zone_id = extract_int_field(val["zone_id"], "zone_id", errors, required=False, default=1, ge=1, le=999, gt=-999999999999, lt=999999999999, alias="")
+        _total_stock = extract_int_field(val["total_stock"], "total_stock", errors, required=False, default=100, ge=0, le=1000000, gt=-999999999999, lt=999999999999, alias="")
+        _reserved_stock = extract_int_field(val["reserved_stock"], "reserved_stock", errors, required=False, default=0, ge=0, le=1000000, gt=-999999999999, lt=999999999999, alias="")
+        _unit_weight_kg = extract_float_field(val["unit_weight_kg"], "unit_weight_kg", errors, required=False, default=1.0, ge=0.01, le=500.0, gt=-1e+18, lt=1e+18, alias="")
+        _temperature_controlled = extract_bool_field(val["temperature_controlled"], "temperature_controlled", errors, required=False, default=False, alias="")
+        _target_temperature = extract_opt_float_field(val["target_temperature"], "target_temperature", errors, ge=-1e+18, le=1e+18, gt=-1e+18, lt=1e+18, alias="")
+        _min_reorder_level = extract_opt_int_field(val["min_reorder_level"], "min_reorder_level", errors, ge=-999999999999, le=999999999999, gt=-999999999999, lt=999999999999, alias="")
+        _is_quarantine = extract_opt_bool_field(val["is_quarantine"], "is_quarantine", errors, alias="")
+        _dimensions_cm = List[int]()
+        _v_dimensions_cm = val["dimensions_cm"]
+        if _v_dimensions_cm.is_null():
+            errors.append(ValidationError("dimensions_cm", "Field 'dimensions_cm' is required", "missing", loc=["body", "dimensions_cm"]))
+        elif not _v_dimensions_cm.is_arr():
+            errors.append(ValidationError("dimensions_cm", "Field 'dimensions_cm' must be a list/array", "type_error.list", loc=["body", "dimensions_cm"]))
+        else:
+            _n_dimensions_cm = _v_dimensions_cm.len()
+            if _n_dimensions_cm < 3:
+                errors.append(ValidationError("dimensions_cm", "Field 'dimensions_cm' requires at least 3 items", "value_error.list.min_items", loc=["body", "dimensions_cm"]))
+            if _n_dimensions_cm > 3:
+                errors.append(ValidationError("dimensions_cm", "Field 'dimensions_cm' must not exceed 3 items", "value_error.list.max_items", loc=["body", "dimensions_cm"]))
+            for _idx_dimensions_cm in range(_n_dimensions_cm):
+                _item_dimensions_cm = _v_dimensions_cm[_idx_dimensions_cm]
+                if not _item_dimensions_cm.is_int():
+                    errors.append(ValidationError("dimensions_cm", "Item at index " + str(_idx_dimensions_cm) + " must be an integer", "type_error.integer", loc=["body", "dimensions_cm", str(_idx_dimensions_cm)]))
+                else:
+                    _dimensions_cm.append(_item_dimensions_cm.as_int())
+        _inspection_flags = List[bool]()
+        _v_inspection_flags = val["inspection_flags"]
+        if _v_inspection_flags.is_null():
+            errors.append(ValidationError("inspection_flags", "Field 'inspection_flags' is required", "missing", loc=["body", "inspection_flags"]))
+        elif not _v_inspection_flags.is_arr():
+            errors.append(ValidationError("inspection_flags", "Field 'inspection_flags' must be a list/array", "type_error.list", loc=["body", "inspection_flags"]))
+        else:
+            _n_inspection_flags = _v_inspection_flags.len()
+            if _n_inspection_flags < 2:
+                errors.append(ValidationError("inspection_flags", "Field 'inspection_flags' requires at least 2 items", "value_error.list.min_items", loc=["body", "inspection_flags"]))
+            if _n_inspection_flags > 5:
+                errors.append(ValidationError("inspection_flags", "Field 'inspection_flags' must not exceed 5 items", "value_error.list.max_items", loc=["body", "inspection_flags"]))
+            for _idx_inspection_flags in range(_n_inspection_flags):
+                _item_inspection_flags = _v_inspection_flags[_idx_inspection_flags]
+                if not _item_inspection_flags.is_bool():
+                    errors.append(ValidationError("inspection_flags", "Item at index " + str(_idx_inspection_flags) + " must be a boolean", "type_error.bool", loc=["body", "inspection_flags", str(_idx_inspection_flags)]))
+                else:
+                    _inspection_flags.append(_item_inspection_flags.as_bool())
+
+        if len(errors) > 0:
+            return ValidationResult[WarehouseInventorySchema](None, errors)
+        _inst = WarehouseInventorySchema(_sku_id, _warehouse_code, _zone_id, _total_stock, _reserved_stock, _unit_weight_kg, _temperature_controlled, _target_temperature, _min_reorder_level, _is_quarantine, _dimensions_cm, _inspection_flags)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            for _ce in _custom_errs:
+                errors.append(_ce)
+            return ValidationResult[WarehouseInventorySchema](None, errors)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def from_json(raw: str) -> ValidationResult[WarehouseInventorySchema]:
+        try:
+            doc = FastJson.loads(raw)
+            res = WarehouseInventorySchema.from_fast_json(doc.root)
+            doc.close()
+            return res
+        except:
+            errors = List[ValidationError]()
+            errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))
+            return ValidationResult[WarehouseInventorySchema](None, errors)
+
+    @staticmethod
+    def model_validate_json(raw: str) -> ValidationResult[WarehouseInventorySchema]:
+        return WarehouseInventorySchema.from_json(raw)
+
+    @staticmethod
+    def from_json_doc(doc: FastJsonDoc) -> ValidationResult[WarehouseInventorySchema]:
+        return WarehouseInventorySchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_dict(d: Dict[str, str]) -> ValidationResult[WarehouseInventorySchema]:
+        errors = List[ValidationError]()
+        _d_sku_id = extract_dict_str(d, "sku_id", errors, required=True, default="", min_len=3, max_len=32, strip_ws=False, choices=[], alias="")
+        _d_warehouse_code = extract_dict_str(d, "warehouse_code", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, choices=["WH-EAST-01", "WH-NORTH-02", "WH-SOUTH-03"], alias="")
+        _d_zone_id = extract_dict_int(d, "zone_id", errors, required=False, default=1, ge=1, le=999, gt=-999999999999, lt=999999999999, alias="")
+        _d_total_stock = extract_dict_int(d, "total_stock", errors, required=False, default=100, ge=0, le=1000000, gt=-999999999999, lt=999999999999, alias="")
+        _d_reserved_stock = extract_dict_int(d, "reserved_stock", errors, required=False, default=0, ge=0, le=1000000, gt=-999999999999, lt=999999999999, alias="")
+        _d_unit_weight_kg = extract_dict_float(d, "unit_weight_kg", errors, required=False, default=1.0, ge=0.01, le=500.0, gt=-1e+18, lt=1e+18, alias="")
+        _d_temperature_controlled = extract_dict_bool(d, "temperature_controlled", errors, required=False, default=False, alias="")
+        _d_target_temperature = extract_dict_opt_float(d, "target_temperature", errors, ge=-1e+18, le=1e+18, gt=-1e+18, lt=1e+18, alias="")
+        _d_min_reorder_level = extract_dict_opt_int(d, "min_reorder_level", errors, ge=-999999999999, le=999999999999, gt=-999999999999, lt=999999999999, alias="")
+        _d_is_quarantine = extract_dict_opt_bool(d, "is_quarantine", errors, alias="")
+        _has_dimensions_cm = ("dimensions_cm" in d and len(d["dimensions_cm"].strip()) > 0)
+        _d_dimensions_cm = List[int]()
+        if _has_dimensions_cm:
+            _raw_dimensions_cm = d["dimensions_cm"].strip()
+            _items_dimensions_cm = _raw_dimensions_cm.split(',')
+            for _sub_item in _items_dimensions_cm:
+                _clean_sub = _sub_item.strip()
+                try: _d_dimensions_cm.append(int(_clean_sub))
+                except: errors.append(ValidationError("dimensions_cm", "Item must be integer", "type_error.int", loc=["query", "dimensions_cm"]))
+        _has_inspection_flags = ("inspection_flags" in d and len(d["inspection_flags"].strip()) > 0)
+        _d_inspection_flags = List[bool]()
+        if _has_inspection_flags:
+            _raw_inspection_flags = d["inspection_flags"].strip()
+            _items_inspection_flags = _raw_inspection_flags.split(',')
+            for _sub_item in _items_inspection_flags:
+                _clean_sub = _sub_item.strip()
+                _d_inspection_flags.append(_clean_sub)
+
+        if len(errors) > 0:
+            return ValidationResult[WarehouseInventorySchema](None, errors)
+        _inst = WarehouseInventorySchema(_d_sku_id, _d_warehouse_code, _d_zone_id, _d_total_stock, _d_reserved_stock, _d_unit_weight_kg, _d_temperature_controlled, _d_target_temperature, _d_min_reorder_level, _d_is_quarantine, _d_dimensions_cm, _d_inspection_flags)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            for _ce in _custom_errs:
+                errors.append(_ce)
+            return ValidationResult[WarehouseInventorySchema](None, errors)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def model_validate(d: Dict[str, str]) -> ValidationResult[WarehouseInventorySchema]:
+        return WarehouseInventorySchema.from_dict(d)
+
+    @staticmethod
+    def model_validate(val: FastJsonVal) -> ValidationResult[WarehouseInventorySchema]:
+        return WarehouseInventorySchema.from_fast_json(val)
+
+    @staticmethod
+    def model_validate(doc: FastJsonDoc) -> ValidationResult[WarehouseInventorySchema]:
+        return WarehouseInventorySchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_orm[M](entity: M) -> ValidationResult[WarehouseInventorySchema]:
+        """Zero-alloc direct attribute borrowing from ORM entity (no intermediate Dict)."""
+        _sku_id = entity["sku_id"]
+        _warehouse_code = entity["warehouse_code"]
+        _raw_zone_id = entity["zone_id"].strip()
+        _zone_id = int(_raw_zone_id) if len(_raw_zone_id) > 0 else 1
+        _raw_total_stock = entity["total_stock"].strip()
+        _total_stock = int(_raw_total_stock) if len(_raw_total_stock) > 0 else 100
+        _raw_reserved_stock = entity["reserved_stock"].strip()
+        _reserved_stock = int(_raw_reserved_stock) if len(_raw_reserved_stock) > 0 else 0
+        _raw_unit_weight_kg = entity["unit_weight_kg"].strip()
+        _unit_weight_kg = float(_raw_unit_weight_kg) if len(_raw_unit_weight_kg) > 0 else 1.0
+        _raw_temperature_controlled = entity["temperature_controlled"].strip()
+        _temperature_controlled = (_raw_temperature_controlled == "1" or _raw_temperature_controlled.lower() == "true") if len(_raw_temperature_controlled) > 0 else False
+        _raw_target_temperature = entity["target_temperature"].strip()
+        _target_temperature = Optional[float](float(_raw_target_temperature)) if len(_raw_target_temperature) > 0 else None
+        _raw_min_reorder_level = entity["min_reorder_level"].strip()
+        _min_reorder_level = Optional[int](int(_raw_min_reorder_level)) if len(_raw_min_reorder_level) > 0 else None
+        _raw_is_quarantine = entity["is_quarantine"].strip()
+        _is_quarantine = Optional[bool](_raw_is_quarantine == "1" or _raw_is_quarantine.lower() == "true") if len(_raw_is_quarantine) > 0 else None
+        _dimensions_cm = List[int]()
+        _raw_dimensions_cm = entity["dimensions_cm"].strip()
+        if len(_raw_dimensions_cm) > 0:
+            for _s in _raw_dimensions_cm.split(","):
+                _c = _s.strip()
+                if len(_c) > 0:
+                    try: _dimensions_cm.append(int(_c))
+                    except: pass
+        _inspection_flags = List[bool]()
+        _raw_inspection_flags = entity["inspection_flags"].strip()
+        if len(_raw_inspection_flags) > 0:
+            for _s in _raw_inspection_flags.split(","):
+                _c = _s.strip()
+                if len(_c) > 0:
+                    _inspection_flags.append(_c == "1" or _c.lower() == "true")
+        _inst = WarehouseInventorySchema(_sku_id,_warehouse_code,_zone_id,_total_stock,_reserved_stock,_unit_weight_kg,_temperature_controlled,_target_temperature,_min_reorder_level,_is_quarantine,_dimensions_cm,_inspection_flags)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            return ValidationResult[WarehouseInventorySchema](None, _custom_errs)
+        return ValidationResult.ok(_inst)
+
+    def copy_to[T](self, target: T) -> None:
+        """Zero-alloc direct attribute transfer to target entity (no intermediate Dict)."""
+        target["sku_id"] = self.sku_id
+        target["warehouse_code"] = self.warehouse_code
+        target["zone_id"] = self.zone_id
+        target["total_stock"] = self.total_stock
+        target["reserved_stock"] = self.reserved_stock
+        target["unit_weight_kg"] = self.unit_weight_kg
+        target["temperature_controlled"] = self.temperature_controlled
+        if self.target_temperature is not None:
+            target["target_temperature"] = self.target_temperature
+        if self.min_reorder_level is not None:
+            target["min_reorder_level"] = self.min_reorder_level
+        if self.is_quarantine is not None:
+            target["is_quarantine"] = self.is_quarantine
+        _items_dimensions_cm = List[str]()
+        for _x in self.dimensions_cm:
+            _items_dimensions_cm.append(str(_x))
+        target["dimensions_cm"] = ",".join(_items_dimensions_cm)
+        _items_inspection_flags = List[str]()
+        for _x in self.inspection_flags:
+            _items_inspection_flags.append("1" if _x else "0")
+        target["inspection_flags"] = ",".join(_items_inspection_flags)
+
+    @staticmethod
+    def openapi_schema_json() -> str:
+        return '{"type":"object","title":"WarehouseInventorySchema","properties":{"sku_id":{"type":"string","minLength":3,"maxLength":32,"pattern":"^[A-Z0-9_-]+$"},"warehouse_code":{"type":"string","enum":["WH-EAST-01","WH-NORTH-02","WH-SOUTH-03"]},"zone_id":{"type":"integer","minimum":1,"maximum":999,"default":1},"total_stock":{"type":"integer","minimum":0,"maximum":1000000,"default":100},"reserved_stock":{"type":"integer","minimum":0,"maximum":1000000,"default":0},"unit_weight_kg":{"type":"number","minimum":0.01,"maximum":500.0,"default":1.0},"temperature_controlled":{"type":"boolean","default":false},"target_temperature":{"type":"string","default":"None"},"min_reorder_level":{"type":"string","default":"None"},"is_quarantine":{"type":"string","default":"None"},"dimensions_cm":{"type":"array","minItems":3,"maxItems":3,"items":{"type":"integer"}},"inspection_flags":{"type":"array","minItems":2,"maxItems":5,"items":{"type":"boolean"}}},"required":["sku_id","warehouse_code","dimensions_cm","inspection_flags"]}'
+
+    @staticmethod
+    def model_json_schema() -> str:
+        return WarehouseInventorySchema.openapi_schema_json()
+
+@extend
+class InventoryUpdateSchema:
+
+    def to_dict(self) -> Dict[str, str]:
+        d = Dict[str, str]()
+        d["total_stock"] = str(self.total_stock)
+        d["reserved_stock"] = str(self.reserved_stock)
+        d["min_reorder_level"] = str(self.min_reorder_level)
+        d["is_quarantine"] = str(self.is_quarantine)
+        return d
+
+    def _write_json_fields(self, w: FastJsonWriter):
+        w.write_int("total_stock", self.total_stock)
+        w.write_int("reserved_stock", self.reserved_stock)
+        if self.min_reorder_level is not None:
+            w.write_int("min_reorder_level", self.min_reorder_level)
+        else:
+            w.write_null("min_reorder_level")
+        if self.is_quarantine is not None:
+            w.write_bool("is_quarantine", self.is_quarantine)
+        else:
+            w.write_null("is_quarantine")
+
+    @staticmethod
+    def from_fast_json(val: FastJsonVal) -> ValidationResult[InventoryUpdateSchema]:
+        errors = List[ValidationError]()
+        if not val.is_obj():
+            errors.append(ValidationError("", "Expected JSON object", "type_error.object", loc=["body"]))
+            return ValidationResult[InventoryUpdateSchema](None, errors)
+
+        _total_stock = extract_int_field(val["total_stock"], "total_stock", errors, required=False, default=0, ge=0, le=1000000, gt=-999999999999, lt=999999999999, alias="")
+        _reserved_stock = extract_int_field(val["reserved_stock"], "reserved_stock", errors, required=False, default=0, ge=0, le=1000000, gt=-999999999999, lt=999999999999, alias="")
+        _min_reorder_level = extract_opt_int_field(val["min_reorder_level"], "min_reorder_level", errors, ge=-999999999999, le=999999999999, gt=-999999999999, lt=999999999999, alias="")
+        _is_quarantine = extract_opt_bool_field(val["is_quarantine"], "is_quarantine", errors, alias="")
+
+        if len(errors) > 0:
+            return ValidationResult[InventoryUpdateSchema](None, errors)
+        _inst = InventoryUpdateSchema(_total_stock, _reserved_stock, _min_reorder_level, _is_quarantine)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            for _ce in _custom_errs:
+                errors.append(_ce)
+            return ValidationResult[InventoryUpdateSchema](None, errors)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def from_json(raw: str) -> ValidationResult[InventoryUpdateSchema]:
+        try:
+            doc = FastJson.loads(raw)
+            res = InventoryUpdateSchema.from_fast_json(doc.root)
+            doc.close()
+            return res
+        except:
+            errors = List[ValidationError]()
+            errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))
+            return ValidationResult[InventoryUpdateSchema](None, errors)
+
+    @staticmethod
+    def model_validate_json(raw: str) -> ValidationResult[InventoryUpdateSchema]:
+        return InventoryUpdateSchema.from_json(raw)
+
+    @staticmethod
+    def from_json_doc(doc: FastJsonDoc) -> ValidationResult[InventoryUpdateSchema]:
+        return InventoryUpdateSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_dict(d: Dict[str, str]) -> ValidationResult[InventoryUpdateSchema]:
+        errors = List[ValidationError]()
+        _d_total_stock = extract_dict_int(d, "total_stock", errors, required=False, default=0, ge=0, le=1000000, gt=-999999999999, lt=999999999999, alias="")
+        _d_reserved_stock = extract_dict_int(d, "reserved_stock", errors, required=False, default=0, ge=0, le=1000000, gt=-999999999999, lt=999999999999, alias="")
+        _d_min_reorder_level = extract_dict_opt_int(d, "min_reorder_level", errors, ge=-999999999999, le=999999999999, gt=-999999999999, lt=999999999999, alias="")
+        _d_is_quarantine = extract_dict_opt_bool(d, "is_quarantine", errors, alias="")
+
+        if len(errors) > 0:
+            return ValidationResult[InventoryUpdateSchema](None, errors)
+        _inst = InventoryUpdateSchema(_d_total_stock, _d_reserved_stock, _d_min_reorder_level, _d_is_quarantine)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            for _ce in _custom_errs:
+                errors.append(_ce)
+            return ValidationResult[InventoryUpdateSchema](None, errors)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def model_validate(d: Dict[str, str]) -> ValidationResult[InventoryUpdateSchema]:
+        return InventoryUpdateSchema.from_dict(d)
+
+    @staticmethod
+    def model_validate(val: FastJsonVal) -> ValidationResult[InventoryUpdateSchema]:
+        return InventoryUpdateSchema.from_fast_json(val)
+
+    @staticmethod
+    def model_validate(doc: FastJsonDoc) -> ValidationResult[InventoryUpdateSchema]:
+        return InventoryUpdateSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_orm[M](entity: M) -> ValidationResult[InventoryUpdateSchema]:
+        """Zero-alloc direct attribute borrowing from ORM entity (no intermediate Dict)."""
+        _raw_total_stock = entity["total_stock"].strip()
+        _total_stock = int(_raw_total_stock) if len(_raw_total_stock) > 0 else 0
+        _raw_reserved_stock = entity["reserved_stock"].strip()
+        _reserved_stock = int(_raw_reserved_stock) if len(_raw_reserved_stock) > 0 else 0
+        _raw_min_reorder_level = entity["min_reorder_level"].strip()
+        _min_reorder_level = Optional[int](int(_raw_min_reorder_level)) if len(_raw_min_reorder_level) > 0 else None
+        _raw_is_quarantine = entity["is_quarantine"].strip()
+        _is_quarantine = Optional[bool](_raw_is_quarantine == "1" or _raw_is_quarantine.lower() == "true") if len(_raw_is_quarantine) > 0 else None
+        _inst = InventoryUpdateSchema(_total_stock,_reserved_stock,_min_reorder_level,_is_quarantine)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            return ValidationResult[InventoryUpdateSchema](None, _custom_errs)
+        return ValidationResult.ok(_inst)
+
+    def copy_to[T](self, target: T) -> None:
+        """Zero-alloc direct attribute transfer to target entity (no intermediate Dict)."""
+        target["total_stock"] = self.total_stock
+        target["reserved_stock"] = self.reserved_stock
+        if self.min_reorder_level is not None:
+            target["min_reorder_level"] = self.min_reorder_level
+        if self.is_quarantine is not None:
+            target["is_quarantine"] = self.is_quarantine
+
+    @staticmethod
+    def openapi_schema_json() -> str:
+        return '{"type":"object","title":"InventoryUpdateSchema","properties":{"total_stock":{"type":"integer","minimum":0,"maximum":1000000,"default":0},"reserved_stock":{"type":"integer","minimum":0,"maximum":1000000,"default":0},"min_reorder_level":{"type":"string","default":"None"},"is_quarantine":{"type":"string","default":"None"}}}'
+
+    @staticmethod
+    def model_json_schema() -> str:
+        return InventoryUpdateSchema.openapi_schema_json()
+
+@extend
+class LogisticsRoutePointSchema:
+
+    def to_dict(self) -> Dict[str, str]:
+        d = Dict[str, str]()
+        d["station_name"] = self.station_name
+        d["city"] = self.city
+        d["passed"] = "true" if self.passed else "false"
+        return d
+
+    def _write_json_fields(self, w: FastJsonWriter):
+        w.write_str("station_name", self.station_name)
+        w.write_str("city", self.city)
+        w.write_bool("passed", self.passed)
+
+    @staticmethod
+    def from_fast_json(val: FastJsonVal) -> ValidationResult[LogisticsRoutePointSchema]:
+        errors = List[ValidationError]()
+        if not val.is_obj():
+            errors.append(ValidationError("", "Expected JSON object", "type_error.object", loc=["body"]))
+            return ValidationResult[LogisticsRoutePointSchema](None, errors)
+
+        _station_name = extract_str_field(val["station_name"], "station_name", errors, required=True, default="", min_len=2, max_len=50, strip_ws=False, fmt="", pattern=r"", choices=[], alias="")
+        _city = extract_str_field(val["city"], "city", errors, required=True, default="", min_len=2, max_len=50, strip_ws=False, fmt="", pattern=r"", choices=[], alias="")
+        _passed = extract_bool_field(val["passed"], "passed", errors, required=False, default=True, alias="")
+
+        if len(errors) > 0:
+            return ValidationResult[LogisticsRoutePointSchema](None, errors)
+        _inst = LogisticsRoutePointSchema(_station_name, _city, _passed)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def from_json(raw: str) -> ValidationResult[LogisticsRoutePointSchema]:
+        try:
+            doc = FastJson.loads(raw)
+            res = LogisticsRoutePointSchema.from_fast_json(doc.root)
+            doc.close()
+            return res
+        except:
+            errors = List[ValidationError]()
+            errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))
+            return ValidationResult[LogisticsRoutePointSchema](None, errors)
+
+    @staticmethod
+    def model_validate_json(raw: str) -> ValidationResult[LogisticsRoutePointSchema]:
+        return LogisticsRoutePointSchema.from_json(raw)
+
+    @staticmethod
+    def from_json_doc(doc: FastJsonDoc) -> ValidationResult[LogisticsRoutePointSchema]:
+        return LogisticsRoutePointSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_dict(d: Dict[str, str]) -> ValidationResult[LogisticsRoutePointSchema]:
+        errors = List[ValidationError]()
+        _d_station_name = extract_dict_str(d, "station_name", errors, required=True, default="", min_len=2, max_len=50, strip_ws=False, choices=[], alias="")
+        _d_city = extract_dict_str(d, "city", errors, required=True, default="", min_len=2, max_len=50, strip_ws=False, choices=[], alias="")
+        _d_passed = extract_dict_bool(d, "passed", errors, required=False, default=True, alias="")
+
+        if len(errors) > 0:
+            return ValidationResult[LogisticsRoutePointSchema](None, errors)
+        _inst = LogisticsRoutePointSchema(_d_station_name, _d_city, _d_passed)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def model_validate(d: Dict[str, str]) -> ValidationResult[LogisticsRoutePointSchema]:
+        return LogisticsRoutePointSchema.from_dict(d)
+
+    @staticmethod
+    def model_validate(val: FastJsonVal) -> ValidationResult[LogisticsRoutePointSchema]:
+        return LogisticsRoutePointSchema.from_fast_json(val)
+
+    @staticmethod
+    def model_validate(doc: FastJsonDoc) -> ValidationResult[LogisticsRoutePointSchema]:
+        return LogisticsRoutePointSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_orm[M](entity: M) -> ValidationResult[LogisticsRoutePointSchema]:
+        """Zero-alloc direct attribute borrowing from ORM entity (no intermediate Dict)."""
+        _station_name = entity["station_name"]
+        _city = entity["city"]
+        _raw_passed = entity["passed"].strip()
+        _passed = (_raw_passed == "1" or _raw_passed.lower() == "true") if len(_raw_passed) > 0 else True
+        _inst = LogisticsRoutePointSchema(_station_name,_city,_passed)
+        return ValidationResult.ok(_inst)
+
+    def copy_to[T](self, target: T) -> None:
+        """Zero-alloc direct attribute transfer to target entity (no intermediate Dict)."""
+        target["station_name"] = self.station_name
+        target["city"] = self.city
+        target["passed"] = self.passed
+
+    @staticmethod
+    def openapi_schema_json() -> str:
+        return '{"type":"object","title":"LogisticsRoutePointSchema","properties":{"station_name":{"type":"string","minLength":2,"maxLength":50},"city":{"type":"string","minLength":2,"maxLength":50},"passed":{"type":"boolean","default":true}},"required":["station_name","city"]}'
+
+    @staticmethod
+    def model_json_schema() -> str:
+        return LogisticsRoutePointSchema.openapi_schema_json()
+
+@extend
+class ShipmentTrackingSchema:
+
+    def to_dict(self) -> Dict[str, str]:
+        d = Dict[str, str]()
+        d["waybill_no"] = self.waybill_no
+        d["carrier_code"] = self.carrier_code
+        d["status_code"] = str(self.status_code)
+        d["dispatcher_email"] = self.dispatcher_email
+        d["gross_weight_kg"] = str(self.gross_weight_kg)
+        d["signature_required"] = str(self.signature_required)
+        d["delivery_deadline_hours"] = str(self.delivery_deadline_hours)
+        d["carbon_footprint_kg"] = str(self.carbon_footprint_kg)
+        _s_items_gps_coordinates = List[str]()
+        for _x in self.gps_coordinates:
+            _s_items_gps_coordinates.append(str(_x))
+        d["gps_coordinates"] = ",".join(_s_items_gps_coordinates)
+        _sub_items_route_stations = List[str]()
+        for _x in self.route_stations:
+            _sub_items_route_stations.append(_x.to_json())
+        d["route_stations"] = "[" + ",".join(_sub_items_route_stations) + "]"
+        return d
+
+    def _write_json_fields(self, w: FastJsonWriter):
+        w.write_str("waybill_no", self.waybill_no)
+        w.write_str("carrier_code", self.carrier_code)
+        w.write_int("status_code", self.status_code)
+        w.write_str("dispatcher_email", self.dispatcher_email)
+        w.write_float("gross_weight_kg", self.gross_weight_kg)
+        if self.signature_required is not None:
+            w.write_bool("signature_required", self.signature_required)
+        else:
+            w.write_null("signature_required")
+        if self.delivery_deadline_hours is not None:
+            w.write_int("delivery_deadline_hours", self.delivery_deadline_hours)
+        else:
+            w.write_null("delivery_deadline_hours")
+        if self.carbon_footprint_kg is not None:
+            w.write_float("carbon_footprint_kg", self.carbon_footprint_kg)
+        else:
+            w.write_null("carbon_footprint_kg")
+        w.begin_array("gps_coordinates")
+        for _x in self.gps_coordinates:
+            w.append_arr_float(_x)
+        w.end_array()
+        w.begin_array("route_stations")
+        for _x in self.route_stations:
+            w.append_arr_raw(_x.to_json())
+        w.end_array()
+
+    @staticmethod
+    def from_fast_json(val: FastJsonVal) -> ValidationResult[ShipmentTrackingSchema]:
+        errors = List[ValidationError]()
+        if not val.is_obj():
+            errors.append(ValidationError("", "Expected JSON object", "type_error.object", loc=["body"]))
+            return ValidationResult[ShipmentTrackingSchema](None, errors)
+
+        _waybill_no = extract_str_field(val["waybill_no"], "waybill_no", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, fmt="", pattern=r"^WB-[A-Z0-9]{10}$", choices=[], alias="")
+        _carrier_code = extract_str_field(val["carrier_code"], "carrier_code", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, fmt="", pattern=r"", choices=["SF_EXPRESS", "JD_LOGISTICS", "EMS_GLOBAL"], alias="")
+        _status_code = extract_int_field(val["status_code"], "status_code", errors, required=False, default=0, ge=0, le=10, gt=-999999999999, lt=999999999999, alias="")
+        _dispatcher_email = extract_str_field(val["dispatcher_email"], "dispatcher_email", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, fmt="email", pattern=r"", choices=[], alias="")
+        _gross_weight_kg = extract_float_field(val["gross_weight_kg"], "gross_weight_kg", errors, required=False, default=1.0, ge=0.01, le=1000.0, gt=-1e+18, lt=1e+18, alias="")
+        _signature_required = extract_opt_bool_field(val["signature_required"], "signature_required", errors, alias="")
+        _delivery_deadline_hours = extract_opt_int_field(val["delivery_deadline_hours"], "delivery_deadline_hours", errors, ge=-999999999999, le=999999999999, gt=-999999999999, lt=999999999999, alias="")
+        _carbon_footprint_kg = extract_opt_float_field(val["carbon_footprint_kg"], "carbon_footprint_kg", errors, ge=-1e+18, le=1e+18, gt=-1e+18, lt=1e+18, alias="")
+        _gps_coordinates = List[float]()
+        _v_gps_coordinates = val["gps_coordinates"]
+        if _v_gps_coordinates.is_null():
+            errors.append(ValidationError("gps_coordinates", "Field 'gps_coordinates' is required", "missing", loc=["body", "gps_coordinates"]))
+        elif not _v_gps_coordinates.is_arr():
+            errors.append(ValidationError("gps_coordinates", "Field 'gps_coordinates' must be a list/array", "type_error.list", loc=["body", "gps_coordinates"]))
+        else:
+            _n_gps_coordinates = _v_gps_coordinates.len()
+            if _n_gps_coordinates < 2:
+                errors.append(ValidationError("gps_coordinates", "Field 'gps_coordinates' requires at least 2 items", "value_error.list.min_items", loc=["body", "gps_coordinates"]))
+            if _n_gps_coordinates > 2:
+                errors.append(ValidationError("gps_coordinates", "Field 'gps_coordinates' must not exceed 2 items", "value_error.list.max_items", loc=["body", "gps_coordinates"]))
+            for _idx_gps_coordinates in range(_n_gps_coordinates):
+                _item_gps_coordinates = _v_gps_coordinates[_idx_gps_coordinates]
+                if not _item_gps_coordinates.is_float():
+                    errors.append(ValidationError("gps_coordinates", "Item at index " + str(_idx_gps_coordinates) + " must be a float", "type_error.float", loc=["body", "gps_coordinates", str(_idx_gps_coordinates)]))
+                else:
+                    _gps_coordinates.append(_item_gps_coordinates.as_float())
+        _route_stations = List[LogisticsRoutePointSchema]()
+        _v_route_stations = val["route_stations"]
+        if _v_route_stations.is_null():
+            errors.append(ValidationError("route_stations", "Field 'route_stations' is required", "missing", loc=["body", "route_stations"]))
+        elif not _v_route_stations.is_arr():
+            errors.append(ValidationError("route_stations", "Field 'route_stations' must be a list/array", "type_error.list", loc=["body", "route_stations"]))
+        else:
+            _n_route_stations = _v_route_stations.len()
+            if _n_route_stations < 1:
+                errors.append(ValidationError("route_stations", "Field 'route_stations' requires at least 1 items", "value_error.list.min_items", loc=["body", "route_stations"]))
+            if _n_route_stations > 5:
+                errors.append(ValidationError("route_stations", "Field 'route_stations' must not exceed 5 items", "value_error.list.max_items", loc=["body", "route_stations"]))
+            for _idx_route_stations in range(_n_route_stations):
+                _item_route_stations = _v_route_stations[_idx_route_stations]
+                _sub_res_route_stations = LogisticsRoutePointSchema.from_fast_json(_item_route_stations)
+                if not _sub_res_route_stations.is_ok():
+                    for _s_err in _sub_res_route_stations.errors:
+                        errors.append(_s_err.with_prefix(str(_idx_route_stations)).with_prefix("route_stations"))
+                else:
+                    _route_stations.append(_sub_res_route_stations.unwrap())
+
+        if len(errors) > 0:
+            return ValidationResult[ShipmentTrackingSchema](None, errors)
+        _inst = ShipmentTrackingSchema(_waybill_no, _carrier_code, _status_code, _dispatcher_email, _gross_weight_kg, _signature_required, _delivery_deadline_hours, _carbon_footprint_kg, _gps_coordinates, _route_stations)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            for _ce in _custom_errs:
+                errors.append(_ce)
+            return ValidationResult[ShipmentTrackingSchema](None, errors)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def from_json(raw: str) -> ValidationResult[ShipmentTrackingSchema]:
+        try:
+            doc = FastJson.loads(raw)
+            res = ShipmentTrackingSchema.from_fast_json(doc.root)
+            doc.close()
+            return res
+        except:
+            errors = List[ValidationError]()
+            errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))
+            return ValidationResult[ShipmentTrackingSchema](None, errors)
+
+    @staticmethod
+    def model_validate_json(raw: str) -> ValidationResult[ShipmentTrackingSchema]:
+        return ShipmentTrackingSchema.from_json(raw)
+
+    @staticmethod
+    def from_json_doc(doc: FastJsonDoc) -> ValidationResult[ShipmentTrackingSchema]:
+        return ShipmentTrackingSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_dict(d: Dict[str, str]) -> ValidationResult[ShipmentTrackingSchema]:
+        errors = List[ValidationError]()
+        _d_waybill_no = extract_dict_str(d, "waybill_no", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, choices=[], alias="")
+        _d_carrier_code = extract_dict_str(d, "carrier_code", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, choices=["SF_EXPRESS", "JD_LOGISTICS", "EMS_GLOBAL"], alias="")
+        _d_status_code = extract_dict_int(d, "status_code", errors, required=False, default=0, ge=0, le=10, gt=-999999999999, lt=999999999999, alias="")
+        _d_dispatcher_email = extract_dict_str(d, "dispatcher_email", errors, required=True, default="", min_len=0, max_len=0, strip_ws=False, choices=[], alias="")
+        _d_gross_weight_kg = extract_dict_float(d, "gross_weight_kg", errors, required=False, default=1.0, ge=0.01, le=1000.0, gt=-1e+18, lt=1e+18, alias="")
+        _d_signature_required = extract_dict_opt_bool(d, "signature_required", errors, alias="")
+        _d_delivery_deadline_hours = extract_dict_opt_int(d, "delivery_deadline_hours", errors, ge=-999999999999, le=999999999999, gt=-999999999999, lt=999999999999, alias="")
+        _d_carbon_footprint_kg = extract_dict_opt_float(d, "carbon_footprint_kg", errors, ge=-1e+18, le=1e+18, gt=-1e+18, lt=1e+18, alias="")
+        _has_gps_coordinates = ("gps_coordinates" in d and len(d["gps_coordinates"].strip()) > 0)
+        _d_gps_coordinates = List[float]()
+        if _has_gps_coordinates:
+            _raw_gps_coordinates = d["gps_coordinates"].strip()
+            _items_gps_coordinates = _raw_gps_coordinates.split(',')
+            for _sub_item in _items_gps_coordinates:
+                _clean_sub = _sub_item.strip()
+                try: _d_gps_coordinates.append(float(_clean_sub))
+                except: errors.append(ValidationError("gps_coordinates", "Item must be float", "type_error.float", loc=["query", "gps_coordinates"]))
+        _has_route_stations = ("route_stations" in d and len(d["route_stations"].strip()) > 0)
+        _d_route_stations = List[LogisticsRoutePointSchema]()
+        if _has_route_stations:
+            _raw_route_stations = d["route_stations"].strip()
+            try:
+                _sub_arr_doc_route_stations = FastJson.loads(_raw_route_stations)
+                if _sub_arr_doc_route_stations.root.is_arr():
+                    for _idx_route_stations in range(_sub_arr_doc_route_stations.root.len()):
+                        _sub_item_res = LogisticsRoutePointSchema.from_fast_json(_sub_arr_doc_route_stations.root[_idx_route_stations])
+                        if _sub_item_res.is_ok():
+                            _d_route_stations.append(_sub_item_res.unwrap())
+                        else:
+                            for _s_err in _sub_item_res.errors:
+                                errors.append(_s_err.with_prefix(str(_idx_route_stations)).with_prefix("route_stations"))
+                _sub_arr_doc_route_stations.close()
+            except:
+                errors.append(ValidationError("route_stations", "Invalid JSON array", "type_error.list", loc=["query", "route_stations"]))
+
+        if len(errors) > 0:
+            return ValidationResult[ShipmentTrackingSchema](None, errors)
+        _inst = ShipmentTrackingSchema(_d_waybill_no, _d_carrier_code, _d_status_code, _d_dispatcher_email, _d_gross_weight_kg, _d_signature_required, _d_delivery_deadline_hours, _d_carbon_footprint_kg, _d_gps_coordinates, _d_route_stations)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            for _ce in _custom_errs:
+                errors.append(_ce)
+            return ValidationResult[ShipmentTrackingSchema](None, errors)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def model_validate(d: Dict[str, str]) -> ValidationResult[ShipmentTrackingSchema]:
+        return ShipmentTrackingSchema.from_dict(d)
+
+    @staticmethod
+    def model_validate(val: FastJsonVal) -> ValidationResult[ShipmentTrackingSchema]:
+        return ShipmentTrackingSchema.from_fast_json(val)
+
+    @staticmethod
+    def model_validate(doc: FastJsonDoc) -> ValidationResult[ShipmentTrackingSchema]:
+        return ShipmentTrackingSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_orm[M](entity: M) -> ValidationResult[ShipmentTrackingSchema]:
+        """Zero-alloc direct attribute borrowing from ORM entity (no intermediate Dict)."""
+        _waybill_no = entity["waybill_no"]
+        _carrier_code = entity["carrier_code"]
+        _raw_status_code = entity["status_code"].strip()
+        _status_code = int(_raw_status_code) if len(_raw_status_code) > 0 else 0
+        _dispatcher_email = entity["dispatcher_email"]
+        _raw_gross_weight_kg = entity["gross_weight_kg"].strip()
+        _gross_weight_kg = float(_raw_gross_weight_kg) if len(_raw_gross_weight_kg) > 0 else 1.0
+        _raw_signature_required = entity["signature_required"].strip()
+        _signature_required = Optional[bool](_raw_signature_required == "1" or _raw_signature_required.lower() == "true") if len(_raw_signature_required) > 0 else None
+        _raw_delivery_deadline_hours = entity["delivery_deadline_hours"].strip()
+        _delivery_deadline_hours = Optional[int](int(_raw_delivery_deadline_hours)) if len(_raw_delivery_deadline_hours) > 0 else None
+        _raw_carbon_footprint_kg = entity["carbon_footprint_kg"].strip()
+        _carbon_footprint_kg = Optional[float](float(_raw_carbon_footprint_kg)) if len(_raw_carbon_footprint_kg) > 0 else None
+        _gps_coordinates = List[float]()
+        _raw_gps_coordinates = entity["gps_coordinates"].strip()
+        if len(_raw_gps_coordinates) > 0:
+            for _s in _raw_gps_coordinates.split(","):
+                _c = _s.strip()
+                if len(_c) > 0:
+                    try: _gps_coordinates.append(float(_c))
+                    except: pass
+        _route_stations = List[LogisticsRoutePointSchema]()
+        _raw_route_stations = entity["route_stations"].strip()
+        if len(_raw_route_stations) > 0 and _raw_route_stations.startswith("["):
+            try:
+                _doc_route_stations = FastJson.loads(_raw_route_stations)
+                if _doc_route_stations.root.is_arr():
+                    for _idx_route_stations in range(_doc_route_stations.root.len()):
+                        _sub_item_res_route_stations = LogisticsRoutePointSchema.from_fast_json(_doc_route_stations.root[_idx_route_stations])
+                        if _sub_item_res_route_stations.is_ok():
+                            _route_stations.append(_sub_item_res_route_stations.unwrap())
+                _doc_route_stations.close()
+            except:
+                pass
+        _inst = ShipmentTrackingSchema(_waybill_no,_carrier_code,_status_code,_dispatcher_email,_gross_weight_kg,_signature_required,_delivery_deadline_hours,_carbon_footprint_kg,_gps_coordinates,_route_stations)
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            return ValidationResult[ShipmentTrackingSchema](None, _custom_errs)
+        return ValidationResult.ok(_inst)
+
+    def copy_to[T](self, target: T) -> None:
+        """Zero-alloc direct attribute transfer to target entity (no intermediate Dict)."""
+        target["waybill_no"] = self.waybill_no
+        target["carrier_code"] = self.carrier_code
+        target["status_code"] = self.status_code
+        target["dispatcher_email"] = self.dispatcher_email
+        target["gross_weight_kg"] = self.gross_weight_kg
+        if self.signature_required is not None:
+            target["signature_required"] = self.signature_required
+        if self.delivery_deadline_hours is not None:
+            target["delivery_deadline_hours"] = self.delivery_deadline_hours
+        if self.carbon_footprint_kg is not None:
+            target["carbon_footprint_kg"] = self.carbon_footprint_kg
+        _items_gps_coordinates = List[str]()
+        for _x in self.gps_coordinates:
+            _items_gps_coordinates.append(str(_x))
+        target["gps_coordinates"] = ",".join(_items_gps_coordinates)
+        _sub_items_route_stations = List[str]()
+        for _x in self.route_stations:
+            _sub_items_route_stations.append(_x.to_json())
+        target["route_stations"] = "[" + ",".join(_sub_items_route_stations) + "]"
+
+    @staticmethod
+    def openapi_schema_json() -> str:
+        return '{"type":"object","title":"ShipmentTrackingSchema","properties":{"waybill_no":{"type":"string","pattern":"^WB-[A-Z0-9]{10}$"},"carrier_code":{"type":"string","enum":["SF_EXPRESS","JD_LOGISTICS","EMS_GLOBAL"]},"status_code":{"type":"integer","minimum":0,"maximum":10,"default":0},"dispatcher_email":{"type":"string","format":"email"},"gross_weight_kg":{"type":"number","minimum":0.01,"maximum":1000.0,"default":1.0},"signature_required":{"type":"string","default":"None"},"delivery_deadline_hours":{"type":"string","default":"None"},"carbon_footprint_kg":{"type":"string","default":"None"},"gps_coordinates":{"type":"array","minItems":2,"maxItems":2,"items":{"type":"number"}},"route_stations":{"type":"array","minItems":1,"maxItems":5,"items":{"type":"object","title":"LogisticsRoutePointSchema"}}},"required":["waybill_no","carrier_code","dispatcher_email","gps_coordinates","route_stations"]}'
+
+    @staticmethod
+    def model_json_schema() -> str:
+        return ShipmentTrackingSchema.openapi_schema_json()
+
+@extend
+class ShipmentUpdateSchema:
+
+    def to_dict(self) -> Dict[str, str]:
+        d = Dict[str, str]()
+        d["status_code"] = str(self.status_code)
+        d["status_remark"] = self.status_remark
+        d["carbon_footprint_kg"] = str(self.carbon_footprint_kg)
+        return d
+
+    def _write_json_fields(self, w: FastJsonWriter):
+        w.write_int("status_code", self.status_code)
+        w.write_str("status_remark", self.status_remark)
+        if self.carbon_footprint_kg is not None:
+            w.write_float("carbon_footprint_kg", self.carbon_footprint_kg)
+        else:
+            w.write_null("carbon_footprint_kg")
+
+    @staticmethod
+    def from_fast_json(val: FastJsonVal) -> ValidationResult[ShipmentUpdateSchema]:
+        errors = List[ValidationError]()
+        if not val.is_obj():
+            errors.append(ValidationError("", "Expected JSON object", "type_error.object", loc=["body"]))
+            return ValidationResult[ShipmentUpdateSchema](None, errors)
+
+        _status_code = extract_int_field(val["status_code"], "status_code", errors, required=False, default=0, ge=0, le=10, gt=-999999999999, lt=999999999999, alias="")
+        _status_remark = extract_str_field(val["status_remark"], "status_remark", errors, required=True, default="", min_len=1, max_len=200, strip_ws=False, fmt="", pattern=r"", choices=[], alias="")
+        _carbon_footprint_kg = extract_opt_float_field(val["carbon_footprint_kg"], "carbon_footprint_kg", errors, ge=-1e+18, le=1e+18, gt=-1e+18, lt=1e+18, alias="")
+
+        if len(errors) > 0:
+            return ValidationResult[ShipmentUpdateSchema](None, errors)
+        _inst = ShipmentUpdateSchema(_status_code, _status_remark, _carbon_footprint_kg)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def from_json(raw: str) -> ValidationResult[ShipmentUpdateSchema]:
+        try:
+            doc = FastJson.loads(raw)
+            res = ShipmentUpdateSchema.from_fast_json(doc.root)
+            doc.close()
+            return res
+        except:
+            errors = List[ValidationError]()
+            errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))
+            return ValidationResult[ShipmentUpdateSchema](None, errors)
+
+    @staticmethod
+    def model_validate_json(raw: str) -> ValidationResult[ShipmentUpdateSchema]:
+        return ShipmentUpdateSchema.from_json(raw)
+
+    @staticmethod
+    def from_json_doc(doc: FastJsonDoc) -> ValidationResult[ShipmentUpdateSchema]:
+        return ShipmentUpdateSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_dict(d: Dict[str, str]) -> ValidationResult[ShipmentUpdateSchema]:
+        errors = List[ValidationError]()
+        _d_status_code = extract_dict_int(d, "status_code", errors, required=False, default=0, ge=0, le=10, gt=-999999999999, lt=999999999999, alias="")
+        _d_status_remark = extract_dict_str(d, "status_remark", errors, required=True, default="", min_len=1, max_len=200, strip_ws=False, choices=[], alias="")
+        _d_carbon_footprint_kg = extract_dict_opt_float(d, "carbon_footprint_kg", errors, ge=-1e+18, le=1e+18, gt=-1e+18, lt=1e+18, alias="")
+
+        if len(errors) > 0:
+            return ValidationResult[ShipmentUpdateSchema](None, errors)
+        _inst = ShipmentUpdateSchema(_d_status_code, _d_status_remark, _d_carbon_footprint_kg)
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def model_validate(d: Dict[str, str]) -> ValidationResult[ShipmentUpdateSchema]:
+        return ShipmentUpdateSchema.from_dict(d)
+
+    @staticmethod
+    def model_validate(val: FastJsonVal) -> ValidationResult[ShipmentUpdateSchema]:
+        return ShipmentUpdateSchema.from_fast_json(val)
+
+    @staticmethod
+    def model_validate(doc: FastJsonDoc) -> ValidationResult[ShipmentUpdateSchema]:
+        return ShipmentUpdateSchema.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_orm[M](entity: M) -> ValidationResult[ShipmentUpdateSchema]:
+        """Zero-alloc direct attribute borrowing from ORM entity (no intermediate Dict)."""
+        _raw_status_code = entity["status_code"].strip()
+        _status_code = int(_raw_status_code) if len(_raw_status_code) > 0 else 0
+        _status_remark = entity["status_remark"]
+        _raw_carbon_footprint_kg = entity["carbon_footprint_kg"].strip()
+        _carbon_footprint_kg = Optional[float](float(_raw_carbon_footprint_kg)) if len(_raw_carbon_footprint_kg) > 0 else None
+        _inst = ShipmentUpdateSchema(_status_code,_status_remark,_carbon_footprint_kg)
+        return ValidationResult.ok(_inst)
+
+    def copy_to[T](self, target: T) -> None:
+        """Zero-alloc direct attribute transfer to target entity (no intermediate Dict)."""
+        target["status_code"] = self.status_code
+        target["status_remark"] = self.status_remark
+        if self.carbon_footprint_kg is not None:
+            target["carbon_footprint_kg"] = self.carbon_footprint_kg
+
+    @staticmethod
+    def openapi_schema_json() -> str:
+        return '{"type":"object","title":"ShipmentUpdateSchema","properties":{"status_code":{"type":"integer","minimum":0,"maximum":10,"default":0},"status_remark":{"type":"string","minLength":1,"maxLength":200},"carbon_footprint_kg":{"type":"string","default":"None"}},"required":["status_remark"]}'
+
+    @staticmethod
+    def model_json_schema() -> str:
+        return ShipmentUpdateSchema.openapi_schema_json()
+
+# =================== END AUTO-GENERATED METHODS ====================

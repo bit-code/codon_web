@@ -1,0 +1,195 @@
+from typing import List, Dict, Tuple, Optional
+from src.orm.dialect import Dialect
+from src.orm.engine import DatabaseEngine
+from src.orm.model import ModelMeta, Model
+from src.orm.lazy_model import LazyModel
+from src.orm.schema import TableSchema, get_table_schema
+from src.orm.query import Query
+from src.orm.sql.select import Select
+from src.orm.sql.dml import Insert, Update, Delete
+from src.db.types import Row
+
+class Session:
+    engine: DatabaseEngine
+
+    def __init__(self, engine: DatabaseEngine):
+        self.engine = engine
+
+    def query[T](self, model: T) -> Query:
+        tbl_name = model.__tablename__
+        schema = get_table_schema(tbl_name)
+        return Query(schema.meta(), dialect=self.engine.dialect)
+
+    def query(self, schema: TableSchema) -> Query:
+        return Query(schema.meta(), dialect=self.engine.dialect)
+
+    def query(self, meta: ModelMeta) -> Query:
+        return Query(meta, dialect=self.engine.dialect)
+
+    def first(self, query: Query) -> Optional[Row]:
+        query.limit(1)
+        sql, params = query.to_sql()
+        cnt, rows = self.engine.execute_raw(sql, params)
+        if len(rows) > 0:
+            return rows[0]
+        return None
+
+    def execute_query(self, query: Query) -> List[Row]:
+        sql, params = query.to_sql()
+        cnt, rows = self.engine.execute_raw(sql, params)
+        return rows
+
+    def execute(self, stmt: Select) -> List[Row]:
+        sql, params = stmt.to_sql(self.engine.dialect)
+        cnt, rows = self.engine.execute_raw(sql, params)
+        return rows
+
+    def execute(self, stmt: Insert) -> int:
+        sql, params = stmt.to_sql(self.engine.dialect)
+        cnt, last_id, rows = self.engine.execute_insert(sql, params)
+        if last_id > 0:
+            return last_id
+        return cnt
+
+    def execute(self, stmt: Update) -> int:
+        sql, params = stmt.to_sql(self.engine.dialect)
+        cnt, _ = self.engine.execute_raw(sql, params)
+        return cnt
+
+    def execute(self, stmt: Delete) -> int:
+        sql, params = stmt.to_sql(self.engine.dialect)
+        cnt, _ = self.engine.execute_raw(sql, params)
+        return cnt
+
+    def first(self, stmt: Select) -> Optional[Row]:
+        stmt.limit(1)
+        rows = self.execute(stmt)
+        if len(rows) > 0:
+            return rows[0]
+        return None
+
+    def scalars(self, stmt: Select) -> List[str]:
+        rows = self.execute(stmt)
+        res = List[str]()
+        for r in rows:
+            if len(r) > 0:
+                v = r.get_str(0, "")
+                res.append(v)
+        return res
+
+    def count(self, query: Query) -> int:
+        sql, params = query.to_count_sql()
+        cnt, rows = self.engine.execute_raw(sql, params)
+        if len(rows) > 0 and len(rows[0]) > 0:
+            val = rows[0].get_int(0, 0)
+            return val
+        return 0
+
+    def insert(self, meta: ModelMeta, values: Dict[str, str]) -> int:
+        query = Query(meta, dialect=self.engine.dialect)
+        sql, params = query.to_insert_sql(values)
+        cnt, last_id, rows = self.engine.execute_insert(sql, params)
+        if last_id > 0:
+            return last_id
+        return cnt
+
+    def _get_meta(self, meta: ModelMeta, pk_value: str) -> Optional[Row]:
+        sql = meta.get_pk_query_sql(self.engine.dialect)
+        params = [pk_value]
+        cnt, rows = self.engine.execute_raw(sql, params)
+        if len(rows) > 0:
+            return rows[0]
+        return None
+
+    def get[T](self, model: T, pk_value: str) -> Optional[Row]:
+        tbl_name = model.__tablename__
+        schema = get_table_schema(tbl_name)
+        return self._get_meta(schema.meta(), pk_value)
+
+    def get(self, schema: TableSchema, pk_value: str) -> Optional[Row]:
+        return self._get_meta(schema.meta(), pk_value)
+
+    def get(self, meta: ModelMeta, pk_value: str) -> Optional[Row]:
+        return self._get_meta(meta, pk_value)
+
+    def update(self, meta: ModelMeta, pk_value: str, values: Dict[str, str]) -> int:
+        query = Query(meta, dialect=self.engine.dialect)
+        query.where_eq(meta.primary_key, pk_value)
+        sql, params = query.to_update_sql(values)
+        cnt, _ = self.engine.execute_raw(sql, params)
+        return cnt
+
+    def delete(self, meta: ModelMeta, pk_value: str) -> int:
+        query = Query(meta, dialect=self.engine.dialect)
+        query.where_eq(meta.primary_key, pk_value)
+        sql, params = query.to_delete_sql()
+        cnt, _ = self.engine.execute_raw(sql, params)
+        return cnt
+
+    def save(self, model: Model, meta: ModelMeta) -> int:
+        pk = meta.primary_key
+        if model.has(pk) and len(model.get(pk)) > 0:
+            pk_val = model.get(pk)
+            update_vals = Dict[str, str]()
+            for k, v in model._values.items():
+                if k != pk:
+                    update_vals[k] = v
+            return self.update(meta, pk_val, update_vals)
+        else:
+            new_id = self.insert(meta, model.to_dict())
+            if new_id > 0:
+                model.set(pk, str(new_id))
+            return new_id
+
+    def save(self, model: LazyModel, meta: ModelMeta) -> int:
+        pk = meta.primary_key
+        pk_val = model.get_str(pk)
+        if len(pk_val) > 0 and pk_val != "0":
+            if model.is_dirty():
+                dirty_fields = model.get_dirty_fields()
+                update_fields = Dict[str, str]()
+                for k, v in dirty_fields.items():
+                    if k != pk:
+                        update_fields[k] = v
+                res = self.update(meta, pk_val, update_fields)
+                model._row = Optional[Row](model.to_row(meta))
+                model.clear_dirty()
+                return res
+            return 0
+        else:
+            res = self.insert(meta, model.get_dirty_fields())
+            if res > 0:
+                model.set_str(pk, str(res))
+            model._row = Optional[Row](model.to_row(meta))
+            model.clear_dirty()
+            return res
+
+
+    def insert(self, schema: TableSchema, values: Dict[str, str]) -> int:
+        return self.insert(schema.meta(), values)
+
+    def update(self, schema: TableSchema, pk_value: str, values: Dict[str, str]) -> int:
+        return self.update(schema.meta(), pk_value, values)
+
+    def delete(self, schema: TableSchema, pk_value: str) -> int:
+        return self.delete(schema.meta(), pk_value)
+
+    def save(self, model: Model, schema: TableSchema) -> int:
+        return self.save(model, schema.meta())
+
+    def save(self, model: LazyModel, schema: TableSchema) -> int:
+        return self.save(model, schema.meta())
+
+    def create_table(self, schema: TableSchema) -> None:
+        self.create_table(schema.meta())
+
+    def drop_table(self, schema: TableSchema) -> None:
+        self.drop_table(schema.meta())
+
+    def create_table(self, meta: ModelMeta) -> None:
+        sql = meta.create_table_sql(self.engine.dialect)
+        self.engine.execute_raw(sql)
+
+    def drop_table(self, meta: ModelMeta) -> None:
+        sql = meta.drop_table_sql(self.engine.dialect)
+        self.engine.execute_raw(sql)

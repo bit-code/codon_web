@@ -1,0 +1,282 @@
+# Model and ModelMeta Definitions
+from typing import List, Dict, Optional
+from src.orm.fields import Field
+from src.orm.dialect import Dialect, MYSQL_DIALECT, POSTGRESQL_DIALECT
+from src.db.types import (
+    Row, RowView, FieldInfo,
+    COL_KIND_INT, COL_KIND_FLOAT, COL_KIND_BOOL, COL_KIND_STR
+)
+
+class ModelMeta:
+    table_name: str
+    fields: List[Field]
+    field_map: Dict[str, Field]
+    field_infos: List[FieldInfo]
+    primary_key: str
+    pk_auto_increment: bool
+    columns: List[str]
+    _cached_select_base: Dict[str, str]
+    _cached_pk_sql: Dict[str, str]
+
+    def __init__(self, table_name: str, fields: List[Field]):
+        self.table_name = table_name
+        self.fields = fields
+        self.field_map = Dict[str, Field]()
+        self.field_infos = List[FieldInfo]()
+        self.primary_key = "id"
+        self.pk_auto_increment = False
+        self.columns = List[str]()
+        self._cached_select_base = Dict[str, str]()
+        self._cached_pk_sql = Dict[str, str]()
+
+        for f in fields:
+            col = f.get_column_name()
+            self.columns.append(col)
+            self.field_map[col] = f
+            self.field_map[f.name] = f
+            self.field_infos.append(f.to_field_info())
+            if f.primary_key:
+                self.primary_key = col
+                self.pk_auto_increment = f.auto_increment
+
+    def get_select_base(self, dialect: Dialect) -> str:
+        dname = dialect.name
+        if dname in self._cached_select_base:
+            return self._cached_select_base[dname]
+
+        q_cols = List[str]()
+        for c in self.columns:
+            q_cols.append(dialect.quote_identifier(c))
+        cols_str = "*" if len(q_cols) == 0 else ", ".join(q_cols)
+        q_table = dialect.quote_identifier(self.table_name)
+        base = "SELECT " + cols_str + " FROM " + q_table
+        self._cached_select_base[dname] = base
+        return base
+
+    def get_pk_query_sql(self, dialect: Dialect) -> str:
+        dname = dialect.name
+        if dname in self._cached_pk_sql:
+            return self._cached_pk_sql[dname]
+
+        base = self.get_select_base(dialect)
+        q_pk = dialect.quote_identifier(self.primary_key)
+        ph = dialect.placeholder(1)
+        sql = base + " WHERE " + q_pk + " = " + ph + dialect.limit_offset(1, -1)
+        self._cached_pk_sql[dname] = sql
+        return sql
+
+    def get_field(self, name: str) -> Optional[Field]:
+        if name in self.field_map:
+            return self.field_map[name]
+        return None
+
+    def create_table_sql(self, dialect: Dialect) -> str:
+        q_table = dialect.quote_identifier(self.table_name)
+        col_defs = List[str]()
+
+        for f in self.fields:
+            col_name = dialect.quote_identifier(f.get_column_name())
+            type_sql = dialect.type_to_sql(
+                f.field_type,
+                f.max_length,
+                f.primary_key,
+                f.auto_increment,
+                f.nullable
+            )
+            col_def = col_name + " " + type_sql
+            if f.unique and not f.primary_key:
+                col_def += " UNIQUE"
+            if len(f.default_val) > 0 and not f.primary_key:
+                ft = f.field_type.lower()
+                if dialect.name == "mysql" and (ft == "bool" or ft == "boolean"):
+                    d_val = "1" if (f.default_val.lower() == "true" or f.default_val == "1") else "0"
+                    col_def += " DEFAULT " + d_val
+                elif ft in ["int", "integer", "tinyint", "smallint", "mediumint", "bigint", "float", "double"]:
+                    col_def += " DEFAULT " + f.default_val
+                else:
+                    col_def += " DEFAULT '" + f.default_val + "'"
+            col_defs.append(col_def)
+
+        sql = "CREATE TABLE IF NOT EXISTS " + q_table + " (\n  "
+        sql += ",\n  ".join(col_defs)
+        sql += "\n)" + dialect.table_suffix() + ";"
+        return sql
+
+    def drop_table_sql(self, dialect: Dialect) -> str:
+        q_table = dialect.quote_identifier(self.table_name)
+        return "DROP TABLE IF EXISTS " + q_table + ";"
+
+    def generate_entity_code(self, class_name: str = "") -> str:
+        cname = class_name if len(class_name) > 0 else self.table_name.capitalize()
+        sb = List[str]()
+        sb.append("class " + cname + "(LazyModel):")
+        for f in self.fields:
+            col = f.get_column_name()
+            kind = f.get_kind()
+            type_name = "str"
+            if kind == COL_KIND_INT:
+                type_name = "int"
+            elif kind == COL_KIND_FLOAT:
+                type_name = "float"
+            elif kind == COL_KIND_BOOL:
+                type_name = "bool"
+            sb.append("    _" + col + "_cache: Optional[" + type_name + "]")
+
+        sb.append("\n    def __init__(self, row: Optional[Row] = None):")
+        sb.append("        super().__init__(row)")
+        for f in self.fields:
+            col = f.get_column_name()
+            sb.append("        self._" + col + "_cache = None")
+
+        for f in self.fields:
+            col = f.get_column_name()
+            kind = f.get_kind()
+            type_name = "str"
+            getter_name = "get_str"
+            setter_name = "set_str"
+            default_val = '""'
+
+            if kind == COL_KIND_INT:
+                type_name = "int"
+                getter_name = "get_int"
+                setter_name = "set_int"
+                default_val = "0"
+            elif kind == COL_KIND_FLOAT:
+                type_name = "float"
+                getter_name = "get_float"
+                setter_name = "set_float"
+                default_val = "0.0"
+            elif kind == COL_KIND_BOOL:
+                type_name = "bool"
+                getter_name = "get_bool"
+                setter_name = "set_bool"
+                default_val = "False"
+
+            sb.append("\n    @property")
+            sb.append("    def " + col + "(self) -> " + type_name + ":")
+            sb.append("        if self._" + col + "_cache is None:")
+            sb.append('            self._' + col + '_cache = Optional[' + type_name + '](self.' + getter_name + '("' + col + '"))')
+            sb.append("        val = self._" + col + "_cache")
+            sb.append("        return val if val is not None else " + default_val)
+
+            sb.append("\n    @" + col + ".setter")
+            sb.append("    def " + col + "(self, val: " + type_name + "):")
+            sb.append("        self._" + col + "_cache = Optional[" + type_name + "](val)")
+            sb.append('        self.' + setter_name + '("' + col + '", val)')
+
+        return "\n".join(sb)
+
+
+class Model:
+    _values: Dict[str, str]
+
+    def __init__(self):
+        self._values = Dict[str, str]()
+
+    def set(self, key: str, value: str) -> None:
+        self._values[key] = value
+
+    def get(self, key: str, default_val: str = "") -> str:
+        if key in self._values:
+            return self._values[key]
+        return default_val
+
+    def has(self, key: str) -> bool:
+        return key in self._values
+
+    def get_str(self, key: str, default_val: str = "") -> str:
+        return self.get(key, default_val)
+
+    def get_int(self, key: str, default_val: int = 0) -> int:
+        if key in self._values:
+            try:
+                return int(self._values[key])
+            except:
+                return default_val
+        return default_val
+
+    def get_float(self, key: str, default_val: float = 0.0) -> float:
+        if key in self._values:
+            try:
+                return float(self._values[key])
+            except:
+                return default_val
+        return default_val
+
+    def get_bool(self, key: str, default_val: bool = False) -> bool:
+        if key in self._values:
+            v = self._values[key].lower()
+            if v == "1" or v == "true" or v == "t":
+                return True
+            if v == "0" or v == "false" or v == "f":
+                return False
+        return default_val
+
+    def set_int(self, key: str, val: int) -> None:
+        self.set(key, str(val))
+
+    def set_float(self, key: str, val: float) -> None:
+        self.set(key, str(val))
+
+    def set_bool(self, key: str, val: bool) -> None:
+        self.set(key, "true" if val else "false")
+
+    def set_str(self, key: str, val: str) -> None:
+        self.set(key, val)
+
+    def to_dict(self) -> Dict[str, str]:
+        d = Dict[str, str]()
+        for k, v in self._values.items():
+            d[k] = v
+        return d
+
+    def from_dict(self, d: Dict[str, str]) -> None:
+        """Populates ORM entity from dictionary (e.g. from schema.model_dump())."""
+        for k, v in d.items():
+            self.set(k, v)
+
+    def from_schema[S](self, schema: S) -> None:
+        """Zero-alloc direct attribute ingestion from Schema DTO (no intermediate Dict)."""
+        schema.copy_to(self)
+
+    def from_row(self, row: Row) -> None:
+        for name in row.field_names:
+            v = row.get(name)
+            if v is not None:
+                self.set(name, v)
+            else:
+                self.set(name, "")
+
+    def meta(self) -> ModelMeta:
+        return self.get_meta()
+
+    def to_row(self, meta: Optional[ModelMeta] = None) -> Row:
+        m = meta if meta is not None else self.meta()
+        cols = m.columns
+        if len(cols) > 0:
+            vals = List[Optional[str]]()
+            for col in cols:
+                if col in self._values:
+                    vals.append(Optional[str](self._values[col]))
+                else:
+                    vals.append(None)
+            return Row(cols, vals, m.field_infos)
+        else:
+            f_names = list(self._values.keys())
+            vals = List[Optional[str]]()
+            for k in f_names:
+                vals.append(Optional[str](self._values[k]))
+            return Row(f_names, vals)
+
+    def to_row_view(self, meta: Optional[ModelMeta] = None) -> RowView:
+        return RowView(self.to_row(meta))
+
+    def create_view(self, meta: Optional[ModelMeta] = None) -> RowView:
+        return self.to_row_view(meta)
+
+    def to_json(self, meta: Optional[ModelMeta] = None) -> str:
+        return self.to_row(meta).to_json()
+
+    @staticmethod
+    def get_meta() -> ModelMeta:
+        return ModelMeta("", List[Field]())

@@ -1,0 +1,244 @@
+# Industrial Asynchronous ORM Session
+from typing import List, Dict, Tuple, Optional
+from src.orm.dialect import Dialect, MYSQL_DIALECT
+from src.orm.model import ModelMeta, Model
+from src.orm.lazy_model import LazyModel
+from src.orm.schema import TableSchema, get_table_schema
+from src.orm.query import Query
+from src.orm.sql.select import Select
+from src.orm.sql.dml import Insert, Update, Delete
+from src.db.types import Row
+from src.db.async_pool import AsyncMySQLPool
+from src.orm.engine import interpolate_params
+
+class AsyncSession:
+    pool: AsyncMySQLPool
+    dialect: Dialect
+
+    def __init__(self, pool: AsyncMySQLPool, dialect: Dialect = MYSQL_DIALECT):
+        self.pool = pool
+        self.dialect = dialect
+
+    def query[T](self, model: T) -> Query:
+        tbl_name = model.__tablename__
+        schema = get_table_schema(tbl_name)
+        return Query(schema.meta(), dialect=self.dialect)
+
+    def query(self, schema: TableSchema) -> Query:
+        return Query(schema.meta(), dialect=self.dialect)
+
+    def query(self, meta: ModelMeta) -> Query:
+        return Query(meta, dialect=self.dialect)
+
+    async def execute_raw(self, sql: str, params: List[str] = List[str]()):
+        final_sql = interpolate_params(sql, params)
+        res = List[Row]()
+        async with self.pool.connection() as conn:
+            cur = conn.cursor()
+            await cur.execute(final_sql)
+            res = cur.fetchall()
+            cur.close()
+        return res
+
+    async def execute_one(self, sql: str, params: List[str] = List[str]()):
+        final_sql = interpolate_params(sql, params)
+        async with self.pool.connection() as conn:
+            cur = conn.cursor()
+            await cur.execute(final_sql)
+            row = cur.fetchone()
+            cur.close()
+            return row
+
+    async def execute_query(self, query: Query):
+        sql, params = query.to_sql()
+        return await self.execute_raw(sql, params)
+
+    async def first(self, query: Query):
+        query.limit(1)
+        sql, params = query.to_sql()
+        return await self.execute_one(sql, params)
+
+    async def first(self, stmt: Select):
+        stmt.limit(1)
+        sql, params = stmt.to_sql(self.dialect)
+        return await self.execute_one(sql, params)
+
+    async def execute(self, stmt: Select):
+        sql, params = stmt.to_sql(self.dialect)
+        return await self.execute_raw(sql, params)
+
+    async def execute_insert(self, stmt: Insert):
+        sql, params = stmt.to_sql(self.dialect)
+        final_sql = interpolate_params(sql, params)
+        res = 0
+        async with self.pool.connection() as conn:
+            cur = conn.cursor()
+            await cur.execute(final_sql)
+            last_id = cur.lastrowid
+            cnt = cur.rowcount
+            cur.close()
+            res = last_id if last_id > 0 else cnt
+        return res
+
+    async def execute_update(self, stmt: Update):
+        sql, params = stmt.to_sql(self.dialect)
+        final_sql = interpolate_params(sql, params)
+        res = 0
+        async with self.pool.connection() as conn:
+            cur = conn.cursor()
+            await cur.execute(final_sql)
+            res = cur.rowcount
+            cur.close()
+        return res
+
+    async def execute_delete(self, stmt: Delete):
+        sql, params = stmt.to_sql(self.dialect)
+        final_sql = interpolate_params(sql, params)
+        res = 0
+        async with self.pool.connection() as conn:
+            cur = conn.cursor()
+            await cur.execute(final_sql)
+            res = cur.rowcount
+            cur.close()
+        return res
+
+    async def _get_meta(self, meta: ModelMeta, pk_value: str):
+        sql = meta.get_pk_query_sql(self.dialect)
+        params = [pk_value]
+        return await self.execute_one(sql, params)
+
+
+    async def count(self, query: Query):
+        sql, params = query.to_count_sql()
+        rows = await self.execute_raw(sql, params)
+        if len(rows) > 0 and len(rows[0]) > 0:
+            return rows[0].get_int(0, 0)
+        return 0
+
+    async def insert(self, meta: ModelMeta, values: Dict[str, str]):
+        query = Query(meta, dialect=self.dialect)
+        sql, params = query.to_insert_sql(values)
+        final_sql = interpolate_params(sql, params)
+        res = 0
+        async with self.pool.connection() as conn:
+            cur = conn.cursor()
+            await cur.execute(final_sql)
+            last_id = cur.lastrowid
+            cnt = cur.rowcount
+            cur.close()
+            res = last_id if last_id > 0 else cnt
+        return res
+
+    async def update(self, meta: ModelMeta, pk_value: str, values: Dict[str, str]):
+        query = Query(meta, dialect=self.dialect)
+        query.where_eq(meta.primary_key, pk_value)
+        sql, params = query.to_update_sql(values)
+        final_sql = interpolate_params(sql, params)
+        res = 0
+        async with self.pool.connection() as conn:
+            cur = conn.cursor()
+            await cur.execute(final_sql)
+            res = cur.rowcount
+            cur.close()
+        return res
+
+    async def delete(self, meta: ModelMeta, pk_value: str):
+        query = Query(meta, dialect=self.dialect)
+        query.where_eq(meta.primary_key, pk_value)
+        sql, params = query.to_delete_sql()
+        final_sql = interpolate_params(sql, params)
+        res = 0
+        async with self.pool.connection() as conn:
+            cur = conn.cursor()
+            await cur.execute(final_sql)
+            res = cur.rowcount
+            cur.close()
+        return res
+
+    async def save(self, model: Model, meta: ModelMeta):
+        pk = meta.primary_key
+        if model.has(pk) and len(model.get(pk)) > 0:
+            pk_val = model.get(pk)
+            update_vals = Dict[str, str]()
+            for k, v in model._values.items():
+                if k != pk:
+                    update_vals[k] = v
+            return await self.update(meta, pk_val, update_vals)
+        else:
+            new_id = await self.insert(meta, model.to_dict())
+            if new_id > 0:
+                model.set(pk, str(new_id))
+            return new_id
+
+    async def save(self, model: LazyModel, meta: ModelMeta):
+        pk = meta.primary_key
+        pk_val = model.get_str(pk)
+        if len(pk_val) > 0 and pk_val != "0":
+            if model.is_dirty():
+                dirty_fields = model.get_dirty_fields()
+                update_fields = Dict[str, str]()
+                for k, v in dirty_fields.items():
+                    if k != pk:
+                        update_fields[k] = v
+                res = await self.update(meta, pk_val, update_fields)
+                model._row = Optional[Row](model.to_row(meta))
+                model.clear_dirty()
+                return res
+            return 0
+        else:
+            res = await self.insert(meta, model.get_dirty_fields())
+            if res > 0:
+                model.set_str(pk, str(res))
+            model._row = Optional[Row](model.to_row(meta))
+            model.clear_dirty()
+            return res
+
+    async def get[T](self, model: T, pk_value: str):
+        tbl_name = model.__tablename__
+        schema = get_table_schema(tbl_name)
+        return await self._get_meta(schema.meta(), pk_value)
+
+    async def get(self, schema: TableSchema, pk_value: str):
+        return await self._get_meta(schema.meta(), pk_value)
+
+    async def get(self, meta: ModelMeta, pk_value: str):
+        return await self._get_meta(meta, pk_value)
+
+    async def insert(self, schema: TableSchema, values: Dict[str, str]):
+        return await self.insert(schema.meta(), values)
+
+    async def update(self, schema: TableSchema, pk_value: str, values: Dict[str, str]):
+        return await self.update(schema.meta(), pk_value, values)
+
+    async def delete(self, schema: TableSchema, pk_value: str):
+        return await self.delete(schema.meta(), pk_value)
+
+    async def save(self, model: Model, schema: TableSchema):
+        return await self.save(model, schema.meta())
+
+    async def save(self, model: LazyModel, schema: TableSchema):
+        return await self.save(model, schema.meta())
+
+    async def save[T](self, model: T):
+        tbl_name = model.__tablename__
+        schema = get_table_schema(tbl_name)
+        return await self.save(model, schema.meta())
+
+    async def create_table(self, meta: ModelMeta):
+        sql = meta.create_table_sql(self.dialect)
+        await self.execute_raw(sql)
+
+    async def drop_table(self, meta: ModelMeta):
+        sql = meta.drop_table_sql(self.dialect)
+        await self.execute_raw(sql)
+
+    async def create_table(self, schema: TableSchema):
+        sql = schema.meta().create_table_sql(self.dialect)
+        await self.execute_raw(sql)
+
+    async def drop_table(self, schema: TableSchema):
+        sql = schema.meta().drop_table_sql(self.dialect)
+        await self.execute_raw(sql)
+
+
+

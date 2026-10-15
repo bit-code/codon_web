@@ -1,0 +1,211 @@
+# Industrial-Grade Redis Pipeline & Transaction Implementation for Codon Web
+# Batches multiple commands into a single TCP write frame to eliminate network RTT latency.
+
+from typing import List, Optional
+from src.core.async.loop import wait_for
+from src.memory.buffer import ByteBuffer
+from src.db.drivers.redis.protocol import RedisValue, encode_command, encode_command_to_buf, parse_resp_sync, parse_resp_async
+from src.db.drivers.redis.connection import RedisConnection
+from src.db.drivers.redis.async_connection import AsyncRedisConnection
+from src.db.drivers.redis.errors import RedisConnectionError, RedisTimeoutError
+
+class RedisPipeline:
+    """Synchronous Redis command pipeline."""
+    _conn: RedisConnection
+    _commands: List[List[str]]
+
+    def __init__(self, conn: RedisConnection):
+        self._conn = conn
+        self._commands = List[List[str]]()
+
+    def __len__(self) -> int:
+        return len(self._commands)
+
+    def queue_command(self, cmd_args: List[str]) -> RedisPipeline:
+        self._commands.append(cmd_args)
+        return self
+
+    def set(self, key: str, val: str, ex: int = 0, px: int = 0) -> RedisPipeline:
+        cmd: List[str] = ["SET", key, val]
+        if ex > 0:
+            cmd.append("EX")
+            cmd.append(str(ex))
+        elif px > 0:
+            cmd.append("PX")
+            cmd.append(str(px))
+        return self.queue_command(cmd)
+
+    def get(self, key: str) -> RedisPipeline:
+        return self.queue_command(["GET", key])
+
+    def incr(self, key: str) -> RedisPipeline:
+        return self.queue_command(["INCR", key])
+
+    def decr(self, key: str) -> RedisPipeline:
+        return self.queue_command(["DECR", key])
+
+    def del_key(self, key: str) -> RedisPipeline:
+        return self.queue_command(["DEL", key])
+
+    def hset(self, name: str, key: str, val: str) -> RedisPipeline:
+        return self.queue_command(["HSET", name, key, val])
+
+    def hget(self, name: str, key: str) -> RedisPipeline:
+        return self.queue_command(["HGET", name, key])
+
+    def rpush(self, name: str, values: List[str]) -> RedisPipeline:
+        cmd: List[str] = ["RPUSH", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        return self.queue_command(cmd)
+
+    def lpush(self, name: str, values: List[str]) -> RedisPipeline:
+        cmd: List[str] = ["LPUSH", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        return self.queue_command(cmd)
+
+    def ping(self) -> RedisPipeline:
+        return self.queue_command(["PING"])
+
+    def execute(self, raise_on_error: bool = False) -> List[RedisValue]:
+        """Flushes all queued commands in a single network transmission and collects replies."""
+        n_cmds = len(self._commands)
+        if n_cmds == 0:
+            return List[RedisValue]()
+
+        if not self._conn.ensure_connected() or self._conn.reader is None:
+            raise RedisConnectionError("Not connected to Redis server")
+
+        # 1. Zero-copy batch serialization into native ByteBuffer
+        batch_buf = ByteBuffer(4096)
+        for i in range(n_cmds):
+            encode_command_to_buf(self._commands[i], batch_buf)
+        rslice = batch_buf.readable_slice()
+
+        # 2. Transmit batch in single I/O burst via send_raw
+        sent = self._conn.sock.send_raw(rslice.ptr, rslice.len)
+        if sent < 0:
+            self._conn.close()
+            raise RedisConnectionError("Failed to transmit pipeline batch frame")
+
+        # 3. Read back all N responses sequentially
+        results = List[RedisValue]()
+        for _ in range(n_cmds):
+            try:
+                val = parse_resp_sync(self._conn.reader)
+                results.append(val)
+            except Exception as e:
+                self._conn.close()
+                raise RedisConnectionError(f"Error reading pipeline response: {str(e)}")
+
+        self._commands.clear()
+
+        # 4. Check for errors without desynchronizing socket
+        if raise_on_error:
+            for i in range(len(results)):
+                results[i].raise_if_error()
+
+        return results
+
+
+class AsyncRedisPipeline:
+    """Asynchronous Epoll Redis command pipeline."""
+    _conn: AsyncRedisConnection
+    _commands: List[List[str]]
+
+    def __init__(self, conn: AsyncRedisConnection):
+        self._conn = conn
+        self._commands = List[List[str]]()
+
+    def __len__(self) -> int:
+        return len(self._commands)
+
+    def queue_command(self, cmd_args: List[str]) -> AsyncRedisPipeline:
+        self._commands.append(cmd_args)
+        return self
+
+    def set(self, key: str, val: str, ex: int = 0, px: int = 0) -> AsyncRedisPipeline:
+        cmd: List[str] = ["SET", key, val]
+        if ex > 0:
+            cmd.append("EX")
+            cmd.append(str(ex))
+        elif px > 0:
+            cmd.append("PX")
+            cmd.append(str(px))
+        return self.queue_command(cmd)
+
+    def get(self, key: str) -> AsyncRedisPipeline:
+        return self.queue_command(["GET", key])
+
+    def incr(self, key: str) -> AsyncRedisPipeline:
+        return self.queue_command(["INCR", key])
+
+    def decr(self, key: str) -> AsyncRedisPipeline:
+        return self.queue_command(["DECR", key])
+
+    def del_key(self, key: str) -> AsyncRedisPipeline:
+        return self.queue_command(["DEL", key])
+
+    def hset(self, name: str, key: str, val: str) -> AsyncRedisPipeline:
+        return self.queue_command(["HSET", name, key, val])
+
+    def hget(self, name: str, key: str) -> AsyncRedisPipeline:
+        return self.queue_command(["HGET", name, key])
+
+    def rpush(self, name: str, values: List[str]) -> AsyncRedisPipeline:
+        cmd: List[str] = ["RPUSH", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        return self.queue_command(cmd)
+
+    def lpush(self, name: str, values: List[str]) -> AsyncRedisPipeline:
+        cmd: List[str] = ["LPUSH", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        return self.queue_command(cmd)
+
+    def ping(self) -> AsyncRedisPipeline:
+        return self.queue_command(["PING"])
+
+    async def execute(self, timeout_sec: float = 10.0, raise_on_error: bool = False):
+        """Asynchronously sends the entire pipeline buffer over Epoll stream and gathers replies."""
+        n_cmds = len(self._commands)
+        if n_cmds == 0:
+            return List[RedisValue]()
+
+        if not self._conn.is_connected or self._conn.writer is None or self._conn.reader is None:
+            raise RedisConnectionError(f"Not connected to Redis server at {self._conn.host}:{self._conn.port}")
+
+        # 1. Zero-copy batch serialization into native ByteBuffer
+        batch_buf = ByteBuffer(4096)
+        for i in range(n_cmds):
+            encode_command_to_buf(self._commands[i], batch_buf)
+        rslice = batch_buf.readable_slice()
+
+        # 2. Write buffer and drain
+        results = List[RedisValue]()
+        try:
+            self._conn.writer.write_raw(rslice.ptr, rslice.len)
+            if self._conn.writer.is_paused() or self._conn.writer.get_buffer_size() > 0:
+                await wait_for(self._conn.writer.drain(), timeout_sec)
+
+            # 3. Read back all N responses
+            for _ in range(n_cmds):
+                val = await wait_for(parse_resp_async(self._conn.reader), timeout_sec)
+                results.append(val)
+
+            self._commands.clear()
+        except Exception as e:
+            self._conn.close()
+            err_msg = str(e)
+            if "Timeout" in err_msg:
+                raise RedisTimeoutError(f"Pipeline execution timed out after {timeout_sec}s")
+            raise RedisConnectionError(f"Pipeline communication error: {err_msg}")
+
+        # 4. Check for errors without desynchronizing socket
+        if raise_on_error:
+            for i in range(len(results)):
+                results[i].raise_if_error()
+
+        return results

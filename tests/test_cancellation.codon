@@ -1,0 +1,285 @@
+# Test Suite for TaskQ Synchronous and Multi-Layer Asynchronous Task Cancellation
+# Validates pre-execution revocation, delayed task purging, and hierarchical cascading cancellation
+
+import time
+from src.taskq import (
+    MemoryBroker,
+    TaskClient,
+    TaskMessage,
+    Worker,
+    WorkerConfig,
+    AsyncWorker,
+    AsyncWorkerConfig,
+    AsyncTaskHandler,
+    AsyncTaskRegistry,
+    TaskStatus,
+    TaskCancelledError,
+    TaskContext,
+    CancellationToken,
+    task,
+    GLOBAL_TASK_REGISTRY
+)
+from src.core.async import run, sleep, create_task
+
+# ---------------------------------------------------------
+# Synchronous Task Definition
+# ---------------------------------------------------------
+@task(name="sync_payment")
+def handle_payment(payload: str) -> str:
+    return "payment_processed"
+
+# ---------------------------------------------------------
+# Multi-Layer Nested Async Task Handler
+# Simulates a complex deep-crawling pipeline with sub-tasks
+# ---------------------------------------------------------
+class DeepCrawlerPipeline(AsyncTaskHandler):
+    subtask_1_executed: bool
+    subtask_2_executed: bool
+    subtask_3_aborted: bool
+
+    def __init__(self):
+        super().__init__(name="deep_crawler", max_retries=1)
+        self.subtask_1_executed = False
+        self.subtask_2_executed = False
+        self.subtask_3_aborted = False
+
+    async def _level2_fetch_chunk(self, chunk_id: int, ctx: TaskContext):
+        for i in range(5):
+            ctx.check_cancelled()
+            await sleep(0.01)
+        return f"chunk_{chunk_id}"
+
+    async def _level1_stage_crawler(self, ctx: TaskContext):
+        # Spawns Level-2 sub-operations using hierarchical child contexts
+        child_ctx1 = ctx.child_context()
+        child_ctx2 = ctx.child_context()
+
+        # Step 1: Execute chunk 1
+        self.subtask_1_executed = True
+        r1 = await self._level2_fetch_chunk(1, child_ctx1)
+
+        # Step 2: Coroutine cooperative delay where cancellation will arrive
+        for i in range(10):
+            ctx.check_cancelled()
+            await sleep(0.02)
+
+        # Step 3: Chunk 2 should NEVER execute if cancelled
+        self.subtask_2_executed = True
+        r2 = await self._level2_fetch_chunk(2, child_ctx2)
+        return r1 + "_" + r2
+
+    async def run_with_context(self, payload: str, ctx: TaskContext):
+        try:
+            res = await self._level1_stage_crawler(ctx)
+            return res
+        except BaseException:
+            self.subtask_3_aborted = True
+            raise
+
+# ---------------------------------------------------------
+# Test Cases
+# ---------------------------------------------------------
+def test_sync_task_cancellation_before_execution():
+    print("[1/4] Testing synchronous task pre-execution cancellation...")
+    broker = MemoryBroker()
+    client = TaskClient(broker)
+    worker = Worker(broker, GLOBAL_TASK_REGISTRY, WorkerConfig(queues=["default"]))
+
+    # Enqueue task
+    res = client.apply_async("sync_payment", '{"amount": 100}')
+    assert res.status() == TaskStatus.PENDING
+
+    # Cancel task before worker processes it
+    ok = res.cancel()
+    assert ok
+    assert res.is_cancelled()
+    assert broker.is_cancelled(res.task_id)
+
+    # 1. Queue is purged immediately upon cancellation
+    assert len(broker.queues.get("default", [])) == 0
+    assert res.is_ready()
+    assert res.status() == TaskStatus.CANCELLED
+
+    # 2. Test worker pre-execution gate interception when a cancelled message arrives
+    msg = TaskMessage(task_id=res.task_id, task_name="sync_payment", payload="{}")
+    broker.enqueue("default", msg)
+    processed = worker.step()
+    assert processed
+    assert worker.stats.total_cancelled == 1
+    assert worker.stats.total_succeeded == 0
+
+    # Verify result backend
+    result = res.get(timeout_sec=0.1)
+    assert result is not None
+    assert result.status == TaskStatus.CANCELLED
+    print("  -> Passed sync task pre-execution cancellation")
+
+def test_delayed_task_purging_on_cancellation():
+    print("[2/4] Testing delayed ETA task cancellation and purging...")
+    broker = MemoryBroker()
+    client = TaskClient(broker)
+
+    # Schedule delayed task for 100 seconds in the future
+    res = client.apply_async("sync_payment", '{"amount": 50}', eta_sec=100)
+    assert len(broker.delayed_queues.get("default", [])) == 1
+
+    # Cancel the delayed task
+    ok = res.cancel()
+    assert ok
+    # Should be immediately purged from delayed queues
+    assert len(broker.delayed_queues.get("default", [])) == 0
+    assert res.is_cancelled()
+
+    result = res.get(timeout_sec=0.1)
+    assert result is not None
+    assert result.status == TaskStatus.CANCELLED
+    print("  -> Passed delayed task purging")
+
+async def _test_async_pre_execution_cancel_coro():
+    print("[3/4] Testing async task pre-execution gate cancellation...")
+    broker = MemoryBroker()
+    client = TaskClient(broker)
+    registry = AsyncTaskRegistry()
+    crawler = DeepCrawlerPipeline()
+    registry.register(crawler)
+    worker = AsyncWorker(broker, registry, AsyncWorkerConfig(queues=["default"]))
+
+    res = client.apply_async("deep_crawler", '{"url": "https://example.com"}')
+    ok = res.cancel()
+    assert ok
+    assert len(broker.queues.get("default", [])) == 0
+
+    # Simulate message arriving to worker for cancelled task
+    msg = TaskMessage(task_id=res.task_id, task_name="deep_crawler", payload="{}")
+    broker.enqueue("default", msg)
+
+    # Run single worker step
+    worker.step_dispatch()
+    assert worker.stats.total_cancelled == 1
+    assert worker.stats.total_received == 1
+    assert worker.stats.active_tasks == 0
+
+    result = res.get(timeout_sec=0.1)
+    assert result is not None
+    assert result.status == TaskStatus.CANCELLED
+    print("  -> Passed async pre-execution gate cancellation")
+
+async def _test_multi_layer_async_cancellation_coro():
+    print("[4/4] Testing multi-layer nested async hierarchical cancellation...")
+    broker = MemoryBroker()
+    client = TaskClient(broker)
+    registry = AsyncTaskRegistry()
+    crawler = DeepCrawlerPipeline()
+    registry.register(crawler)
+    worker = AsyncWorker(broker, registry, AsyncWorkerConfig(queues=["default"]))
+
+    # Enqueue complex multi-layer async task
+    res = client.apply_async("deep_crawler", '{"url": "https://deep-site.com"}')
+
+    # Dispatch task into active coroutine
+    worker.step_dispatch()
+    assert worker.stats.active_tasks == 1
+    assert res.task_id in worker.active_contexts
+
+    # Let Level 1 start and Level 2 complete chunk 1
+    for _ in range(5):
+        worker.step_dispatch()
+        await sleep(0.01)
+
+    assert crawler.subtask_1_executed
+    assert not crawler.subtask_2_executed
+
+    # Remotely issue cancellation while Level 1 is suspended in sleep
+    print("  -> Emitting remote cancellation signal...")
+    res.cancel()
+    assert broker.is_cancelled(res.task_id)
+
+    # Worker step polls remote cancellation and triggers local cascading cancellation
+    for _ in range(10):
+        worker.step_dispatch()
+        await sleep(0.01)
+
+    # Check results
+    assert crawler.subtask_3_aborted
+    assert not crawler.subtask_2_executed, "Subtask 2 must NEVER have run after cancellation"
+    assert worker.stats.active_tasks == 0, "Active concurrency slot must be released"
+    assert worker.stats.total_cancelled >= 1
+
+    result = res.get(timeout_sec=0.1)
+    assert result is not None
+    assert result.status == TaskStatus.CANCELLED
+    assert res.is_ready()
+    print("  -> Passed multi-layer nested async cancellation")
+
+class AutomaticSleepTask(AsyncTaskHandler):
+    stage1_reached: bool
+    stage2_reached: bool
+
+    def __init__(self):
+        super().__init__(name="auto_sleep_task")
+        self.stage1_reached = False
+        self.stage2_reached = False
+
+    async def run(self, payload: str):
+        self.stage1_reached = True
+        # Completely standard async code with ZERO ctx.check_cancelled() calls
+        await sleep(0.5)
+        self.stage2_reached = True
+        return "completed"
+
+async def _test_automatic_runtime_cancellation_coro():
+    print("[5/5] Testing automatic runtime cancellation (ZERO manual check_cancelled calls)...")
+    broker = MemoryBroker()
+    client = TaskClient(broker)
+    registry = AsyncTaskRegistry()
+    auto_task = AutomaticSleepTask()
+    registry.register(auto_task)
+    worker = AsyncWorker(broker, registry, AsyncWorkerConfig(queues=["default"]))
+
+    res = client.apply_async("auto_sleep_task", "{}")
+    worker.step_dispatch()
+    assert worker.stats.active_tasks == 1
+
+    # Let task enter await sleep(0.5)
+    for _ in range(3):
+        worker.step_dispatch()
+        await sleep(0.01)
+
+    assert auto_task.stage1_reached
+    assert not auto_task.stage2_reached
+
+    # Issue cancellation remotely
+    print("  -> Issuing remote cancel to in-flight sleeping task...")
+    res.cancel()
+
+    # Step worker: Worker detects remote cancel and invokes task.cancel(),
+    # causing the event loop to raise CancelledError at await sleep(0.5) automatically
+    for _ in range(10):
+        worker.step_dispatch()
+        await sleep(0.01)
+
+    # Verify task was automatically interrupted and aborted
+    assert not auto_task.stage2_reached, "Stage 2 must NEVER be reached when cancelled automatically"
+    assert worker.stats.active_tasks == 0, "Active concurrency slot must be released"
+    assert worker.stats.total_cancelled >= 1
+
+    result = res.get(timeout_sec=0.1)
+    assert result is not None
+    assert result.status == TaskStatus.CANCELLED
+    assert res.is_ready()
+    print("  -> Passed automatic runtime cancellation (100% automated)")
+
+def main():
+    print("==================================================")
+    print("  TaskQ Industrial Cancellation Test Suite")
+    print("==================================================")
+    test_sync_task_cancellation_before_execution()
+    test_delayed_task_purging_on_cancellation()
+    run(_test_async_pre_execution_cancel_coro())
+    run(_test_multi_layer_async_cancellation_coro())
+    run(_test_automatic_runtime_cancellation_coro())
+    print("==================================================")
+    print("  ALL 5 CANCELLATION TESTS PASSED SUCCESSFULLY!   ")
+    print("==================================================")
+
+main()

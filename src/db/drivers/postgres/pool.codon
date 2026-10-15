@@ -1,0 +1,128 @@
+# PostgreSQL Connection Pool
+from typing import List, Optional
+from src.db.errors import OperationalError, InterfaceError
+from src.db.drivers.postgres.connection import PostgresConnection, connect
+
+class PooledPostgresConnection[PoolType]:
+    _pool: PoolType
+    conn: PostgresConnection
+    _released: bool
+
+    def __init__(self, pool: PoolType, conn: PostgresConnection):
+        self._pool = pool
+        self.conn = conn
+        self._released = False
+
+    def cursor(self):
+        return self.conn.cursor()
+
+    def execute(self, sql: str, params: list[str] = list[str]()):
+        return self.conn.execute(sql, params)
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def rollback(self) -> None:
+        self.conn.rollback()
+
+    def ping(self) -> bool:
+        return self.conn.ping()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self):
+        self.release()
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._pool.release(self.conn)
+
+class PostgresPool:
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+    min_size: int
+    max_size: int
+    conninfo: str
+
+    _available: List[PostgresConnection]
+    _total_created: int
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 5432,
+        user: str = "postgres",
+        password: str = "",
+        database: str = "postgres",
+        min_size: int = 2,
+        max_size: int = 10,
+        conninfo: str = ""
+    ):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.database = database
+        self.min_size = min_size
+        self.max_size = max_size
+        self.conninfo = conninfo
+
+        self._available = List[PostgresConnection]()
+        self._total_created = 0
+
+        # Pre-warm min_size connections if possible
+        for _ in range(min_size):
+            try:
+                c = self._create_connection()
+                self._available.append(c)
+            except Exception:
+                break
+
+    def _create_connection(self) -> PostgresConnection:
+        c = connect(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=self.password,
+            database=self.database,
+            conninfo=self.conninfo
+        )
+        self._total_created += 1
+        return c
+
+    def acquire(self) -> PooledPostgresConnection[PostgresPool]:
+        while len(self._available) > 0:
+            conn = self._available.pop()
+            if not conn.is_closed and conn.ping():
+                return PooledPostgresConnection[PostgresPool](self, conn)
+            else:
+                conn.close()
+                self._total_created -= 1
+
+        if self._total_created < self.max_size:
+            conn = self._create_connection()
+            return PooledPostgresConnection[PostgresPool](self, conn)
+
+        raise OperationalError("PostgreSQL pool exhausted (max_size: " + str(self.max_size) + ")")
+
+    def release(self, conn: PostgresConnection) -> None:
+        if conn.is_closed:
+            self._total_created -= 1
+            return
+
+        if len(self._available) < self.max_size:
+            self._available.append(conn)
+        else:
+            conn.close()
+            self._total_created -= 1
+
+    def close(self) -> None:
+        while len(self._available) > 0:
+            c = self._available.pop()
+            c.close()
+        self._total_created = 0

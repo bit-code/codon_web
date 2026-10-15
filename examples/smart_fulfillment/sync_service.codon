@@ -1,0 +1,194 @@
+# ==============================================================================
+# Smart Fulfillment Hub - Synchronous ORM Domain Service Showcase
+# Retained as reference for Synchronous CodonWeb ORM Session usage.
+# ==============================================================================
+
+from typing import List, Dict, Optional, Tuple
+from examples.smart_fulfillment.config import app_config
+from examples.smart_fulfillment.schemas import (
+    AddressSchema,
+    FulfillmentItemSchema,
+    FulfillmentRequest
+)
+from examples.smart_fulfillment.entities import (
+    FulfillmentOrderTable
+)
+from src.orm import (
+    Session, DatabaseEngine, get_table_schema,
+    select, update, delete, Table
+)
+from src.db.types import Row
+from src.memory.buffer import ByteBuffer
+from src.schema import ValidationError, ValidationResult
+
+
+class FulfillmentCalculation:
+    """Calculated financial and dispatch metrics for an order."""
+    item_subtotal: float
+    total_quantity: int
+    shipping_fee: float
+    insurance_fee: float
+    discount_amount: float
+    final_payable: float
+
+    def __init__(
+        self,
+        item_subtotal: float = 0.0,
+        total_quantity: int = 0,
+        shipping_fee: float = 0.0,
+        insurance_fee: float = 0.0,
+        discount_amount: float = 0.0,
+        final_payable: float = 0.0
+    ):
+        self.item_subtotal = item_subtotal
+        self.total_quantity = total_quantity
+        self.shipping_fee = shipping_fee
+        self.insurance_fee = insurance_fee
+        self.discount_amount = discount_amount
+        self.final_payable = final_payable
+
+
+_GLOBAL_DB_ENGINE: Optional[DatabaseEngine] = None
+_GLOBAL_DB_SESSION: Optional[Session] = None
+
+def _get_db_session() -> Session:
+    global _GLOBAL_DB_ENGINE, _GLOBAL_DB_SESSION
+    if _GLOBAL_DB_SESSION is None:
+        engine = DatabaseEngine.from_url(app_config.db_url)
+        _GLOBAL_DB_ENGINE = Optional[DatabaseEngine](engine)
+        _GLOBAL_DB_SESSION = Optional[Session](Session(engine))
+    return _GLOBAL_DB_SESSION
+
+
+class SyncFulfillmentService:
+    """Synchronous Fulfillment domain service orchestrator using CodonWeb Session."""
+
+    @staticmethod
+    def get_session() -> Session:
+        """Lazy initializes and returns singleton Session for real database persistence."""
+        return _get_db_session()
+
+    @staticmethod
+    def init_db_schema() -> None:
+        """Executes real DDL to verify/create the fulfillment_orders table in MySQL."""
+        session = SyncFulfillmentService.get_session()
+        try:
+            session.engine.execute_raw("DROP TABLE IF EXISTS fulfillment_orders")
+        except:
+            pass
+        schema = get_table_schema("fulfillment_orders")
+        session.create_table(schema)
+
+    @staticmethod
+    def calculate_order_metrics(order: FulfillmentRequest) -> FulfillmentCalculation:
+        """Computes items subtotal, logistics fee, insurance premium, and payable sum."""
+        subtotal = 0.0
+        total_qty = 0
+        for item in order.items:
+            subtotal += item.unit_price * float(item.quantity)
+            total_qty += item.quantity
+
+        shipping_fee = app_config.calculate_shipping(subtotal, order.delivery_speed)
+        insurance_fee = order.insured_amount * 0.005
+
+        discount = 0.0
+        if order.discount_code is not None:
+            code = order.discount_code
+            if code == "VIP20":
+                discount = subtotal * 0.20
+            elif code == "FLAT10":
+                discount = 10.0
+
+        if discount > subtotal:
+            discount = subtotal
+
+        final_payable = subtotal + shipping_fee + insurance_fee - discount
+        return FulfillmentCalculation(
+            item_subtotal=subtotal,
+            total_quantity=total_qty,
+            shipping_fee=shipping_fee,
+            insurance_fee=insurance_fee,
+            discount_amount=discount,
+            final_payable=final_payable
+        )
+
+    @staticmethod
+    def transfer_to_orm(order: FulfillmentRequest, target: FulfillmentOrderTable) -> None:
+        """Zero-alloc attribute transfer to real database table entity using copy_to."""
+        order.copy_to(target)
+
+    @staticmethod
+    def restore_from_orm(entity: FulfillmentOrderTable) -> ValidationResult[FulfillmentRequest]:
+        """Zero-alloc direct attribute borrowing from real database table entity."""
+        return FulfillmentRequest.from_orm(entity)
+
+    @staticmethod
+    def save_to_real_db(order: FulfillmentRequest) -> int:
+        """Persists verified FulfillmentRequest into real MySQL database using sync ORM Session."""
+        SyncFulfillmentService.init_db_schema()
+        session = SyncFulfillmentService.get_session()
+        schema = get_table_schema("fulfillment_orders")
+
+        table_record = FulfillmentOrderTable(order)
+        new_id = session.save(table_record, schema)
+        return new_id
+
+    @staticmethod
+    def find_by_id(pk_id: int) -> Optional[FulfillmentRequest]:
+        """Queries real MySQL database by primary key and restores to domain schema."""
+        session = SyncFulfillmentService.get_session()
+        row_opt = session.get(FulfillmentOrderTable, str(pk_id))
+        if row_opt is None:
+            return None
+        table_record = FulfillmentOrderTable(Optional[Row](row_opt))
+        res = FulfillmentRequest.from_orm(table_record)
+        if res.is_ok():
+            return Optional[FulfillmentRequest](res.unwrap())
+        return None
+
+    @staticmethod
+    def find_by_tracking_sn(tracking_sn: str) -> Optional[FulfillmentRequest]:
+        """Queries real MySQL database by tracking_sn index using fluent QueryBuilder."""
+        session = SyncFulfillmentService.get_session()
+        query = session.query(FulfillmentOrderTable).where_eq("tracking_sn", tracking_sn)
+        row = session.first(query)
+        if row is None:
+            return None
+        table_record = FulfillmentOrderTable(Optional[Row](row))
+        res = FulfillmentRequest.from_orm(table_record)
+        if res.is_ok():
+            return Optional[FulfillmentRequest](res.unwrap())
+        return None
+
+    @staticmethod
+    def update_order_sync(tracking_sn: str, new_priority: int, new_memo: str) -> bool:
+        """Updates order record using synchronous SQL update statement."""
+        session = SyncFulfillmentService.get_session()
+        tbl = Table("fulfillment_orders")
+        up_vals = Dict[str, str]()
+        up_vals["priority"] = str(new_priority)
+        up_vals["memo"] = new_memo
+        stmt = update(tbl).where(tbl["tracking_sn"] == tracking_sn).values(up_vals)
+        affected = session.execute(stmt)
+        return affected > 0
+
+    @staticmethod
+    def delete_order_sync(tracking_sn: str) -> bool:
+        """Deletes order record using synchronous SQL delete statement."""
+        session = SyncFulfillmentService.get_session()
+        tbl = Table("fulfillment_orders")
+        stmt = delete(tbl).where(tbl["tracking_sn"] == tracking_sn)
+        affected = session.execute(stmt)
+        return affected > 0
+
+    @staticmethod
+    def write_direct_to_buffer(order: FulfillmentRequest) -> ByteBuffer:
+        """High-throughput serialization directly into zero-alloc ByteBuffer stream."""
+        buf = ByteBuffer(1024)
+        order.write_to_buffer(buf)
+        return buf
+
+    @staticmethod
+    def audit_snapshot_dict(order: FulfillmentRequest) -> Dict[str, str]:
+        """Exports flat dictionary for audit logging / multi-source compliance."""
+        return order.to_dict()

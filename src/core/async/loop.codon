@@ -1,10 +1,11 @@
 import time
-from typing import Optional
+from typing import Optional, Tuple
 import asyncio
 from asyncio import (
     EventLoop as BaseEventLoop,
     Future,
     Task,
+    gather,
     get_event_loop as get_base_loop,
     set_event_loop as set_base_loop,
     _EnterLoop
@@ -31,12 +32,18 @@ class FdCallback:
 class FdHandler:
     read_cb: Optional[FdCallback]
     write_cb: Optional[FdCallback]
+    read_fut: Optional[Future[bool]]
+    write_fut: Optional[Future[bool]]
     events: u32
+    is_persistent: bool
 
-    def __init__(self):
+    def __init__(self, is_persistent: bool = False):
         self.read_cb = None
         self.write_cb = None
+        self.read_fut = None
+        self.write_fut = None
         self.events = u32(0)
+        self.is_persistent = is_persistent
 
 class EpollEventLoop:
     base_loop: BaseEventLoop
@@ -56,18 +63,134 @@ class EpollEventLoop:
         self.handlers = {}
         self.is_running = False
 
+    def has_handlers(self) -> bool:
+        """Check if any async I/O handlers are currently active."""
+        return len(self.handlers) > 0
+
     def has_fd_handler(self, fd: int) -> bool:
         """Check whether a given file descriptor is registered in the async I/O handlers."""
         return fd in self.handlers
 
-    def handle_fd_event(self, fd: int, ev_mask: u32) -> None:
-        """Dispatch ready I/O event to registered coroutine reader/writer callbacks."""
+    def register_persistent_fd(self, fd: int) -> None:
+        """Register a long-lived persistent fd in EPOLLET mode (e.g. database client sockets) to eliminate epoll_ctl thrashing."""
+        if fd not in self.handlers:
+            h = FdHandler(is_persistent=True)
+            h.events = u32(EPOLLIN | EPOLLET | EPOLLRDHUP)
+            self.handlers[fd] = h
+            self.epoll.add(i32(fd), h.events)
+        else:
+            h = self.handlers[fd]
+            h.is_persistent = True
+            h.events = u32(h.events | u32(EPOLLIN | EPOLLET | EPOLLRDHUP))
+            try:
+                self.epoll.modify(i32(fd), h.events)
+            except:
+                self.epoll.add(i32(fd), h.events)
+
+    def unregister_fd(self, fd: int) -> None:
+        """Explicitly unregister and clean up a persistent or active file descriptor from epoll."""
         if fd in self.handlers:
             h = self.handlers[fd]
-            if (ev_mask & u32(EPOLLOUT)) != u32(0) and h.write_cb is not None:
-                h.write_cb.run()
-            if (ev_mask & u32(EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != u32(0) and h.read_cb is not None:
-                h.read_cb.run()
+            h.read_fut = None
+            h.write_fut = None
+            try:
+                self.epoll.remove(i32(fd))
+            except:
+                pass
+            del self.handlers[fd]
+
+    def handle_fd_event(self, fd: int, ev_mask: u32) -> None:
+        """Dispatch ready I/O event to registered coroutine reader/writer callbacks or direct futures."""
+        if fd in self.handlers:
+            h = self.handlers[fd]
+            # Priority: writable first, then readable/error
+            if (ev_mask & u32(EPOLLOUT)) != u32(0):
+                if h.write_fut is not None:
+                    w_fut = h.write_fut
+                    h.write_fut = None
+                    w_fut.set_result(True)
+                if h.write_cb is not None:
+                    h.write_cb.run()
+            if (ev_mask & u32(EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != u32(0):
+                if h.read_fut is not None:
+                    r_fut = h.read_fut
+                    h.read_fut = None
+                    r_fut.set_result(True)
+                if h.read_cb is not None:
+                    h.read_cb.run()
+
+            # Clean up one-shot waiters once completed; KEEP persistent handlers in epoll tree!
+            if not h.is_persistent:
+                if h.read_fut is None and h.write_fut is None and h.read_cb is None and h.write_cb is None:
+                    try:
+                        self.epoll.remove(i32(fd))
+                    except:
+                        pass
+                    del self.handlers[fd]
+
+    def wait_readable(self, fd: int, fut: Future[bool]) -> None:
+        """Direct zero-overhead registration: resolve `fut` when `fd` becomes readable."""
+        if fd not in self.handlers:
+            h = FdHandler(is_persistent=False)
+            h.read_fut = fut
+            h.events = u32(EPOLLIN | EPOLLRDHUP)
+            self.handlers[fd] = h
+            self.epoll.add(i32(fd), h.events)
+        else:
+            h = self.handlers[fd]
+            h.read_fut = fut
+            if not h.is_persistent:
+                h.events = u32(h.events | u32(EPOLLIN | EPOLLRDHUP))
+                try:
+                    self.epoll.modify(i32(fd), h.events)
+                except:
+                    self.epoll.add(i32(fd), h.events)
+
+    def wait_writable(self, fd: int, fut: Future[bool]) -> None:
+        """Direct zero-overhead registration: resolve `fut` when `fd` becomes writable."""
+        if fd not in self.handlers:
+            h = FdHandler(is_persistent=False)
+            h.write_fut = fut
+            h.events = u32(EPOLLOUT)
+            self.handlers[fd] = h
+            self.epoll.add(i32(fd), h.events)
+        else:
+            h = self.handlers[fd]
+            h.write_fut = fut
+            h.events = u32(h.events | u32(EPOLLOUT))
+            try:
+                self.epoll.modify(i32(fd), h.events)
+            except:
+                self.epoll.add(i32(fd), h.events)
+
+
+    def cancel_wait(self, fd: int) -> None:
+        """Cancel active waiting future on file descriptor `fd` and unregister from epoll."""
+        if fd in self.handlers:
+            h = self.handlers[fd]
+            h.read_fut = None
+            h.write_fut = None
+            if not h.is_persistent:
+                if h.read_cb is None and h.write_cb is None:
+                    try:
+                        self.epoll.remove(i32(fd))
+                    except:
+                        pass
+                    del self.handlers[fd]
+                else:
+                    h.events = u32(0)
+                    if h.read_cb is not None:
+                        h.events = u32(h.events | u32(EPOLLIN | EPOLLRDHUP))
+                    if h.write_cb is not None:
+                        h.events = u32(h.events | u32(EPOLLOUT))
+                    if h.events == u32(0):
+                        try:
+                            self.epoll.remove(i32(fd))
+                        except:
+                            pass
+                        del self.handlers[fd]
+                    else:
+                        self.epoll.modify(i32(fd), h.events)
 
     def has_pending_tasks(self) -> bool:
         """Check whether there are ready coroutines waiting in the base loop work queue."""
@@ -144,15 +267,7 @@ class EpollEventLoop:
         n = len(events)
         for i in range(n):
             ev = events[i]
-            fd = int(ev.fd)
-            if fd in self.handlers:
-                h = self.handlers[fd]
-                ev_mask = ev.events
-                # Priority: writable first, then readable/error
-                if (ev_mask & u32(EPOLLOUT)) != u32(0) and h.write_cb is not None:
-                    h.write_cb.run()
-                if (ev_mask & u32(EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != u32(0) and h.read_cb is not None:
-                    h.read_cb.run()
+            self.handle_fd_event(int(ev.fd), ev.events)
         return n
 
     def call_later(self, delay: float, callback, *args):
@@ -238,3 +353,82 @@ def run(coro):
 def create_task(coro, name: Optional[str] = None):
     """Convenience shortcut to create an asynchronous task on the current loop."""
     return get_event_loop().create_task(coro, name=name)
+
+async def wait_for(coro, timeout_sec: float):
+    """
+    Wait for `coro` to complete with a deadline.
+    If timeout expires before completion, the underlying Task is cancelled
+    and an OSError/TimeoutError is raised.
+    """
+    loop = get_event_loop()
+    task = loop.create_task(coro)
+
+    timed_out = [False]
+    def on_timeout():
+        timed_out[0] = True
+        task.cancel()
+
+    timer = loop.call_later(timeout_sec, on_timeout)
+    try:
+        res = await task
+        timer.cancel()
+        return res
+    except:
+        timer.cancel()
+        if timed_out[0]:
+            raise OSError(f"Timeout: Operation exceeded {timeout_sec}s deadline")
+        raise
+
+async def gather2(coro1, coro2):
+    """
+    Run two coroutines concurrently and await their results into a typed tuple (res1, res2).
+    If either coroutine raises an exception, the sibling task is cancelled immediately.
+    """
+    loop = get_event_loop()
+    t1 = loop.create_task(coro1)
+    t2 = loop.create_task(coro2)
+
+    try:
+        r1 = await t1
+    except:
+        t2.cancel()
+        raise
+
+    try:
+        r2 = await t2
+    except:
+        raise
+
+    return (r1, r2)
+
+async def gather3(coro1, coro2, coro3):
+    """
+    Run three coroutines concurrently and await their results into a typed tuple (res1, res2, res3).
+    If any coroutine raises an exception, sibling tasks are cancelled immediately.
+    """
+    loop = get_event_loop()
+    t1 = loop.create_task(coro1)
+    t2 = loop.create_task(coro2)
+    t3 = loop.create_task(coro3)
+
+    try:
+        r1 = await t1
+    except:
+        t2.cancel()
+        t3.cancel()
+        raise
+
+    try:
+        r2 = await t2
+    except:
+        t3.cancel()
+        raise
+
+    try:
+        r3 = await t3
+    except:
+        raise
+
+    return (r1, r2, r3)
+
+

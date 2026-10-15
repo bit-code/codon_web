@@ -4,7 +4,7 @@ from src.os.socket import Socket
 from src.db.errors import (
     DatabaseError, InterfaceError, OperationalError, ProgrammingError
 )
-from src.db.types import FieldInfo, Row
+from src.db.types import FieldInfo, Row, infer_column_kind, COL_KIND_STR
 from src.db.drivers.mysql.constants import (
     COM_QUIT, COM_QUERY, COM_PING,
     PACKET_OK, PACKET_EOF, PACKET_ERR,
@@ -22,6 +22,7 @@ class MySQLCursor[Conn]:
     _row_idx: int
     _fields: List[FieldInfo]
     _field_names: List[str]
+    _field_kinds: List[int]
     _affected_rows: int
     _last_insert_id: int
 
@@ -31,6 +32,7 @@ class MySQLCursor[Conn]:
         self._row_idx = 0
         self._fields = List[FieldInfo]()
         self._field_names = List[str]()
+        self._field_kinds = List[int]()
         self._affected_rows = 0
         self._last_insert_id = 0
 
@@ -46,13 +48,18 @@ class MySQLCursor[Conn]:
 
     @property
     def description(self) -> List[FieldInfo]:
+        if len(self._fields) == 0 and len(self._field_names) > 0:
+            for i in range(len(self._field_names)):
+                kind = self._field_kinds[i] if i < len(self._field_kinds) else COL_KIND_STR
+                self._fields.append(FieldInfo(self._field_names[i], "", 0, 0, 0, kind))
         return self._fields
 
     def _reset(self) -> None:
-        self._rows.clear()
+        self._rows = List[Row]()
         self._row_idx = 0
-        self._fields.clear()
-        self._field_names.clear()
+        self._fields = List[FieldInfo]()
+        self._field_names = List[str]()
+        self._field_kinds = List[int]()
         self._affected_rows = 0
         self._last_insert_id = 0
 
@@ -101,12 +108,12 @@ class MySQLCursor[Conn]:
             if reader.is_err():
                 raise ProgrammingError("Error reading column definition: " + reader.get_err_message())
 
-            _catalog = reader.read_length_encoded_str()
-            _schema = reader.read_length_encoded_str()
-            table = reader.read_length_encoded_str()
-            _org_table = reader.read_length_encoded_str()
+            reader.skip_length_encoded_str() # catalog
+            reader.skip_length_encoded_str() # schema
+            reader.skip_length_encoded_str() # table
+            reader.skip_length_encoded_str() # org_table
             name = reader.read_length_encoded_str()
-            _org_name = reader.read_length_encoded_str()
+            reader.skip_length_encoded_str() # org_name
             _fixed_len = reader.read_length_encoded_int()
 
             _charset = reader.read_uint16()
@@ -115,11 +122,9 @@ class MySQLCursor[Conn]:
             flags = reader.read_uint16()
             decimals = reader.read_uint8()
 
-            col_name = name if name is not None else f"col_{i}"
-            tbl_name = table if table is not None else ""
-            field = FieldInfo(col_name, tbl_name, col_type, flags, decimals)
-            self._fields.append(field)
+            col_name = name if name is not None else "col_" + str(i)
             self._field_names.append(col_name)
+            self._field_kinds.append(infer_column_kind(col_type, flags))
 
         # Read EOF packet (or intermediate OK packet in MySQL 8.0 with CLIENT_DEPRECATE_EOF)
         if not reader.read_from_socket(sock_fd):
@@ -144,7 +149,7 @@ class MySQLCursor[Conn]:
                 val = reader.read_length_encoded_str()
                 row_values.append(val)
 
-            row = Row(list(self._field_names), row_values)
+            row = Row(self._field_names, row_values, self._field_kinds)
             self._rows.append(row)
 
         return len(self._rows)
@@ -159,7 +164,7 @@ class MySQLCursor[Conn]:
     def fetchall(self) -> List[Row]:
         if self._row_idx == 0:
             self._row_idx = len(self._rows)
-            return self._rows
+            return list(self._rows)
         res = List[Row]()
         while self._row_idx < len(self._rows):
             res.append(self._rows[self._row_idx])
@@ -328,6 +333,40 @@ class MySQLConnection:
             msg = self.reader.get_err_message()
             self.close()
             raise OperationalError(f"Authentication failed [{code}]: {msg}")
+
+        # Check for AuthSwitchRequest (0xFE)
+        if self.reader.length > 0 and int(self.reader.data[0]) == 0xfe:
+            self.reader.offset = 1
+            new_plugin = self.reader.read_null_terminated_str()
+            new_salt = List[byte]()
+            while self.reader.has_more():
+                b = self.reader.read_uint8()
+                if b == 0:
+                    break
+                new_salt.append(byte(b))
+
+            new_auth = List[byte]()
+            if new_plugin == "mysql_native_password":
+                new_auth = scramble_native_password(self.password, new_salt)
+            elif new_plugin == "caching_sha2_password":
+                new_auth = scramble_caching_sha2(self.password, new_salt)
+
+            self.writer.reset()
+            self.writer.write_bytes(new_auth)
+            # AuthSwitchResponse seq_id is 3
+            if not self.writer.send_to_socket(self.sock.fd, 3):
+                self.close()
+                raise OperationalError("Failed to send AuthSwitchResponse")
+
+            if not self.reader.read_from_socket(self.sock.fd):
+                self.close()
+                raise OperationalError("Lost connection reading AuthSwitch reply")
+
+            if self.reader.is_err():
+                code = self.reader.get_err_code()
+                msg = self.reader.get_err_message()
+                self.close()
+                raise OperationalError(f"AuthSwitch failed [{code}]: {msg}")
 
         # Check for fast auth response (0x01 0x03) in caching_sha2_password
         if self.reader.length >= 2 and int(self.reader.data[0]) == 0x01:

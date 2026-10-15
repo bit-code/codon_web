@@ -12,6 +12,8 @@ class BackgroundTasks:
         self.tasks.append(task)
 
     def run_all(self) -> None:
+        if len(self.tasks) == 0:
+            return
         for i in range(len(self.tasks)):
             try:
                 task = self.tasks[i]

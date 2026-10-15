@@ -1,0 +1,70 @@
+import time
+from src.db.types import Row, FieldInfo, COL_KIND_INT, COL_KIND_STR, COL_KIND_FLOAT, COL_KIND_BOOL
+from src.memory.buffer import ByteBuffer
+from src.http.fast_json import FastJsonStream
+
+def main():
+    names = ["id", "user_name", "age", "gender", "email", "address", "created_at", "is_active", "salary", "department"]
+    values = [
+        "1022578",
+        "user_bc111cd6",
+        "40",
+        "F",
+        "bc111cdd@example.com",
+        "196 Main St",
+        "2023-07-31 00:00:00",
+        "1",
+        "4647.41",
+        "Marketing"
+    ]
+    fields = [
+        FieldInfo("id", "", 3, 0, 0, COL_KIND_INT),
+        FieldInfo("user_name", "", 253, 0, 0, COL_KIND_STR),
+        FieldInfo("age", "", 1, 0, 0, COL_KIND_INT),
+        FieldInfo("gender", "", 254, 0, 0, COL_KIND_STR),
+        FieldInfo("email", "", 253, 0, 0, COL_KIND_STR),
+        FieldInfo("address", "", 253, 0, 0, COL_KIND_STR),
+        FieldInfo("created_at", "", 12, 0, 0, COL_KIND_STR),
+        FieldInfo("is_active", "", 1, 0, 0, COL_KIND_BOOL),
+        FieldInfo("salary", "", 246, 0, 0, COL_KIND_FLOAT),
+        FieldInfo("department", "", 253, 0, 0, COL_KIND_STR),
+    ]
+
+    row = Row(names, values, fields)
+    dest = ByteBuffer(65536)
+
+    iters = 1_000_000
+
+    # Warmup
+    for _ in range(1000):
+        d = row.to_dict()
+        dest.reset()
+        FastJsonStream.write_dict(dest, d)
+        dest.reset()
+        row.write_json_direct(dest)
+
+    # 1. Benchmark db-real-fast: row.to_dict() + FastJsonStream.write_dict()
+    t0 = time.time()
+    for _ in range(iters):
+        d = row.to_dict()
+        dest.reset()
+        FastJsonStream.write_dict(dest, d)
+    t1 = time.time()
+    fast_cost = t1 - t0
+
+    # 2. Benchmark db-real-zerocopy: row.write_json_direct()
+    t0 = time.time()
+    for _ in range(iters):
+        dest.reset()
+        row.write_json_direct(dest)
+    t1 = time.time()
+    zerocopy_cost = t1 - t0
+
+    print("=== 1,000,000 Iterations Benchmark (10 Columns Mass Data) ===")
+    print("db-real-fast (to_dict + yyjson stream):   time =", round(fast_cost, 4), "s, ops/sec =", int(iters / fast_cost))
+    print("db-real-zerocopy (Schema-Aware direct):  time =", round(zerocopy_cost, 4), "s, ops/sec =", int(iters / zerocopy_cost))
+    ratio = (fast_cost - zerocopy_cost) / fast_cost * 100.0
+    speedup = fast_cost / zerocopy_cost
+    print("Zero-Copy CPU Overhead Reduction:", round(ratio, 2), "% (Speedup:", round(speedup, 2), "x)")
+
+main()

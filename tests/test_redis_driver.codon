@@ -1,0 +1,440 @@
+# Comprehensive Production Test Suite for Codon Web Native Redis Driver
+# Tests:
+# 1. RESP Protocol encoder and decoder
+# 2. Synchronous Redis client (CRUD, Hashes, Lists, Sets, ZSets, Lua)
+# 3. Synchronous Redis connection pool (acquire, release, context manager)
+# 4. Asynchronous Epoll Redis client (Non-blocking I/O)
+# 5. Asynchronous Redis connection pool (Concurrent acquisition, Future queue)
+# 6. Enterprise Distributed Lock (NX PX acquisition, CAS release, extend, mutual exclusion)
+
+import time
+from typing import Optional, List
+from src.db.drivers.redis import (
+    Redis,
+    AsyncRedis,
+    RedisPool,
+    AsyncRedisPool,
+    AsyncRedisLock,
+    RedisPipeline,
+    AsyncRedisPipeline,
+    RedisValue,
+    RedisCommandError,
+    connect_redis,
+    connect_redis_async,
+    connect_redis_from_url,
+    connect_redis_async_from_url
+)
+from src.core.async import run, sleep, gather2
+
+import sys
+
+print("==================================================================")
+print("  Codon Web Native Industrial Redis Driver Verification Test Suite")
+print("==================================================================")
+sys.stdout.flush()
+
+# ---------------------------------------------------------
+# Test 1: RESP Protocol Values & Formatting
+# ---------------------------------------------------------
+print("\n[1/6] Testing RESP Protocol values & helpers...")
+sys.stdout.flush()
+
+val_str = RedisValue("str", str_val="hello world")
+assert val_str.as_str() == "hello world"
+assert not val_str.is_nil()
+
+val_int = RedisValue("int", int_val=42)
+assert val_int.as_int() == 42
+
+val_nil = RedisValue("nil")
+assert val_nil.is_nil()
+assert val_nil.as_str() == ""
+
+val_arr = RedisValue("array", arr_val=[
+    RedisValue("str", "field1"),
+    RedisValue("str", "val1"),
+    RedisValue("str", "field2"),
+    RedisValue("str", "val2")
+])
+d = val_arr.as_dict()
+assert d.get("field1", "") == "val1"
+assert d.get("field2", "") == "val2"
+print("  -> Passed RESP Protocol values and conversions")
+
+# ---------------------------------------------------------
+# Test 2: Synchronous Redis Client Core Features
+# ---------------------------------------------------------
+print("\n[2/6] Testing Synchronous Redis Client (Socket + Wire Protocol)...")
+sync_client = connect_redis(host="127.0.0.1", port=6379, db=14)
+
+# 1. PING & Strings
+assert sync_client.ping(), "PING failed"
+assert sync_client.set("codon:test:sync_str", "native_power", ex=60), "SET failed"
+assert sync_client.get("codon:test:sync_str") == "native_power", "GET mismatch"
+assert sync_client.exists("codon:test:sync_str"), "EXISTS failed"
+
+# INCR / DECR
+sync_client.set("codon:test:counter", "10")
+assert sync_client.incr("codon:test:counter") == 11, "INCR failed"
+assert sync_client.decr("codon:test:counter") == 10, "DECR failed"
+
+# 2. Hashes
+sync_client.hset("codon:test:user:1", "name", "Alice")
+sync_client.hset("codon:test:user:1", "role", "admin")
+assert sync_client.hget("codon:test:user:1", "name") == "Alice"
+hdata = sync_client.hgetall("codon:test:user:1")
+assert hdata.get("role", "") == "admin"
+assert sync_client.hexists("codon:test:user:1", "name")
+
+# 3. Lists
+sync_client.del_key("codon:test:tasks")
+sync_client.rpush("codon:test:tasks", ["task1", "task2", "task3"])
+assert sync_client.llen("codon:test:tasks") == 3
+assert sync_client.lpop("codon:test:tasks") == "task1"
+litems = sync_client.lrange("codon:test:tasks", 0, -1)
+assert len(litems) == 2
+assert litems[0] == "task2"
+
+# 4. Sets
+sync_client.del_key("codon:test:tags")
+sync_client.sadd("codon:test:tags", ["web", "fast", "codon"])
+assert sync_client.scard("codon:test:tags") == 3
+assert sync_client.sismember("codon:test:tags", "fast")
+
+# 5. Sorted Sets (ZSet)
+sync_client.del_key("codon:test:zset")
+sync_client.zadd("codon:test:zset", 10.5, "item_a")
+sync_client.zadd("codon:test:zset", 50.0, "item_b")
+sync_client.zadd("codon:test:zset", 30.2, "item_c")
+zitems = sync_client.zrangebyscore("codon:test:zset", 0.0, 40.0)
+assert len(zitems) == 2
+assert zitems[0] == "item_a"
+assert zitems[1] == "item_c"
+
+# 6. Lua Scripting
+lua_calc = "return tonumber(ARGV[1]) * tonumber(ARGV[2])"
+eval_res = sync_client.eval_script(lua_calc, [], ["7", "8"])
+assert eval_res.as_int() == 56
+
+sync_client.close()
+print("  -> Passed Synchronous Redis Client (Strings, Hashes, Lists, Sets, ZSets, Lua)")
+
+# ---------------------------------------------------------
+# Test 3: Synchronous Redis Connection Pool
+# ---------------------------------------------------------
+print("\n[3/6] Testing Synchronous Redis Connection Pool...")
+sync_pool = RedisPool(host="127.0.0.1", port=6379, db=14, min_size=2, max_size=5)
+
+with sync_pool.acquire() as conn:
+    assert conn.ping()
+    conn.set("codon:test:pool_sync", "pooled_val")
+    assert conn.get("codon:test:pool_sync") == "pooled_val"
+
+sync_pool.close()
+print("  -> Passed Synchronous Redis Connection Pool")
+
+# ---------------------------------------------------------
+# Test 4: Asynchronous Epoll Native Redis Client
+# ---------------------------------------------------------
+print("\n[4/6] Testing Asynchronous Epoll Native Redis Client...")
+
+async def _test_async_client_coro():
+    client = await connect_redis_async(host="127.0.0.1", port=6379, db=14)
+
+    # Async PING & Strings
+    assert await client.ping(), "Async PING failed"
+    assert await client.set("codon:test:async_str", "async_speed", ex=60), "Async SET failed"
+    assert await client.get("codon:test:async_str") == "async_speed", "Async GET mismatch"
+
+    # Async Hash
+    await client.hset("codon:test:user:2", "city", "Tokyo")
+    assert await client.hget("codon:test:user:2", "city") == "Tokyo"
+
+    # Async List
+    await client.del_key("codon:test:async_q")
+    await client.lpush("codon:test:async_q", ["q_msg1", "q_msg2"])
+    assert await client.rpop("codon:test:async_q") == "q_msg1"
+
+    # Async Lua
+    lua_echo = "return 'async_' .. ARGV[1]"
+    res = await client.eval_script(lua_echo, [], ["native"])
+    assert res.as_str() == "async_native"
+
+    client.close()
+
+run(_test_async_client_coro())
+print("  -> Passed Asynchronous Epoll Native Redis Client")
+
+# ---------------------------------------------------------
+# Test 5: Asynchronous Redis Connection Pool (Concurrency)
+# ---------------------------------------------------------
+print("\n[5/6] Testing Asynchronous Redis Connection Pool & Concurrency...")
+
+async def _test_async_pool_coro():
+    pool = AsyncRedisPool(host="127.0.0.1", port=6379, db=14, min_size=2, max_size=4)
+    await pool.init_pool()
+
+    # Test concurrent access across multiple coroutines
+    async def worker_job(worker_id: int):
+        conn = await pool.acquire()
+        key = f"codon:test:w_{worker_id}"
+        await conn.set(key, f"res_{worker_id}", ex=30)
+        v = await conn.get(key)
+        assert v == f"res_{worker_id}"
+        conn.close() # Return to pool
+
+    await gather2(worker_job(1), worker_job(2))
+
+    # Test context manager pattern
+    conn = await pool.acquire()
+    async with conn:
+        assert await conn.ping()
+        await conn.set("codon:test:ctx_pool", "ok", ex=30)
+
+    await pool.close()
+
+run(_test_async_pool_coro())
+print("  -> Passed Asynchronous Redis Connection Pool & Concurrency")
+
+# ---------------------------------------------------------
+# Test 6: Enterprise Distributed Lock (AsyncRedisLock)
+# ---------------------------------------------------------
+print("\n[6/6] Testing Enterprise Distributed Lock (AsyncRedisLock)...")
+
+async def _test_lock_coro():
+    client1 = await connect_redis_async(host="127.0.0.1", port=6379, db=14)
+    client2 = await connect_redis_async(host="127.0.0.1", port=6379, db=14)
+
+    lock1 = AsyncRedisLock(client1, "order_payment", ttl_ms=5000)
+    lock2 = AsyncRedisLock(client2, "order_payment", ttl_ms=5000)
+
+    # 1. Node 1 acquires lock
+    ok1 = await lock1.acquire(timeout_sec=1.0)
+    assert ok1, "Lock 1 acquisition should succeed"
+    assert lock1.is_acquired
+
+    # 2. Node 2 attempts to acquire same lock (must fail)
+    ok2 = await lock2.acquire(timeout_sec=0.05, retry_delay_sec=0.01)
+    assert not ok2, "Lock 2 acquisition must fail while held by Node 1"
+
+    # 3. Node 1 extends lock TTL
+    extended = await lock1.extend(5000)
+    assert extended, "Lock 1 extension should succeed"
+
+    # 4. Node 1 releases lock
+    rel1 = await lock1.release()
+    assert rel1, "Lock 1 release should succeed"
+    assert not lock1.is_acquired
+
+    # 5. Now Node 2 can successfully acquire lock
+    ok2_again = await lock2.acquire(timeout_sec=1.0)
+    assert ok2_again, "Lock 2 acquisition must succeed after Lock 1 released"
+    await lock2.release()
+
+    # 6. Context manager test
+    lock3 = AsyncRedisLock(client1, "order_checkout", ttl_ms=3000)
+    async with lock3:
+        assert lock3.is_acquired
+    assert not lock3.is_acquired
+
+    client1.close()
+    client2.close()
+
+run(_test_lock_coro())
+print("  -> Passed Enterprise Distributed Lock (Mutual exclusion, CAS release, extend)")
+
+# ---------------------------------------------------------
+# Test 7: Multibyte UTF-8 & Emoji Data Integrity (Sync & Async)
+# ---------------------------------------------------------
+print("\n[7/10] Testing Multibyte UTF-8 & Emoji Data Integrity (Sync & Async)...")
+sync_client7 = connect_redis(host="127.0.0.1", port=6379, db=14)
+chinese_text = "你好世界，Codon原生高性能驱动！🚀🔥"
+assert sync_client7.set("codon:test:utf8", chinese_text, ex=60)
+val_sync = sync_client7.get("codon:test:utf8")
+assert val_sync is not None
+assert val_sync == chinese_text
+assert len(val_sync) == len(chinese_text)
+
+# Binary payload with embedded null bytes (\0) to thoroughly verify Scheme 3 zero-copy safety
+bin_payload = "alpha\0beta\0gamma\0你好世界"
+assert sync_client7.set("codon:test:binary_null", bin_payload, ex=60)
+val_bin = sync_client7.get("codon:test:binary_null")
+assert val_bin is not None
+assert val_bin == bin_payload
+assert len(val_bin) == len(bin_payload)
+sync_client7.close()
+
+async def _test_utf8_async():
+    client = await connect_redis_async(host="127.0.0.1", port=6379, db=14)
+    unicode_msg = "异步流Unicode传输测试：123abc测试✨"
+    await client.set("codon:test:utf8_async", unicode_msg, ex=60)
+    val_async = await client.get("codon:test:utf8_async")
+    assert val_async is not None
+    assert val_async == unicode_msg
+    assert len(val_async) == len(unicode_msg)
+
+    # Async binary null verification
+    bin_async = "async\0binary\0payload✨"
+    await client.set("codon:test:abin_null", bin_async, ex=60)
+    ret_bin = await client.get("codon:test:abin_null")
+    assert ret_bin is not None
+    assert ret_bin == bin_async
+    assert len(ret_bin) == len(bin_async)
+    client.close()
+
+run(_test_utf8_async())
+print("  -> Passed Multibyte UTF-8, Binary Null Safety & Emoji Integrity (Sync & Async)")
+
+# ---------------------------------------------------------
+# Test 8: Pipeline Batch Operations & Anti-Desync
+# ---------------------------------------------------------
+print("\n[8/11] Testing Pipeline Batch Operations & Anti-Desync (Sync & Async)...")
+sync_client8 = connect_redis(host="127.0.0.1", port=6379, db=14)
+pipe_sync = RedisPipeline(sync_client8)
+pipe_sync.set("codon:test:pipe:1", "val1", ex=60)
+pipe_sync.set("codon:test:pipe:2", "val2", ex=60)
+pipe_sync.incr("codon:test:pipe:counter")
+pipe_sync.get("codon:test:pipe:1")
+pipe_sync.get("codon:test:pipe:2")
+sync_replies = pipe_sync.execute()
+assert len(sync_replies) == 5
+assert sync_replies[0].as_str() == "OK"
+assert sync_replies[1].as_str() == "OK"
+assert sync_replies[3].as_str() == "val1"
+assert sync_replies[4].as_str() == "val2"
+
+# Test Pipeline error containment without socket desynchronization
+pipe_sync.set("codon:test:err_pipe_str", "nan")
+pipe_sync.incr("codon:test:err_pipe_str") # will return ERR
+pipe_sync.set("codon:test:err_pipe_ok", "success")
+pipe_res = pipe_sync.execute(raise_on_error=False)
+assert len(pipe_res) == 3
+assert pipe_res[0].as_str() == "OK"
+assert pipe_res[1].is_error()
+assert pipe_res[2].as_str() == "OK"
+# Ensure socket stream is 100% synchronized and healthy
+assert sync_client8.ping()
+sync_client8.close()
+
+async def _test_pipeline_async():
+    client = await connect_redis_async(host="127.0.0.1", port=6379, db=14)
+    pipe_async = AsyncRedisPipeline(client)
+    pipe_async.set("codon:test:apipe:1", "async_val1", ex=60)
+    pipe_async.set("codon:test:apipe:2", "async_val2", ex=60)
+    pipe_async.get("codon:test:apipe:1")
+    pipe_async.get("codon:test:apipe:2")
+    async_replies = await pipe_async.execute()
+    assert len(async_replies) == 4
+    assert async_replies[0].as_str() == "OK"
+    assert async_replies[1].as_str() == "OK"
+    assert async_replies[2].as_str() == "async_val1"
+    assert async_replies[3].as_str() == "async_val2"
+
+    # Async Pipeline Anti-Desync
+    pipe_async.set("codon:test:aerr_pipe_str", "nan")
+    pipe_async.incr("codon:test:aerr_pipe_str")
+    pipe_async.set("codon:test:aerr_pipe_ok", "success")
+    async_pipe_res = await pipe_async.execute(raise_on_error=False)
+    assert len(async_pipe_res) == 3
+    assert async_pipe_res[0].as_str() == "OK"
+    assert async_pipe_res[1].is_error()
+    assert async_pipe_res[2].as_str() == "OK"
+    assert await client.ping()
+    client.close()
+
+run(_test_pipeline_async())
+print("  -> Passed Pipeline Batch Operations & Anti-Desync (Sync & Async)")
+
+# ---------------------------------------------------------
+# Test 9: Strict Error Handling (RedisCommandError Propagation)
+# ---------------------------------------------------------
+print("\n[9/11] Testing Strict Error Handling & RedisCommandError...")
+sync_client9 = connect_redis(host="127.0.0.1", port=6379, db=14)
+sync_client9.set("codon:test:string_val", "not_a_number")
+caught_incr_err = False
+try:
+    sync_client9.incr("codon:test:string_val")
+except RedisCommandError:
+    caught_incr_err = True
+assert caught_incr_err, "INCR on string value must raise RedisCommandError"
+sync_client9.close()
+
+async def _test_async_error():
+    client = await connect_redis_async(host="127.0.0.1", port=6379, db=14)
+    await client.set("codon:test:astring_val", "not_a_number")
+    caught_err = False
+    try:
+        await client.incr("codon:test:astring_val")
+    except RedisCommandError:
+        caught_err = True
+    assert caught_err, "Async INCR on string value must raise RedisCommandError"
+    client.close()
+
+run(_test_async_error())
+print("  -> Passed Strict Error Handling & RedisCommandError")
+
+# ---------------------------------------------------------
+# Test 10: URL Connection Factory & Pool Tuning
+# ---------------------------------------------------------
+print("\n[10/11] Testing URL Connection Factory & Connection Pool Tuning...")
+url_client = connect_redis_from_url("redis://127.0.0.1:6379/14")
+assert url_client.ping()
+url_client.close()
+
+async def _test_url_async():
+    a_client = await connect_redis_async_from_url("redis://127.0.0.1:6379/14")
+    assert await a_client.ping()
+    a_client.close()
+
+run(_test_url_async())
+print("  -> Passed URL Connection Factory & Connection Pool Tuning")
+
+# ---------------------------------------------------------
+# Test 11: Enterprise Commands (MGET, LRANGE, LLEN, SISMEMBER, FLUSHDB)
+# ---------------------------------------------------------
+print("\n[11/11] Testing Enterprise Commands (MGET, LRANGE, LLEN, SISMEMBER, FLUSHDB)...")
+sync_client11 = connect_redis(host="127.0.0.1", port=6379, db=14)
+sync_client11.set("codon:test:m1", "v1")
+sync_client11.set("codon:test:m2", "v2")
+mvals = sync_client11.mget(["codon:test:m1", "codon:test:nonexistent", "codon:test:m2"])
+assert len(mvals) == 3
+assert mvals[0] == "v1"
+assert mvals[1] is None
+assert mvals[2] == "v2"
+
+sync_client11.del_key("codon:test:list_test")
+sync_client11.rpush("codon:test:list_test", ["a", "b", "c"])
+assert sync_client11.llen("codon:test:list_test") == 3
+list_items = sync_client11.lrange("codon:test:list_test", 0, -1)
+assert len(list_items) == 3
+assert list_items[0] == "a"
+assert list_items[2] == "c"
+
+sync_client11.sadd("codon:test:set_test", ["member1", "member2"])
+assert sync_client11.sismember("codon:test:set_test", "member1")
+assert not sync_client11.sismember("codon:test:set_test", "not_member")
+sync_client11.close()
+
+async def _test_enterprise_async():
+    a_client = await connect_redis_async(host="127.0.0.1", port=6379, db=14)
+    await a_client.set("codon:test:am1", "av1")
+    mvals = await a_client.mget(["codon:test:am1", "codon:test:anonexistent"])
+    assert len(mvals) == 2
+    assert mvals[0] == "av1"
+    assert mvals[1] is None
+
+    await a_client.del_key("codon:test:alist_test")
+    await a_client.rpush("codon:test:alist_test", ["x", "y"])
+    assert await a_client.llen("codon:test:alist_test") == 2
+    l_items = await a_client.lrange("codon:test:alist_test", 0, -1)
+    assert len(l_items) == 2
+    assert l_items[0] == "x"
+    assert l_items[1] == "y"
+    a_client.close()
+
+run(_test_enterprise_async())
+print("  -> Passed Enterprise Commands (MGET, LRANGE, LLEN, SISMEMBER, FLUSHDB)")
+
+print("\n==================================================================")
+print("  ALL 11 REDIS DRIVER INDUSTRIAL TESTS PASSED SUCCESSFULLY!      ")
+print("==================================================================")

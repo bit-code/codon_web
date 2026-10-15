@@ -1,0 +1,86 @@
+# Task Registry and Decorators for Codon TaskQ
+# Static function pointer routing with zero-cost dispatch
+
+from typing import Callable, Optional
+
+# Task handler function signature: payload JSON string -> result JSON string
+TaskHandler = Callable[[str], str]
+
+class TaskDefinition:
+    name: str
+    handler: TaskHandler
+    default_queue: str
+    max_retries: int
+    timeout_ms: int
+
+    def __init__(
+        self,
+        name: str,
+        handler: TaskHandler,
+        default_queue: str = "default",
+        max_retries: int = 3,
+        timeout_ms: int = 0
+    ):
+        self.name = name
+        self.handler = handler
+        self.default_queue = default_queue
+        self.max_retries = max_retries
+        self.timeout_ms = timeout_ms
+
+
+class TaskRegistry:
+    tasks: dict[str, TaskDefinition]
+
+    def __init__(self):
+        self.tasks = {}
+
+    def register(
+        self,
+        name: str,
+        handler: TaskHandler,
+        default_queue: str = "default",
+        max_retries: int = 3,
+        timeout_ms: int = 0
+    ) -> None:
+        if name in self.tasks:
+            raise ValueError(f"Task '{name}' is already registered in registry")
+        self.tasks[name] = TaskDefinition(
+            name=name,
+            handler=handler,
+            default_queue=default_queue,
+            max_retries=max_retries,
+            timeout_ms=timeout_ms
+        )
+
+    def get(self, name: str) -> Optional[TaskDefinition]:
+        if name in self.tasks:
+            return self.tasks[name]
+        ret: Optional[TaskDefinition] = None
+        return ret
+
+    def has(self, name: str) -> bool:
+        return name in self.tasks
+
+    def count(self) -> int:
+        return len(self.tasks)
+
+
+# Global registry singleton
+GLOBAL_TASK_REGISTRY: TaskRegistry = TaskRegistry()
+
+def task(
+    name: str,
+    queue: str = "default",
+    max_retries: int = 3,
+    timeout_ms: int = 0
+):
+    def decorator(fn: TaskHandler) -> TaskHandler:
+        GLOBAL_TASK_REGISTRY.register(
+            name=name,
+            handler=fn,
+            default_queue=queue,
+            max_retries=max_retries,
+            timeout_ms=timeout_ms
+        )
+        return fn
+    return decorator

@@ -2,9 +2,11 @@ from src.http.request import Request
 from src.http.response import Response
 from src.http.method import HttpMethod
 from src.framework.route import RouteHandler
+from src.memory.slice import ByteSlice
 
 class RouteNode:
     segment: str
+    segment_slice: ByteSlice
     is_param: bool
     param_name: str
     param_type: str # "int", "str"
@@ -14,12 +16,23 @@ class RouteNode:
 
     def __init__(self, segment: str = ""):
         self.segment = segment
+        if len(segment) > 0:
+            self.segment_slice = ByteSlice(self.segment.c_str().as_byte(), len(self.segment))
+        else:
+            self.segment_slice = ByteSlice(Ptr[byte](0), 0)
         self.is_param = False
         self.param_name = ""
         self.param_type = "str"
         self.is_wildcard = False
         self.handlers = {}
         self.children = []
+
+    def find_static_child_slice(self, seg: ByteSlice) -> Optional[RouteNode]:
+        for i in range(len(self.children)):
+            c = self.children[i]
+            if not c.is_param and not c.is_wildcard and c.segment_slice.equals_slice(seg):
+                return c
+        return None
 
     def find_static_child(self, seg: str) -> Optional[RouteNode]:
         for i in range(len(self.children)):
@@ -46,11 +59,26 @@ class RadixRouter:
     root: RouteNode
     not_found_handler: Optional[RouteHandler]
     method_not_allowed_handler: Optional[RouteHandler]
+    static_routes: dict[Tuple[i32, str], RouteHandler]
+    static_routes_bs: dict[Tuple[i32, ByteSlice], RouteHandler]
+    static_route_strings: list[str]
+    has_static_routes: bool
 
     def __init__(self):
         self.root = RouteNode("")
         self.not_found_handler = None
         self.method_not_allowed_handler = None
+        self.static_routes = {}
+        self.static_routes_bs = {}
+        self.static_route_strings = []
+        self.has_static_routes = False
+
+    def _is_static_path(self, path: str) -> bool:
+        for i in range(len(path)):
+            c = path[i]
+            if c == '{' or c == '*':
+                return False
+        return True
 
     def _split_path(self, path: str) -> list[str]:
         res: list[str] = []
@@ -71,6 +99,18 @@ class RadixRouter:
         return res
 
     def add_route(self, method: i32, path: str, handler: RouteHandler) -> None:
+        if self._is_static_path(path):
+            norm_path = path
+            if not norm_path.startswith("/"):
+                norm_path = "/" + norm_path
+            if len(norm_path) > 1 and norm_path.endswith("/"):
+                norm_path = norm_path[:-1]
+            self.static_routes[(method, norm_path)] = handler
+            self.static_route_strings.append(norm_path)
+            bs_key = ByteSlice(norm_path.c_str().as_byte(), len(norm_path))
+            self.static_routes_bs[(method, bs_key)] = handler
+            self.has_static_routes = True
+
         segments = self._split_path(path)
         curr = self.root
 
@@ -141,15 +181,46 @@ class RadixRouter:
         return Response.text("Method Not Allowed", 405)
 
     def dispatch(self, req: Request) -> Response:
-        path_str = req.path_str()
-        segments = self._split_path(path_str)
-        curr = self.root
-        matched_params: dict[str, str] = {}
+        # 1. Zero-copy Fast-path for static routes: 0 path string allocation, 0 tree walk
+        if self.has_static_routes:
+            p = req.path
+            # Strip trailing slash without allocations if len > 1
+            if p.len > 1 and p.ptr[p.len - 1] == byte(47): # '/'
+                p = ByteSlice(p.ptr, p.len - 1)
+            bs_key = (req.method, p)
+            if bs_key in self.static_routes_bs:
+                if len(req.path_params) > 0:
+                    req.path_params.clear()
+                if len(req.fast_params) > 0:
+                    req.fast_params.clear()
+                return self.static_routes_bs[bs_key].handle(req)
 
-        for i in range(len(segments)):
-            seg = segments[i]
+        # 2. General dynamic route matching (100% Zero-Allocation & Zero-Copy Sliding Window)
+        if len(req.fast_params) > 0:
+            req.fast_params.clear()
+        if len(req.path_params) > 0:
+            req.path_params.clear()
+
+        p = req.path
+        plen = p.len
+        pptr = p.ptr
+        idx = 0
+        curr = self.root
+
+        while idx < plen:
+            # Skip slashes
+            while idx < plen and pptr[idx] == byte(47): # '/'
+                idx += 1
+            if idx >= plen:
+                break
+            start = idx
+            while idx < plen and pptr[idx] != byte(47):
+                idx += 1
+            seg_len = idx - start
+            seg_slice = ByteSlice(pptr + start, seg_len)
+
             # 1. Static match
-            static_child = curr.find_static_child(seg)
+            static_child = curr.find_static_child_slice(seg_slice)
             if static_child is not None:
                 curr = static_child
                 continue
@@ -158,20 +229,19 @@ class RadixRouter:
             param_child = curr.find_param_child()
             if param_child is not None:
                 if param_child.param_type == "int":
-                    if not self._is_numeric(seg):
+                    ok, _ = seg_slice.parse_int()
+                    if not ok:
                         return Response.text("Invalid path parameter type", 400)
-                matched_params[param_child.param_name] = seg
+                req.fast_params.append((param_child.param_name, seg_slice))
                 curr = param_child
                 continue
 
             # 3. Wildcard match
             wc_child = curr.find_wildcard_child()
             if wc_child is not None:
-                # Store all remaining segments
-                remaining: list[str] = []
-                for k in range(i, len(segments)):
-                    remaining.append(segments[k])
-                matched_params["*"] = "/".join(remaining)
+                # Capture all remaining path characters as a raw slice
+                wc_slice = ByteSlice(pptr + start, plen - start)
+                req.fast_params.append(("*", wc_slice))
                 curr = wc_child
                 break
 
@@ -179,7 +249,6 @@ class RadixRouter:
 
         # Check method handler
         if req.method in curr.handlers:
-            req.path_params = matched_params
             h = curr.handlers[req.method]
             return h.handle(req)
 

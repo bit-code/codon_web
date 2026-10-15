@@ -1,0 +1,230 @@
+# Comprehensive Verification Test Suite for TaskQ
+# Verifies Celery-grade distributed background task features:
+# 1. JSON Protocol serialization & escaping
+# 2. Asynchronous task execution & AsyncResult.get()
+# 3. Automatic retry with exponential backoff
+# 4. Dead-Letter Queue (DLQ) upon retry exhaustion
+# 5. Scheduled delayed execution (ETA)
+# 6. Multi-queue prioritization
+# 7. Unregistered task protection
+
+import time
+from src.taskq import (
+    TaskMessage,
+    TaskResult,
+    TaskStatus,
+    MemoryBroker,
+    TaskRegistry,
+    TaskClient,
+    Worker,
+    WorkerConfig
+)
+
+print("=== Starting Test Suite: Codon TaskQ (Distributed Task Queue) ===")
+
+# ----------------- Test 1: Protocol Serialization & Special Characters -----------------
+print("\n--- Test 1: Protocol Serialization & Special Characters ---")
+original_payload = '{"message": "Hello \\"world\\"\\nNew line\\tTab", "id": 1001}'
+msg = TaskMessage(
+    task_id="tq_test_1",
+    task_name="test:serialize",
+    payload=original_payload,
+    queue="priority",
+    retry_count=1,
+    max_retries=5,
+    timeout_ms=3000,
+    eta=1720000000,
+    created_at=1710000000
+)
+msg_json = msg.to_json()
+restored_msg = TaskMessage.from_json(msg_json)
+
+assert restored_msg.task_id == "tq_test_1", "task_id mismatch"
+assert restored_msg.task_name == "test:serialize", "task_name mismatch"
+assert restored_msg.payload == original_payload, f"payload mismatch: got {restored_msg.payload}"
+assert restored_msg.queue == "priority", "queue mismatch"
+assert restored_msg.retry_count == 1, "retry_count mismatch"
+assert restored_msg.max_retries == 5, "max_retries mismatch"
+assert restored_msg.timeout_ms == 3000, "timeout_ms mismatch"
+assert restored_msg.eta == 1720000000, "eta mismatch"
+assert restored_msg.created_at == 1710000000, "created_at mismatch"
+print(" Protocol serialization verified successfully")
+
+
+# ----------------- Test 2: Basic Task Dispatch & AsyncResult.get() -----------------
+print("\n--- Test 2: Basic Task Dispatch & AsyncResult.get() ---")
+broker = MemoryBroker()
+registry = TaskRegistry()
+
+def add_handler(payload: str) -> str:
+    # payload is e.g. "10,20"
+    parts = payload.split(",")
+    a = int(parts[0])
+    b = int(parts[1])
+    return str(a + b)
+
+registry.register("math:add", add_handler)
+
+client = TaskClient(broker=broker)
+worker = Worker(broker=broker, registry=registry)
+
+async_res = client.apply_async("math:add", "15,27")
+assert not async_res.is_ready(), "Task should be pending before worker execution"
+
+# Worker executes one step
+processed = worker.step()
+assert processed, "Worker should have processed 1 task"
+assert async_res.is_ready(), "Task should be ready after worker execution"
+
+res = async_res.get(timeout_sec=0.1)
+assert res is not None, "Result should not be None"
+assert res.status == TaskStatus.SUCCESS, f"Expected SUCCESS, got {res.status}"
+assert res.result == "42", f"Expected 42, got {res.result}"
+assert worker.stats.total_succeeded == 1, "Stats succeeded should be 1"
+print(" Basic task dispatch and AsyncResult retrieval verified (15 + 27 = 42)")
+
+
+# ----------------- Test 3: Retry Logic with Exponential Backoff -----------------
+print("\n--- Test 3: Retry Logic with Exponential Backoff ---")
+flaky_counter = [0]
+
+def flaky_handler(payload: str) -> str:
+    flaky_counter[0] += 1
+    if flaky_counter[0] < 3:
+        raise ValueError(f"Temporary database connection drop (attempt {flaky_counter[0]})")
+    return "recovered"
+
+registry.register("db:flaky_query", flaky_handler)
+
+flaky_res = client.apply_async("db:flaky_query", "{}", max_retries=3)
+
+# First attempt fails -> schedules retry
+worker.step()
+assert worker.stats.total_retried == 1, f"Expected 1 retry, got {worker.stats.total_retried}"
+
+# Fast forward time to let retry trigger (or force eta to 0 in memory broker for testing)
+delayed_msgs = broker.delayed_queues.get("default", [])
+assert len(delayed_msgs) == 1, "Expected 1 delayed task"
+delayed_msgs[0].eta = 0  # Force ready
+
+# Second attempt fails -> schedules retry again
+worker.step()
+assert worker.stats.total_retried == 2, f"Expected 2 retries, got {worker.stats.total_retried}"
+
+delayed_msgs = broker.delayed_queues.get("default", [])
+assert len(delayed_msgs) == 1, "Expected 1 delayed task"
+delayed_msgs[0].eta = 0  # Force ready
+
+# Third attempt succeeds!
+worker.step()
+assert worker.stats.total_succeeded == 2, "Expected total_succeeded to be 2"
+
+final_res = flaky_res.get(timeout_sec=0.1)
+assert final_res is not None, "Final result should not be None"
+assert final_res.status == TaskStatus.SUCCESS, "Final status should be SUCCESS"
+assert final_res.result == "recovered", f"Expected 'recovered', got {final_res.result}"
+print(" Automatic retry with backoff and recovery verified")
+
+
+# ----------------- Test 4: Dead-Letter Queue (DLQ) upon Max Retries -----------------
+print("\n--- Test 4: Dead-Letter Queue (DLQ) upon Max Retries ---")
+def broken_handler(payload: str) -> str:
+    raise RuntimeError("Permanent fatal hardware fault")
+
+registry.register("sys:broken", broken_handler)
+
+broken_res = client.apply_async("sys:broken", "{}", max_retries=1)
+
+# Attempt 0 -> fails, retry_count becomes 1
+worker.step()
+assert worker.stats.total_retried == 3, "Retry count should increment"
+
+# Trigger retry
+broker.delayed_queues["default"][0].eta = 0
+
+# Attempt 1 -> max_retries (1) reached -> routes to DLQ
+worker.step()
+assert worker.stats.total_dead_lettered == 1, f"Expected 1 DLQ task, got {worker.stats.total_dead_lettered}"
+assert broker.get_dead_letter_count("default") == 1, "Broker DLQ count should be 1"
+
+dead_res = broken_res.get(timeout_sec=0.1)
+assert dead_res is not None, "Dead task result should exist"
+assert dead_res.status == TaskStatus.FAILURE, f"Expected FAILURE, got {dead_res.status}"
+assert "Permanent fatal hardware fault" in dead_res.error, "Error message should be captured"
+print(" Dead-Letter Queue (DLQ) routing verified")
+
+
+# ----------------- Test 5: Scheduled / Delayed Tasks (ETA) -----------------
+print("\n--- Test 5: Scheduled / Delayed Tasks (ETA) ---")
+scheduled_executed = [False]
+
+def delayed_handler(payload: str) -> str:
+    scheduled_executed[0] = True
+    return "done"
+
+registry.register("cron:delayed", delayed_handler)
+
+# Schedule task with 1 second delay
+client.apply_async("cron:delayed", "{}", eta_sec=1)
+
+# Worker step immediately: task is NOT ready, should not execute
+processed = worker.step()
+assert not processed, "Task should not execute before ETA"
+assert not scheduled_executed[0], "Handler must not run before ETA"
+
+# Sleep 1.05s to elapse ETA
+time.sleep(1.05)
+
+# Worker step after ETA: task should be promoted and executed
+processed = worker.step()
+assert processed, "Task should execute after ETA has elapsed"
+assert scheduled_executed[0], "Handler should have executed"
+print(" Scheduled / Delayed ETA execution verified")
+
+
+# ----------------- Test 6: Multi-Queue Prioritization -----------------
+print("\n--- Test 6: Multi-Queue Prioritization ---")
+execution_order: list[str] = []
+
+def record_critical(p: str) -> str:
+    execution_order.append("critical")
+    return ""
+
+def record_low(p: str) -> str:
+    execution_order.append("low")
+    return ""
+
+registry.register("job:critical", record_critical)
+registry.register("job:low", record_low)
+
+multi_worker = Worker(
+    broker=broker,
+    registry=registry,
+    config=WorkerConfig(queues=["critical", "low"])
+)
+
+# Push to 'low' first, then 'critical'
+client.delay("job:low", queue="low")
+client.delay("job:critical", queue="critical")
+
+# First step must consume 'critical' because it is prioritized
+multi_worker.step()
+# Second step consumes 'low'
+multi_worker.step()
+
+assert len(execution_order) == 2, "Expected 2 jobs executed"
+assert execution_order[0] == "critical", f"Expected 'critical' first, got {execution_order[0]}"
+assert execution_order[1] == "low", f"Expected 'low' second, got {execution_order[1]}"
+print(" Multi-queue prioritization ('critical' > 'low') verified")
+
+
+# ----------------- Test 7: Unregistered Task Safety -----------------
+print("\n--- Test 7: Unregistered Task Safety ---")
+client.delay("non_existent_task", queue="default")
+worker.step()
+assert broker.get_dead_letter_count("default") == 2, "Unregistered task should route directly to DLQ"
+print(" Unregistered task safety and isolation verified")
+
+print("\n==================================================================")
+print(" ALL 7 TASKQ DISTRIBUTED TASK QUEUE TESTS PASSED SUCCESSFULLY! ")
+print("==================================================================")

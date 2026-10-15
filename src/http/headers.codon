@@ -1,50 +1,89 @@
 from src.memory.slice import ByteSlice
 
 @tuple
+class CParsedHeader:
+    name: Ptr[byte]
+    name_len: int
+    value: Ptr[byte]
+    value_len: int
+
+@tuple
 class Header:
     name: ByteSlice
     value: ByteSlice
 
 class Headers:
+    raw_ptr: Ptr[CParsedHeader]
+    num_raw: int
     items: list[Header]
 
     def __init__(self):
+        self.raw_ptr = Ptr[CParsedHeader]()
+        self.num_raw = 0
         self.items = []
+
+    def bind_raw(self, ptr: Ptr[CParsedHeader], count: int) -> None:
+        self.raw_ptr = ptr
+        self.num_raw = count
+        if len(self.items) > 0:
+            self.items.clear()
 
     def add(self, name: ByteSlice, value: ByteSlice) -> None:
         self.items.append(Header(name, value))
 
     def add_str(self, name: str, value: str) -> None:
-        n_ptr = name.c_str()
-        v_ptr = value.c_str()
-        self.items.append(Header(ByteSlice(n_ptr, len(name)), ByteSlice(v_ptr, len(value))))
+        clean_name = name.replace("\r", "").replace("\n", "")
+        clean_val = value.replace("\r", "").replace("\n", "")
+        n_ptr = clean_name.c_str()
+        v_ptr = clean_val.c_str()
+        self.items.append(Header(ByteSlice(n_ptr, len(clean_name)), ByteSlice(v_ptr, len(clean_val))))
 
     def set(self, name: str, value: str) -> None:
-        n_ptr = name.c_str()
-        v_ptr = value.c_str()
-        new_h = Header(ByteSlice(n_ptr, len(name)), ByteSlice(v_ptr, len(value)))
+        clean_name = name.replace("\r", "").replace("\n", "")
+        clean_val = value.replace("\r", "").replace("\n", "")
+        n_ptr = clean_name.c_str()
+        v_ptr = clean_val.c_str()
+        new_h = Header(ByteSlice(n_ptr, len(clean_name)), ByteSlice(v_ptr, len(clean_val)))
         for i in range(len(self.items)):
-            if self.items[i].name.equals_case_insensitive(name):
+            if self.items[i].name.equals_case_insensitive(clean_name):
                 self.items[i] = new_h
                 return
         self.items.append(new_h)
 
     def get(self, name: str) -> ByteSlice:
-        for i in range(len(self.items)):
-            h = self.items[i]
-            if h.name.equals_case_insensitive(name):
-                return h.value
+        # 1. Custom / overridden headers take precedence
+        if len(self.items) > 0:
+            for i in range(len(self.items)):
+                h = self.items[i]
+                if h.name.equals_case_insensitive(name):
+                    return h.value
+        # 2. Raw C headers (zero allocation, L1 cache linear scan)
+        if self.num_raw > 0:
+            for i in range(self.num_raw):
+                raw_h = self.raw_ptr[i]
+                bs_name = ByteSlice(raw_h.name, raw_h.name_len)
+                if bs_name.equals_case_insensitive(name):
+                    return ByteSlice(raw_h.value, raw_h.value_len)
         return ByteSlice(Ptr[byte](0), 0)
 
     def has(self, name: str) -> bool:
-        for i in range(len(self.items)):
-            h = self.items[i]
-            if h.name.equals_case_insensitive(name):
-                return True
+        if len(self.items) > 0:
+            for i in range(len(self.items)):
+                if self.items[i].name.equals_case_insensitive(name):
+                    return True
+        if self.num_raw > 0:
+            for i in range(self.num_raw):
+                raw_h = self.raw_ptr[i]
+                bs_name = ByteSlice(raw_h.name, raw_h.name_len)
+                if bs_name.equals_case_insensitive(name):
+                    return True
         return False
 
     def clear(self) -> None:
-        self.items.clear()
+        self.raw_ptr = Ptr[CParsedHeader]()
+        self.num_raw = 0
+        if len(self.items) > 0:
+            self.items.clear()
 
     def count(self) -> int:
-        return len(self.items)
+        return self.num_raw + len(self.items)

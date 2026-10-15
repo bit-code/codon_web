@@ -1,0 +1,286 @@
+# Industrial-Grade Schema Field Metadata & Type-Safe Annotations for CodonWeb
+
+class FieldMeta:
+    name: str
+    field_type: str
+    default_val: str
+    has_default: bool
+    required: bool
+    min_length: int
+    max_length: int
+    has_ge: bool
+    ge: int
+    has_le: bool
+    le: int
+    has_gt: bool
+    gt: int
+    has_lt: bool
+    lt: int
+    has_ge_f: bool
+    ge_f: float
+    has_le_f: bool
+    le_f: float
+    has_gt_f: bool
+    gt_f: float
+    has_lt_f: bool
+    lt_f: float
+    pattern: str
+    format: str
+    choices: List[str]
+    description: str
+    alias: str
+    strip_whitespace: bool
+    min_items: int
+    max_items: int
+    is_list: bool
+    is_optional: bool
+    is_submodel: bool
+    inner_type: str
+
+    def __init__(
+        self,
+        name: str = "",
+        field_type: str = "str",
+        default_val: str = "",
+        has_default: bool = False,
+        required: bool = True,
+        min_length: int = 0,
+        max_length: int = 0,
+        has_ge: bool = False,
+        ge: int = 0,
+        has_le: bool = False,
+        le: int = 0,
+        has_gt: bool = False,
+        gt: int = 0,
+        has_lt: bool = False,
+        lt: int = 0,
+        has_ge_f: bool = False,
+        ge_f: float = 0.0,
+        has_le_f: bool = False,
+        le_f: float = 0.0,
+        has_gt_f: bool = False,
+        gt_f: float = 0.0,
+        has_lt_f: bool = False,
+        lt_f: float = 0.0,
+        pattern: str = "",
+        format: str = "",
+        choices: Optional[List[str]] = None,
+        description: str = "",
+        alias: str = "",
+        strip_whitespace: bool = False,
+        min_items: int = 0,
+        max_items: int = 0,
+        is_list: bool = False,
+        is_optional: bool = False,
+        is_submodel: bool = False,
+        inner_type: str = ""
+    ):
+        self.name = name
+        self.field_type = field_type
+        self.default_val = default_val
+        self.has_default = has_default
+        self.required = required
+        self.min_length = min_length
+        self.max_length = max_length
+        self.has_ge = has_ge
+        self.ge = ge
+        self.has_le = has_le
+        self.le = le
+        self.has_gt = has_gt
+        self.gt = gt
+        self.has_lt = has_lt
+        self.lt = lt
+        self.has_ge_f = has_ge_f
+        self.ge_f = ge_f
+        self.has_le_f = has_le_f
+        self.le_f = le_f
+        self.has_gt_f = has_gt_f
+        self.gt_f = gt_f
+        self.has_lt_f = has_lt_f
+        self.lt_f = lt_f
+        self.pattern = pattern
+        self.format = format
+        if choices is not None:
+            self.choices = choices
+        else:
+            self.choices = List[str]()
+        self.description = description
+        self.alias = alias
+        self.strip_whitespace = strip_whitespace
+        self.min_items = min_items
+        self.max_items = max_items
+        self.is_list = is_list
+        self.is_optional = is_optional
+        self.is_submodel = is_submodel
+        self.inner_type = inner_type
+
+
+# -----------------------------------------------------------------------------
+# Type-Safe Field Annotators for Codon Models
+# These functions return placeholder/default values matching the field's static
+# type so that user schema definitions pass Codon's ahead-of-time type checker.
+# -----------------------------------------------------------------------------
+
+def StrField(
+    default: str = "",
+    min_length: int = 0,
+    max_length: int = 0,
+    pattern: str = "",
+    format: str = "",
+    choices: Optional[List[str]] = None,
+    description: str = "",
+    alias: str = "",
+    strip_whitespace: bool = False,
+    required: bool = True
+) -> str:
+    return default
+
+def IntField(
+    default: int = 0,
+    ge: int = 0,
+    le: int = 0,
+    gt: int = 0,
+    lt: int = 0,
+    description: str = "",
+    alias: str = "",
+    required: bool = True
+) -> int:
+    return default
+
+def FloatField(
+    default: float = 0.0,
+    ge: float = 0.0,
+    le: float = 0.0,
+    gt: float = 0.0,
+    lt: float = 0.0,
+    description: str = "",
+    alias: str = "",
+    required: bool = True
+) -> float:
+    return default
+
+def BoolField(
+    default: bool = False,
+    description: str = "",
+    alias: str = "",
+    required: bool = True
+) -> bool:
+    return default
+
+def StrListField(
+    default: Optional[List[str]] = None,
+    min_items: int = 0,
+    max_items: int = 0,
+    description: str = "",
+    alias: str = "",
+    required: bool = True
+) -> List[str]:
+    if default is not None:
+        return default
+    return List[str]()
+
+def ItemsField[T](
+    sample: T,
+    min_items: int = 0,
+    max_items: int = 0,
+    description: str = "",
+    alias: str = "",
+    required: bool = True
+) -> List[T]:
+    return List[T]()
+
+def ListField[T](
+    default: Optional[List[T]] = None,
+    min_items: int = 0,
+    max_items: int = 0,
+    description: str = "",
+    alias: str = "",
+    required: bool = True
+) -> List[T]:
+    if default is not None:
+        return default
+    return List[T]()
+
+def ModelField[T](
+    default: T,
+    description: str = "",
+    alias: str = "",
+    required: bool = True
+) -> T:
+    return default
+
+
+class Field:
+    @staticmethod
+    def str(
+        default: str = "",
+        min_length: int = 0,
+        max_length: int = 0,
+        pattern: str = "",
+        format: str = "",
+        choices: Optional[List[str]] = None,
+        description: str = "",
+        alias: str = "",
+        strip_whitespace: bool = False,
+        required: bool = True
+    ) -> str:
+        return default
+
+    @staticmethod
+    def int(
+        default: int = 0,
+        ge: int = 0,
+        le: int = 0,
+        gt: int = 0,
+        lt: int = 0,
+        description: str = "",
+        alias: str = "",
+        required: bool = True
+    ) -> int:
+        return default
+
+    @staticmethod
+    def float(
+        default: float = 0.0,
+        ge: float = 0.0,
+        le: float = 0.0,
+        gt: float = 0.0,
+        lt: float = 0.0,
+        description: str = "",
+        alias: str = "",
+        required: bool = True
+    ) -> float:
+        return default
+
+    @staticmethod
+    def bool(
+        default: bool = False,
+        description: str = "",
+        alias: str = "",
+        required: bool = True
+    ) -> bool:
+        return default
+
+    @staticmethod
+    def list[T](
+        default: Optional[List[T]] = None,
+        min_items: int = 0,
+        max_items: int = 0,
+        description: str = "",
+        alias: str = "",
+        required: bool = True
+    ) -> List[T]:
+        if default is not None:
+            return default
+        return List[T]()
+
+    @staticmethod
+    def model[T](
+        default: Optional[T] = None,
+        description: str = "",
+        alias: str = "",
+        required: bool = True
+    ) -> T:
+        if default is not None:
+            return default
+        return T()

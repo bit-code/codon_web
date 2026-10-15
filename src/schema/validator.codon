@@ -1,0 +1,435 @@
+# Industrial-Grade Runtime Validation Helpers and Extractors for CodonWeb Schemas
+# Eliminates hundreds of lines of repetitive code-gen boilerplate with zero runtime allocation.
+import re
+from src.http.fast_json import FastJson, FastJsonVal, FastJsonDoc
+from src.schema.errors import ValidationError, ValidationResult
+
+
+# ==============================================================================
+# FastJsonVal Field Extractors
+# ==============================================================================
+
+def extract_str_field(
+    v: FastJsonVal,
+    name: str,
+    errors: List[ValidationError],
+    required: bool = True,
+    default: str = "",
+    min_len: int = 0,
+    max_len: int = 0,
+    strip_ws: bool = False,
+    fmt: str = "",
+    pattern: str = "",
+    choices: List[str] = List[str](),
+    loc_prefix: str = "body",
+    alias: str = ""
+) -> str:
+    key_name = alias if len(alias) > 0 else name
+    if v.is_null():
+        if required:
+            errors.append(ValidationError(name, "Field '" + key_name + "' is required", "missing", loc=[loc_prefix, key_name]))
+        return default
+    if not v.is_str():
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be a string", "type_error.str", loc=[loc_prefix, key_name]))
+        return default
+    s = v.as_str()
+    if strip_ws:
+        s = s.strip()
+    if min_len > 0 and len(s) < min_len:
+        errors.append(ValidationError(name, "Field '" + key_name + "' length must be >= " + str(min_len), "value_error.length.min", loc=[loc_prefix, key_name]))
+    if max_len > 0 and len(s) > max_len:
+        errors.append(ValidationError(name, "Field '" + key_name + "' length must be <= " + str(max_len), "value_error.length.max", loc=[loc_prefix, key_name]))
+    if fmt == "email":
+        if "@" not in s or "." not in s.split("@")[-1]:
+            errors.append(ValidationError(name, "Invalid email address format", "value_error.format.email", loc=[loc_prefix, key_name]))
+    if len(pattern) > 0:
+        if not re.match(pattern, s):
+            errors.append(ValidationError(name, "Field '" + key_name + "' must match pattern: " + pattern, "value_error.pattern", loc=[loc_prefix, key_name]))
+    if len(choices) > 0:
+        matched = False
+        for c in choices:
+            if s == c:
+                matched = True
+                break
+        if not matched:
+            errors.append(ValidationError(name, "Field '" + key_name + "' must be one of: " + ", ".join(choices), "value_error.choices", loc=[loc_prefix, key_name]))
+    return s
+
+
+def extract_opt_str_field(
+    v: FastJsonVal,
+    name: str,
+    errors: List[ValidationError],
+    min_len: int = 0,
+    max_len: int = 0,
+    strip_ws: bool = False,
+    fmt: str = "",
+    pattern: str = "",
+    choices: List[str] = List[str](),
+    loc_prefix: str = "body",
+    alias: str = ""
+) -> Optional[str]:
+    key_name = alias if len(alias) > 0 else name
+    if v.is_null():
+        return Optional[str]()
+    if not v.is_str():
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be a string", "type_error.str", loc=[loc_prefix, key_name]))
+        return Optional[str]()
+    s = extract_str_field(v, name, errors, required=False, min_len=min_len, max_len=max_len, strip_ws=strip_ws, fmt=fmt, pattern=pattern, choices=choices, loc_prefix=loc_prefix, alias=alias)
+    return Optional[str](s)
+
+
+def extract_int_field(
+    v: FastJsonVal,
+    name: str,
+    errors: List[ValidationError],
+    required: bool = True,
+    default: int = 0,
+    ge: int = -999999999999,
+    le: int = 999999999999,
+    gt: int = -999999999999,
+    lt: int = 999999999999,
+    loc_prefix: str = "body",
+    alias: str = ""
+) -> int:
+    key_name = alias if len(alias) > 0 else name
+    if v.is_null():
+        if required:
+            errors.append(ValidationError(name, "Field '" + key_name + "' is required", "missing", loc=[loc_prefix, key_name]))
+        return default
+    if not v.is_int():
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be an integer", "type_error.integer", loc=[loc_prefix, key_name]))
+        return default
+    val = v.as_int()
+    if ge != -999999999999 and val < ge:
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be >= " + str(ge), "value_error.number.ge", loc=[loc_prefix, key_name]))
+    if le != 999999999999 and val > le:
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be <= " + str(le), "value_error.number.le", loc=[loc_prefix, key_name]))
+    if gt != -999999999999 and val <= gt:
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be > " + str(gt), "value_error.number.gt", loc=[loc_prefix, key_name]))
+    if lt != 999999999999 and val >= lt:
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be < " + str(lt), "value_error.number.lt", loc=[loc_prefix, key_name]))
+    return val
+
+
+def extract_opt_int_field(
+    v: FastJsonVal,
+    name: str,
+    errors: List[ValidationError],
+    ge: int = -999999999999,
+    le: int = 999999999999,
+    gt: int = -999999999999,
+    lt: int = 999999999999,
+    loc_prefix: str = "body",
+    alias: str = ""
+) -> Optional[int]:
+    key_name = alias if len(alias) > 0 else name
+    if v.is_null():
+        return Optional[int]()
+    if not v.is_int():
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be an integer", "type_error.integer", loc=[loc_prefix, key_name]))
+        return Optional[int]()
+    val = extract_int_field(v, name, errors, required=False, ge=ge, le=le, gt=gt, lt=lt, loc_prefix=loc_prefix, alias=alias)
+    return Optional[int](val)
+
+
+def extract_float_field(
+    v: FastJsonVal,
+    name: str,
+    errors: List[ValidationError],
+    required: bool = True,
+    default: float = 0.0,
+    ge: float = -1e18,
+    le: float = 1e18,
+    gt: float = -1e18,
+    lt: float = 1e18,
+    loc_prefix: str = "body",
+    alias: str = ""
+) -> float:
+    key_name = alias if len(alias) > 0 else name
+    if v.is_null():
+        if required:
+            errors.append(ValidationError(name, "Field '" + key_name + "' is required", "missing", loc=[loc_prefix, key_name]))
+        return default
+    if not v.is_float():
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be a float", "type_error.float", loc=[loc_prefix, key_name]))
+        return default
+    val = v.as_float()
+    if ge != -1e18 and val < ge:
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be >= " + str(ge), "value_error.number.ge", loc=[loc_prefix, key_name]))
+    if le != 1e18 and val > le:
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be <= " + str(le), "value_error.number.le", loc=[loc_prefix, key_name]))
+    if gt != -1e18 and val <= gt:
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be > " + str(gt), "value_error.number.gt", loc=[loc_prefix, key_name]))
+    if lt != 1e18 and val >= lt:
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be < " + str(lt), "value_error.number.lt", loc=[loc_prefix, key_name]))
+    return val
+
+
+def extract_opt_float_field(
+    v: FastJsonVal,
+    name: str,
+    errors: List[ValidationError],
+    ge: float = -1e18,
+    le: float = 1e18,
+    gt: float = -1e18,
+    lt: float = 1e18,
+    loc_prefix: str = "body",
+    alias: str = ""
+) -> Optional[float]:
+    key_name = alias if len(alias) > 0 else name
+    if v.is_null():
+        return Optional[float]()
+    if not v.is_float():
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be a float", "type_error.float", loc=[loc_prefix, key_name]))
+        return Optional[float]()
+    val = extract_float_field(v, name, errors, required=False, ge=ge, le=le, gt=gt, lt=lt, loc_prefix=loc_prefix, alias=alias)
+    return Optional[float](val)
+
+
+def extract_bool_field(
+    v: FastJsonVal,
+    name: str,
+    errors: List[ValidationError],
+    required: bool = True,
+    default: bool = False,
+    loc_prefix: str = "body",
+    alias: str = ""
+) -> bool:
+    key_name = alias if len(alias) > 0 else name
+    if v.is_null():
+        if required:
+            errors.append(ValidationError(name, "Field '" + key_name + "' is required", "missing", loc=[loc_prefix, key_name]))
+        return default
+    if not v.is_bool():
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be a boolean", "type_error.bool", loc=[loc_prefix, key_name]))
+        return default
+    return v.as_bool()
+
+
+def extract_opt_bool_field(
+    v: FastJsonVal,
+    name: str,
+    errors: List[ValidationError],
+    loc_prefix: str = "body",
+    alias: str = ""
+) -> Optional[bool]:
+    key_name = alias if len(alias) > 0 else name
+    if v.is_null():
+        return Optional[bool]()
+    if not v.is_bool():
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be a boolean", "type_error.bool", loc=[loc_prefix, key_name]))
+        return Optional[bool]()
+    return Optional[bool](v.as_bool())
+
+
+# ==============================================================================
+# Flat Dict[str, str] Extractors (Query & Form)
+# ==============================================================================
+
+def extract_dict_str(
+    d: Dict[str, str],
+    name: str,
+    errors: List[ValidationError],
+    required: bool = True,
+    default: str = "",
+    min_len: int = 0,
+    max_len: int = 0,
+    strip_ws: bool = False,
+    choices: List[str] = List[str](),
+    alias: str = ""
+) -> str:
+    key_name = alias if len(alias) > 0 else name
+    has_val = (key_name in d and len(d[key_name].strip()) > 0)
+    if not has_val:
+        if required:
+            errors.append(ValidationError(name, "Field '" + key_name + "' is required", "missing", loc=["query", key_name]))
+        return default
+    s = d[key_name].strip() if strip_ws else d[key_name]
+    if min_len > 0 and len(s) < min_len:
+        errors.append(ValidationError(name, "Field '" + key_name + "' length must be >= " + str(min_len), "value_error.length.min", loc=["query", key_name]))
+    if max_len > 0 and len(s) > max_len:
+        errors.append(ValidationError(name, "Field '" + key_name + "' length must be <= " + str(max_len), "value_error.length.max", loc=["query", key_name]))
+    if len(choices) > 0:
+        matched = False
+        for c in choices:
+            if s == c:
+                matched = True
+                break
+        if not matched:
+            errors.append(ValidationError(name, "Field '" + key_name + "' must be one of: " + ", ".join(choices), "value_error.choices", loc=["query", key_name]))
+    return s
+
+
+def extract_dict_opt_str(
+    d: Dict[str, str],
+    name: str,
+    errors: List[ValidationError],
+    min_len: int = 0,
+    max_len: int = 0,
+    strip_ws: bool = False,
+    choices: List[str] = List[str](),
+    alias: str = ""
+) -> Optional[str]:
+    key_name = alias if len(alias) > 0 else name
+    if key_name not in d or len(d[key_name].strip()) == 0:
+        return Optional[str]()
+    s = extract_dict_str(d, name, errors, required=False, min_len=min_len, max_len=max_len, strip_ws=strip_ws, choices=choices, alias=alias)
+    return Optional[str](s)
+
+
+def extract_dict_int(
+    d: Dict[str, str],
+    name: str,
+    errors: List[ValidationError],
+    required: bool = True,
+    default: int = 0,
+    ge: int = -999999999999,
+    le: int = 999999999999,
+    gt: int = -999999999999,
+    lt: int = 999999999999,
+    alias: str = ""
+) -> int:
+    key_name = alias if len(alias) > 0 else name
+    has_val = (key_name in d and len(d[key_name].strip()) > 0)
+    if not has_val:
+        if required:
+            errors.append(ValidationError(name, "Field '" + key_name + "' is required", "missing", loc=["query", key_name]))
+        return default
+    raw_s = d[key_name].strip()
+    try:
+        val = int(raw_s)
+        if ge != -999999999999 and val < ge:
+            errors.append(ValidationError(name, "Field '" + key_name + "' must be >= " + str(ge), "value_error.number.ge", loc=["query", key_name]))
+        if le != 999999999999 and val > le:
+            errors.append(ValidationError(name, "Field '" + key_name + "' must be <= " + str(le), "value_error.number.le", loc=["query", key_name]))
+        if gt != -999999999999 and val <= gt:
+            errors.append(ValidationError(name, "Field '" + key_name + "' must be > " + str(gt), "value_error.number.gt", loc=["query", key_name]))
+        if lt != 999999999999 and val >= lt:
+            errors.append(ValidationError(name, "Field '" + key_name + "' must be < " + str(lt), "value_error.number.lt", loc=["query", key_name]))
+        return val
+    except:
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be an integer", "type_error.int", loc=["query", key_name]))
+        return default
+
+
+def extract_dict_opt_int(
+    d: Dict[str, str],
+    name: str,
+    errors: List[ValidationError],
+    ge: int = -999999999999,
+    le: int = 999999999999,
+    gt: int = -999999999999,
+    lt: int = 999999999999,
+    alias: str = ""
+) -> Optional[int]:
+    key_name = alias if len(alias) > 0 else name
+    if key_name not in d or len(d[key_name].strip()) == 0:
+        return Optional[int]()
+    val = extract_dict_int(d, name, errors, required=False, ge=ge, le=le, gt=gt, lt=lt, alias=alias)
+    return Optional[int](val)
+
+
+def extract_dict_float(
+    d: Dict[str, str],
+    name: str,
+    errors: List[ValidationError],
+    required: bool = True,
+    default: float = 0.0,
+    ge: float = -1e18,
+    le: float = 1e18,
+    gt: float = -1e18,
+    lt: float = 1e18,
+    alias: str = ""
+) -> float:
+    key_name = alias if len(alias) > 0 else name
+    has_val = (key_name in d and len(d[key_name].strip()) > 0)
+    if not has_val:
+        if required:
+            errors.append(ValidationError(name, "Field '" + key_name + "' is required", "missing", loc=["query", key_name]))
+        return default
+    raw_s = d[key_name].strip()
+    try:
+        val = float(raw_s)
+        if ge != -1e18 and val < ge:
+            errors.append(ValidationError(name, "Field '" + key_name + "' must be >= " + str(ge), "value_error.number.ge", loc=["query", key_name]))
+        if le != 1e18 and val > le:
+            errors.append(ValidationError(name, "Field '" + key_name + "' must be <= " + str(le), "value_error.number.le", loc=["query", key_name]))
+        if gt != -1e18 and val <= gt:
+            errors.append(ValidationError(name, "Field '" + key_name + "' must be > " + str(gt), "value_error.number.gt", loc=["query", key_name]))
+        if lt != 1e18 and val >= lt:
+            errors.append(ValidationError(name, "Field '" + key_name + "' must be < " + str(lt), "value_error.number.lt", loc=["query", key_name]))
+        return val
+    except:
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be a float", "type_error.float", loc=["query", key_name]))
+        return default
+
+
+def extract_dict_opt_float(
+    d: Dict[str, str],
+    name: str,
+    errors: List[ValidationError],
+    ge: float = -1e18,
+    le: float = 1e18,
+    gt: float = -1e18,
+    lt: float = 1e18,
+    alias: str = ""
+) -> Optional[float]:
+    key_name = alias if len(alias) > 0 else name
+    if key_name not in d or len(d[key_name].strip()) == 0:
+        return Optional[float]()
+    val = extract_dict_float(d, name, errors, required=False, ge=ge, le=le, gt=gt, lt=lt, alias=alias)
+    return Optional[float](val)
+
+
+def extract_dict_bool(
+    d: Dict[str, str],
+    name: str,
+    errors: List[ValidationError],
+    required: bool = True,
+    default: bool = False,
+    alias: str = ""
+) -> bool:
+    key_name = alias if len(alias) > 0 else name
+    has_val = (key_name in d and len(d[key_name].strip()) > 0)
+    if not has_val:
+        if required:
+            errors.append(ValidationError(name, "Field '" + key_name + "' is required", "missing", loc=["query", key_name]))
+        return default
+    raw_s = d[key_name].strip().lower()
+    if raw_s == "true" or raw_s == "1" or raw_s == "yes":
+        return True
+    elif raw_s == "false" or raw_s == "0" or raw_s == "no":
+        return False
+    else:
+        errors.append(ValidationError(name, "Field '" + key_name + "' must be a boolean", "type_error.bool", loc=["query", key_name]))
+        return default
+
+
+def extract_dict_opt_bool(
+    d: Dict[str, str],
+    name: str,
+    errors: List[ValidationError],
+    alias: str = ""
+) -> Optional[bool]:
+    key_name = alias if len(alias) > 0 else name
+    if key_name not in d or len(d[key_name].strip()) == 0:
+        return Optional[bool]()
+    val = extract_dict_bool(d, name, errors, required=False, default=False, alias=alias)
+    return Optional[bool](val)
+
+
+# ==============================================================================
+# Generic Payload Validation Pipeline
+# ==============================================================================
+
+def parse_json_payload[T](raw: str, parse_fn: Callable[[FastJsonVal], ValidationResult[T]]) -> ValidationResult[T]:
+    try:
+        doc = FastJson.loads(raw)
+        res = parse_fn(doc.root)
+        doc.close()
+        return res
+    except:
+        errors = List[ValidationError]()
+        errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))
+        return ValidationResult[T](None, errors)

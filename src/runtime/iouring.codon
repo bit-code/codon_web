@@ -1,0 +1,132 @@
+# Industrial-Grade Native io_uring Driver for Linux Proactor
+from C import c_iouring_is_supported() -> int
+from C import c_iouring_create(u32) -> Ptr[byte]
+from C import c_iouring_destroy(Ptr[byte])
+from C import c_iouring_get_fd(Ptr[byte]) -> i32
+
+from C import c_iouring_prep_accept(Ptr[byte], i32, Ptr[byte], Ptr[i32], i32, u64) -> i32
+from C import c_iouring_prep_recv(Ptr[byte], i32, Ptr[byte], u32, i32, u64) -> i32
+from C import c_iouring_prep_send(Ptr[byte], i32, Ptr[byte], u32, i32, u64) -> i32
+from C import c_iouring_prep_send_fast(Ptr[byte], i32, Ptr[byte], u32, i32, byte, u64) -> i32
+from C import c_iouring_prep_poll_add(Ptr[byte], i32, u32, u64) -> i32
+from C import c_iouring_prep_cancel(Ptr[byte], u64) -> i32
+
+from C import c_iouring_enter(Ptr[byte], u32, int) -> i32
+from C import c_iouring_reap_cqes(Ptr[byte], Ptr[byte], u32) -> int
+from C import c_iouring_pending_submits(Ptr[byte]) -> u32
+from C import c_iouring_is_defer_taskrun(Ptr[byte]) -> int
+
+# Opcode tags for user_data multiplexing
+OP_ACCEPT: u64 = u64(1)
+OP_RECV: u64 = u64(2)
+OP_SEND: u64 = u64(3)
+OP_POLL: u64 = u64(4)
+
+# Kernel flags
+IOSQE_CQE_SKIP_SUCCESS_FLAG: byte = byte(1 << 6)
+
+@inline
+def make_user_data(op: u64, fd: i32) -> u64:
+    return (op << u64(32)) | (u64(fd) & u64(0xFFFFFFFF))
+
+@inline
+def decode_op(user_data: u64) -> u64:
+    return user_data >> u64(32)
+
+@inline
+def decode_fd(user_data: u64) -> i32:
+    return i32(user_data & u64(0xFFFFFFFF))
+
+@tuple
+class IoUringCqe:
+    user_data: u64
+    res: i32
+    flags: u32
+
+class IoUring:
+    ring: Ptr[byte]
+    ring_fd: i32
+    cqe_buf: Ptr[IoUringCqe]
+    max_events: int
+    is_valid: bool
+
+    @staticmethod
+    def is_supported() -> bool:
+        return c_iouring_is_supported() != 0
+
+    def __init__(self, entries: int = 1024):
+        self.max_events = entries
+        self.ring = c_iouring_create(u32(entries))
+        if self.ring:
+            self.ring_fd = c_iouring_get_fd(self.ring)
+            self.cqe_buf = Ptr[IoUringCqe](entries)
+            self.is_valid = True
+        else:
+            self.ring_fd = i32(-1)
+            self.cqe_buf = Ptr[IoUringCqe](0)
+            self.is_valid = False
+
+    def pending_submits(self) -> int:
+        if not self.is_valid:
+            return 0
+        return int(c_iouring_pending_submits(self.ring))
+
+    def is_defer_taskrun(self) -> bool:
+        if not self.is_valid:
+            return False
+        return c_iouring_is_defer_taskrun(self.ring) != 0
+
+    def prep_accept(self, fd: i32, client_addr: Ptr[byte], addrlen: Ptr[i32], flags: i32 = i32(0)) -> bool:
+        if not self.is_valid:
+            return False
+        ud = make_user_data(OP_ACCEPT, fd)
+        return c_iouring_prep_accept(self.ring, fd, client_addr, addrlen, flags, ud) == 0
+
+    def prep_recv(self, fd: i32, buf: Ptr[byte], len: int, flags: i32 = i32(0)) -> bool:
+        if not self.is_valid:
+            return False
+        ud = make_user_data(OP_RECV, fd)
+        return c_iouring_prep_recv(self.ring, fd, buf, u32(len), flags, ud) == 0
+
+    def prep_send(self, fd: i32, buf: Ptr[byte], len: int, flags: i32 = i32(0)) -> bool:
+        if not self.is_valid:
+            return False
+        ud = make_user_data(OP_SEND, fd)
+        return c_iouring_prep_send(self.ring, fd, buf, u32(len), flags, ud) == 0
+
+    def prep_send_fast(self, fd: i32, buf: Ptr[byte], len: int, flags: i32 = i32(0), sqe_flags: byte = byte(0)) -> bool:
+        if not self.is_valid:
+            return False
+        ud = make_user_data(OP_SEND, fd)
+        return c_iouring_prep_send_fast(self.ring, fd, buf, u32(len), flags, sqe_flags, ud) == 0
+
+    def prep_poll_add(self, fd: i32, poll_mask: u32) -> bool:
+        if not self.is_valid:
+            return False
+        ud = make_user_data(OP_POLL, fd)
+        return c_iouring_prep_poll_add(self.ring, fd, poll_mask, ud) == 0
+
+    def prep_cancel(self, user_data: u64) -> bool:
+        if not self.is_valid:
+            return False
+        return c_iouring_prep_cancel(self.ring, user_data) == 0
+
+    def enter(self, min_complete: int, timeout_ms: int = 0) -> int:
+        if not self.is_valid:
+            return -1
+        return int(c_iouring_enter(self.ring, u32(min_complete), timeout_ms))
+
+    def reap_cqes(self) -> int:
+        if not self.is_valid:
+            return 0
+        return int(c_iouring_reap_cqes(self.ring, self.cqe_buf.as_byte(), u32(self.max_events)))
+
+    def get_cqe(self, index: int) -> IoUringCqe:
+        return self.cqe_buf[index]
+
+    def close(self) -> None:
+        if self.is_valid and self.ring:
+            c_iouring_destroy(self.ring)
+            self.ring = Ptr[byte](0)
+            self.is_valid = False
+            self.ring_fd = i32(-1)

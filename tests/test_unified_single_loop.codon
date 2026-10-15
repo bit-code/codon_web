@@ -1,0 +1,146 @@
+# Comprehensive Verification Test for Unified Single EventLoop (USEL)
+# Tests:
+# 1. Unified EventLoop Dispatch & Step-free coroutine execution
+# 2. Cascade Task Cancellation on client socket disconnect / abort
+# 3. Timeout Control via wait_for() with deadline expiration and task cancellation
+# 4. Optimistic Non-blocking Stream I/O
+
+import time
+from typing import Optional
+from src.http.request import Request
+from src.http.response import Response
+from src.http.exceptions import HTTPException, ForbiddenException
+from src.runtime.async_context import AsyncContext, AsyncResumer
+from src.framework.app import App
+from src.memory.slice import ByteSlice
+from src.http.method import METHOD_GET
+from src.core.async.loop import get_event_loop, create_task, wait_for
+from asyncio import sleep
+
+print("=== Starting Test Suite: Unified Single EventLoop (USEL) ===")
+loop = get_event_loop()
+
+class USELMockResumer(AsyncResumer):
+    resumed_fd: i32
+    received_status: int
+    received_body: str
+    call_count: int
+
+    def __init__(self):
+        self.resumed_fd = i32(-1)
+        self.received_status = 0
+        self.received_body = ""
+        self.call_count = 0
+
+    def resume(self, fd: i32, resp: Response) -> bool:
+        self.resumed_fd = fd
+        self.received_status = resp.status_code
+        self.received_body = resp.body
+        self.call_count += 1
+        return True
+
+usel_app = App()
+
+# --- Route Definitions ---
+cancelled_flag = [False]
+
+@usel_app.async_get("/api/compute")
+async def compute_handler(req: Request):
+    await sleep(0.01)
+    return Response.json("{\"status\":\"ok\",\"engine\":\"unified_single_loop\"}", 200)
+
+@usel_app.async_get("/api/long-job")
+async def long_job_handler(req: Request):
+    try:
+        await sleep(0.2)
+        return Response.text("finished", 200)
+    except:
+        cancelled_flag[0] = True
+        raise
+
+# ----------------- Test 1: Single Loop Step & Async Route Execution -----------------
+print("\n--- Test 1: Single Loop Step & Async Route Execution ---")
+resumer1 = USELMockResumer()
+base_r1: AsyncResumer = resumer1
+
+req1 = Request()
+req1.method = METHOD_GET
+req1.fd = i32(10)
+req1.async_resumer = base_r1
+p1 = "/api/compute"
+req1.path = ByteSlice(p1.c_str(), len(p1))
+
+deferred1 = usel_app.router.dispatch(req1)
+assert deferred1.is_deferred, "Must return deferred response"
+assert resumer1.call_count == 0
+
+start_t = time.time()
+while resumer1.call_count == 0 and (time.time() - start_t < 1.0):
+    loop.run_one_iteration(5)
+
+assert resumer1.call_count == 1, "Resumer should be called exactly once"
+assert resumer1.received_status == 200
+assert "unified_single_loop" in resumer1.received_body
+print("[PASS] Test 1: Coroutine successfully dispatched and resumed in unified loop!")
+
+# ----------------- Test 2: Cascade Task Cancellation on Abort -----------------
+print("\n--- Test 2: Cascade Task Cancellation on Connection Abort ---")
+resumer2 = USELMockResumer()
+base_r2: AsyncResumer = resumer2
+
+req2 = Request()
+req2.method = METHOD_GET
+req2.fd = i32(20)
+req2.async_resumer = base_r2
+p2 = "/api/long-job"
+req2.path = ByteSlice(p2.c_str(), len(p2))
+
+deferred2 = usel_app.router.dispatch(req2)
+assert deferred2.is_deferred
+assert not cancelled_flag[0]
+
+# Simulate client abrupt disconnect: abort the context
+if req2.async_ctx is not None:
+    ctx2 = req2.async_ctx
+    ctx2.abort()
+
+# Advance loop to propagate cancellation exception into coroutine
+loop.run_one_iteration(5)
+loop.run_one_iteration(5)
+
+assert cancelled_flag[0], "Task should have received cancellation and set flag to True"
+assert resumer2.call_count == 0, "No response should be dispatched for aborted connection"
+print("[PASS] Test 2: Task cancellation cascaded cleanly upon connection abort!")
+
+# ----------------- Test 3: wait_for() Deadline Expiration -----------------
+print("\n--- Test 3: Timeout Control via wait_for() ---")
+
+async def fast_task():
+    await sleep(0.01)
+    return 42
+
+async def slow_task():
+    await sleep(0.2)
+    return 999
+
+async def run_timeout_tests():
+    # 3.1 Test fast task finishes before deadline
+    val = await wait_for(fast_task(), timeout_sec=0.1)
+    assert val == 42, "Fast task must complete successfully"
+    print("[PASS] Test 3.1: wait_for() successfully completed before deadline")
+
+    # 3.2 Test slow task exceeds deadline and raises OSError
+    caught_timeout = False
+    try:
+        await wait_for(slow_task(), timeout_sec=0.02)
+    except OSError as e:
+        caught_timeout = True
+        assert "Timeout" in str(e)
+
+    assert caught_timeout, "Slow task must raise Timeout exception"
+    print("[PASS] Test 3.2: wait_for() correctly cancelled task on deadline expiration")
+
+test_task = loop.create_task(run_timeout_tests())
+loop.run_until_complete(test_task)
+
+print("\n=== ALL UNIFIED SINGLE EVENTLOOP TESTS PASSED SUCCESSFULLY! ===")

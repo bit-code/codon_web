@@ -23,6 +23,19 @@ test_fast_json_integration
 test_req
 test_tc
 test_run_all
+test_all
+test_parser
+test_pg
+test_orm_dialects
+test_orm_crud
+bench_pipeline
+scratch/
+test_dual_driver
+test_industrial
+test_p1p2
+actix_mysql_server
+bench_parser
+bench_with_step2
 tests/test_fast_json_integration
 tests/test_request_ext
 tests/test_testclient
@@ -31,6 +44,7 @@ tests/test_json
 # Build and Packaging Directories
 build/
 dist/
+target/
 *.egg-info/
 .codon/
 

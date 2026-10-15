@@ -1,0 +1,369 @@
+# Industrial-Grade Asynchronous Worker for TaskQ
+# Runs hundreds of concurrent coroutine I/O tasks simultaneously on a single worker instance
+
+import time
+from typing import Optional
+from asyncio import Task
+from src.taskq.protocol import TaskMessage, TaskResult, TaskStatus, TaskCancelledError
+from src.taskq.broker.base import Broker
+from src.taskq.async_handler import AsyncTaskHandler, AsyncTaskRegistry, GLOBAL_ASYNC_REGISTRY
+from src.taskq.context import TaskContext
+from src.core.async import (
+    run,
+    sleep,
+    create_task,
+    wait_for,
+    get_event_loop
+)
+
+class AsyncWorkerConfig:
+    queues: list[str]
+    concurrency: int
+    poll_interval_sec: float
+    result_expire_sec: int
+    retry_backoff_base_sec: int
+    drain_timeout_sec: float
+
+    def __init__(
+        self,
+        queues: list[str] = ["default"],
+        concurrency: int = 50,
+        poll_interval_sec: float = 0.01,
+        result_expire_sec: int = 3600,
+        retry_backoff_base_sec: int = 2,
+        drain_timeout_sec: float = 10.0
+    ):
+        self.queues = queues
+        self.concurrency = concurrency
+        self.poll_interval_sec = poll_interval_sec
+        self.result_expire_sec = result_expire_sec
+        self.retry_backoff_base_sec = retry_backoff_base_sec
+        self.drain_timeout_sec = drain_timeout_sec
+
+
+class AsyncWorkerStats:
+    total_received: int
+    total_succeeded: int
+    total_failed: int
+    total_retried: int
+    total_dead_lettered: int
+    total_cancelled: int
+    total_timed_out: int
+    active_tasks: int
+
+    def __init__(self):
+        self.total_received = 0
+        self.total_succeeded = 0
+        self.total_failed = 0
+        self.total_retried = 0
+        self.total_dead_lettered = 0
+        self.total_cancelled = 0
+        self.total_timed_out = 0
+        self.active_tasks = 0
+
+
+async def _execute_task_coro(
+    broker: Broker,
+    handler: AsyncTaskHandler,
+    msg: TaskMessage,
+    config: AsyncWorkerConfig,
+    stats: AsyncWorkerStats,
+    ctx: TaskContext,
+    active_contexts: dict[str, TaskContext],
+    active_coro_tasks: dict[str, Task[None]]
+):
+    t0 = time.time()
+    try:
+        # Fast fail if cancelled before execution begins
+        if ctx.poll_cancelled():
+            stats.total_cancelled += 1
+            cancel_res = TaskResult(
+                task_id=msg.task_id,
+                status=TaskStatus.CANCELLED,
+                result="",
+                error="Task was cancelled before execution",
+                execution_time_ms=0
+            )
+            broker.store_result(msg.task_id, cancel_res, config.result_expire_sec)
+            return
+
+        # Mark task started
+        start_res = TaskResult(
+            task_id=msg.task_id,
+            status=TaskStatus.STARTED
+        )
+        broker.store_result(msg.task_id, start_res, config.result_expire_sec)
+
+        # Determine effective timeout in milliseconds
+        effective_timeout_ms = msg.timeout_ms if msg.timeout_ms > 0 else handler.timeout_ms
+
+        # Await async coroutine with cancellation context and optional timeout
+        if effective_timeout_ms > 0:
+            out_payload = await wait_for(
+                handler.run_with_context(msg.payload, ctx),
+                float(effective_timeout_ms) / 1000.0
+            )
+        else:
+            out_payload = await handler.run_with_context(msg.payload, ctx)
+        exec_ms = int((time.time() - t0) * 1000.0)
+
+        # Check if cancelled during execution before saving success
+        if ctx.is_cancelled():
+            stats.total_cancelled += 1
+            reason = ctx.token.cancel_reason if len(ctx.token.cancel_reason) > 0 else "Task was cancelled during execution"
+            cancel_res = TaskResult(
+                task_id=msg.task_id,
+                status=TaskStatus.CANCELLED,
+                result="",
+                error=reason,
+                execution_time_ms=exec_ms
+            )
+            broker.store_result(msg.task_id, cancel_res, config.result_expire_sec)
+            return
+
+        stats.total_succeeded += 1
+        success_res = TaskResult(
+            task_id=msg.task_id,
+            status=TaskStatus.SUCCESS,
+            result=out_payload,
+            error="",
+            execution_time_ms=exec_ms
+        )
+        broker.store_result(msg.task_id, success_res, config.result_expire_sec)
+
+    except BaseException as e:
+        err_msg = str(e)
+        exec_ms = int((time.time() - t0) * 1000.0)
+
+        # 1. Check if timeout occurred
+        is_timeout = err_msg.startswith("Timeout: Operation exceeded")
+
+        # 2. Check if cancellation occurred (token cancelled, TaskCancelledError, or runtime task cancellation)
+        is_cancel = (not is_timeout) and (
+            ctx.is_cancelled() or 
+            isinstance(e, TaskCancelledError) or 
+            (err_msg.startswith("Task '") and "cancelled" in err_msg)
+        )
+
+        if is_cancel:
+            stats.total_cancelled += 1
+            cancel_res = TaskResult(
+                task_id=msg.task_id,
+                status=TaskStatus.CANCELLED,
+                result="",
+                error=err_msg if len(err_msg) > 0 else "Task was cancelled",
+                execution_time_ms=exec_ms
+            )
+            broker.store_result(msg.task_id, cancel_res, config.result_expire_sec)
+        elif is_timeout:
+            stats.total_timed_out += 1
+            if msg.retry_count < msg.max_retries:
+                # Retry on timeout
+                msg.retry_count += 1
+                backoff_pow = msg.retry_count - 1
+                if backoff_pow > 6:
+                    backoff_pow = 6
+                delay_sec = config.retry_backoff_base_sec ** backoff_pow
+
+                stats.total_retried += 1
+                broker.schedule(msg.queue, msg, delay_sec)
+
+                retry_res = TaskResult(
+                    task_id=msg.task_id,
+                    status=TaskStatus.RETRY,
+                    result="",
+                    error=f"Attempt {msg.retry_count} timed out: {err_msg}",
+                    execution_time_ms=exec_ms
+                )
+                broker.store_result(msg.task_id, retry_res, config.result_expire_sec)
+            else:
+                # Retries exhausted on timeout -> Dead Letter Queue
+                stats.total_failed += 1
+                stats.total_dead_lettered += 1
+                broker.enqueue_dead_letter(msg.queue, msg, err_msg)
+
+                timeout_res = TaskResult(
+                    task_id=msg.task_id,
+                    status=TaskStatus.TIMEOUT,
+                    result="",
+                    error=f"Max retries ({msg.max_retries}) exceeded after timeout: {err_msg}",
+                    execution_time_ms=exec_ms
+                )
+                broker.store_result(msg.task_id, timeout_res, config.result_expire_sec)
+        elif msg.retry_count < msg.max_retries:
+            # Exponential backoff retry
+            msg.retry_count += 1
+            backoff_pow = msg.retry_count - 1
+            if backoff_pow > 6:
+                backoff_pow = 6
+            delay_sec = config.retry_backoff_base_sec ** backoff_pow
+
+            stats.total_retried += 1
+            broker.schedule(msg.queue, msg, delay_sec)
+
+            retry_res = TaskResult(
+                task_id=msg.task_id,
+                status=TaskStatus.RETRY,
+                result="",
+                error=f"Attempt {msg.retry_count} failed: {err_msg}",
+                execution_time_ms=exec_ms
+            )
+            broker.store_result(msg.task_id, retry_res, config.result_expire_sec)
+        else:
+            # Retries exhausted -> Dead Letter Queue
+            stats.total_failed += 1
+            stats.total_dead_lettered += 1
+            broker.enqueue_dead_letter(msg.queue, msg, err_msg)
+
+            fail_res = TaskResult(
+                task_id=msg.task_id,
+                status=TaskStatus.FAILURE,
+                result="",
+                error=f"Max retries ({msg.max_retries}) exceeded: {err_msg}",
+                execution_time_ms=exec_ms
+            )
+            broker.store_result(msg.task_id, fail_res, config.result_expire_sec)
+    finally:
+        if msg.task_id in active_contexts:
+            del active_contexts[msg.task_id]
+        if msg.task_id in active_coro_tasks:
+            del active_coro_tasks[msg.task_id]
+        stats.active_tasks -= 1
+
+
+class AsyncWorker:
+    broker: Broker
+    registry: AsyncTaskRegistry
+    config: AsyncWorkerConfig
+    stats: AsyncWorkerStats
+    active_contexts: dict[str, TaskContext]
+    active_coro_tasks: dict[str, Task[None]]
+    is_running: bool
+
+    def __init__(
+        self,
+        broker: Broker,
+        registry: AsyncTaskRegistry = GLOBAL_ASYNC_REGISTRY,
+        config: Optional[AsyncWorkerConfig] = None
+    ):
+        self.broker = broker
+        self.registry = registry
+        self.config = config if config is not None else AsyncWorkerConfig()
+        self.stats = AsyncWorkerStats()
+        self.active_contexts = {}
+        self.active_coro_tasks = {}
+        self.is_running = False
+
+    def step_dispatch(self) -> int:
+        """
+        Polls delayed tasks, checks remote cancellation on active tasks,
+        and dequeues ready tasks into active coroutines up to the concurrency limit.
+        """
+        # 1. Poll delayed ETA queues
+        for i in range(len(self.config.queues)):
+            self.broker.poll_delayed(self.config.queues[i])
+
+        # 2. Check remote cancellation signals for all currently executing tasks
+        for t_id in self.active_contexts:
+            ctx = self.active_contexts[t_id]
+            if ctx.poll_cancelled():
+                # Remotely cancelled! Trigger automatic native runtime cancellation!
+                if t_id in self.active_coro_tasks:
+                    self.active_coro_tasks[t_id].cancel("Cancelled remotely via Broker")
+
+        # 3. Dequeue tasks while active_tasks < concurrency
+        dispatched = 0
+        while self.stats.active_tasks < self.config.concurrency:
+            found_any = False
+            for i in range(len(self.config.queues)):
+                q_name = self.config.queues[i]
+                msg = self.broker.dequeue(q_name, 0)
+                if msg is not None:
+                    found_any = True
+                    self.stats.total_received += 1
+
+                    # Pre-execution gate check: ignore task if cancelled before start
+                    if self.broker.is_cancelled(msg.task_id):
+                        self.stats.total_cancelled += 1
+                        cancel_res = TaskResult(
+                            task_id=msg.task_id,
+                            status=TaskStatus.CANCELLED,
+                            result="",
+                            error="Task was cancelled before execution"
+                        )
+                        self.broker.store_result(msg.task_id, cancel_res, self.config.result_expire_sec)
+                        break
+
+                    handler = self.registry.get(msg.task_name)
+                    if handler is None:
+                        self.stats.total_failed += 1
+                        self.stats.total_dead_lettered += 1
+                        err = f"Unrecognized async task '{msg.task_name}' (not registered in AsyncTaskRegistry)"
+                        self.broker.enqueue_dead_letter(msg.queue, msg, err)
+                        fail_res = TaskResult(
+                            task_id=msg.task_id,
+                            status=TaskStatus.FAILURE,
+                            error=err
+                        )
+                        self.broker.store_result(msg.task_id, fail_res, self.config.result_expire_sec)
+                    else:
+                        self.stats.active_tasks += 1
+                        dispatched += 1
+                        ctx = TaskContext(msg.task_id, broker=self.broker)
+                        self.active_contexts[msg.task_id] = ctx
+                        t = create_task(_execute_task_coro(
+                            self.broker,
+                            handler,
+                            msg,
+                            self.config,
+                            self.stats,
+                            ctx,
+                            self.active_contexts,
+                            self.active_coro_tasks
+                        ))
+                        self.active_coro_tasks[msg.task_id] = t
+                    break
+
+            if not found_any:
+                break
+
+        return dispatched
+
+    async def step(self):
+        """Single asynchronous step for test suites and coroutine integration."""
+        self.step_dispatch()
+        await sleep(0.001)
+
+    def step_sync(self) -> int:
+        """Synchronous step for external synchronous event loops."""
+        dispatched = self.step_dispatch()
+        get_event_loop().run_one_iteration(5)
+        return dispatched
+
+    async def run_loop(self):
+        self.is_running = True
+        while self.is_running:
+            self.step_dispatch()
+            if self.stats.active_tasks == 0:
+                await sleep(self.config.poll_interval_sec)
+            else:
+                await sleep(0.001)
+
+        # Graceful shutdown: Drain in-flight tasks up to drain_timeout_sec
+        drain_t0 = time.time()
+        while self.stats.active_tasks > 0 and (time.time() - drain_t0 < self.config.drain_timeout_sec):
+            await sleep(0.01)
+
+        # Force cancel any lingering tasks that failed to finish
+        if self.stats.active_tasks > 0:
+            for t_id in self.active_contexts:
+                self.active_contexts[t_id].cancel("Worker shutdown")
+                if t_id in self.active_coro_tasks:
+                    self.active_coro_tasks[t_id].cancel("Worker shutdown")
+            await sleep(0.01)
+
+    def start(self):
+        run(self.run_loop())
+
+    def stop(self):
+        self.is_running = False

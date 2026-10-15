@@ -9,9 +9,12 @@ class ServerConfig:
     max_headers_count: int
     epoll_max_events: int
     keep_alive_timeout_ms: int
+    async_timeout_ms: int
     tcp_nodelay: bool
     reuse_port: bool
     workers: int
+    driver: str
+    cpu_affinity: bool
 
     def __init__(
         self,
@@ -23,9 +26,12 @@ class ServerConfig:
         max_headers_count: int = 64,
         epoll_max_events: int = 1024,
         keep_alive_timeout_ms: int = 15000,
+        async_timeout_ms: int = 30000,
         tcp_nodelay: bool = True,
         reuse_port: bool = False,
-        workers: int = 1
+        workers: int = 1,
+        driver: str = "epoll",
+        cpu_affinity: bool = False
     ):
         self.host = host
         self.port = port
@@ -35,6 +41,9 @@ class ServerConfig:
         self.max_headers_count = max_headers_count
         self.epoll_max_events = epoll_max_events
         self.keep_alive_timeout_ms = keep_alive_timeout_ms
+        self.async_timeout_ms = async_timeout_ms
         self.tcp_nodelay = tcp_nodelay
         self.reuse_port = reuse_port
         self.workers = workers
+        self.driver = driver
+        self.cpu_affinity = cpu_affinity

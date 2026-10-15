@@ -29,6 +29,29 @@ from C import c_yyjson_mut_doc_set_root(cobj, cobj)
 from C import c_yyjson_mut_obj_add_strn(cobj, cobj, Ptr[byte], int, Ptr[byte], int) -> int
 from C import c_yyjson_mut_write(cobj, Ptr[int]) -> Ptr[byte]
 from C import c_free(cobj)
+from C import c_get_tls_fast_writer() -> cobj
+from C import c_get_tls_json_stream() -> cobj
+from C import c_json_stream_init(cobj, Ptr[byte], int)
+from C import c_json_stream_append_str_pair(cobj, Ptr[byte], int, Ptr[byte], int)
+from C import c_json_stream_append_int_pair(cobj, Ptr[byte], int, int)
+from C import c_json_stream_append_float_pair(cobj, Ptr[byte], int, float)
+from C import c_json_stream_append_bool_pair(cobj, Ptr[byte], int, int)
+from C import c_json_stream_append_null_pair(cobj, Ptr[byte], int)
+from C import c_json_stream_append_raw_pair(cobj, Ptr[byte], int, Ptr[byte], int)
+from C import c_json_stream_begin_array(cobj, Ptr[byte], int)
+from C import c_json_stream_append_arr_str(cobj, Ptr[byte], int)
+from C import c_json_stream_append_arr_int(cobj, int)
+from C import c_json_stream_append_arr_float(cobj, float)
+from C import c_json_stream_append_arr_bool(cobj, int)
+from C import c_json_stream_append_arr_raw(cobj, Ptr[byte], int)
+from C import c_json_stream_end_array(cobj)
+from C import c_json_stream_finish(cobj) -> int
+from C import c_fast_writer_init(cobj)
+from C import c_fast_writer_add(cobj, Ptr[byte], int, Ptr[byte], int)
+from C import c_fast_writer_finish(cobj, Ptr[byte], int) -> int
+from src.memory.buffer import ByteBuffer
+from src.memory.slice import ByteSlice
+
 
 
 def _to_unicode_str(p: Ptr[byte], l: int) -> str:
@@ -105,6 +128,9 @@ class FastJsonVal:
         val_ptr = c_yyjson_obj_get(self.ptr, key.c_str())
         return FastJsonVal(val_ptr)
 
+    def get(self, key: str) -> FastJsonVal:
+        return self[key]
+
     def __getitem__(self, idx: int) -> FastJsonVal:
         if not bool(self.ptr):
             return FastJsonVal(cobj())
@@ -151,27 +177,44 @@ class FastJson:
         return FastJsonDoc(doc_ptr)
 
     @staticmethod
+    def loads_slice(src: ByteSlice) -> FastJsonDoc:
+        doc_ptr = c_yyjson_read(src.ptr, src.len)
+        if not bool(doc_ptr):
+            raise ValueError("Invalid JSON string")
+        return FastJsonDoc(doc_ptr)
+
+    @staticmethod
     def dumps(doc: FastJsonDoc) -> str:
         return doc.dumps()
 
     @staticmethod
     def dumps_dict(d: dict[str, str]) -> str:
-        """Ultra-fast RFC 8259 compliant JSON serialization for flat string dictionaries."""
+        """Ultra-fast RFC 8259 compliant streaming JSON serialization for flat string dictionaries with large-field protection."""
         if len(d) == 0:
             return "{}"
-        mut_doc = c_yyjson_mut_doc_new()
-        root = c_yyjson_mut_obj(mut_doc)
-        c_yyjson_mut_doc_set_root(mut_doc, root)
+        cap = 4096
+        raw_buf = Ptr[byte](cap)
+        stream = c_get_tls_json_stream()
+        c_json_stream_init(stream, raw_buf, cap)
         for k, v in d.items():
-            c_yyjson_mut_obj_add_strn(mut_doc, root, k.c_str(), len(k), v.c_str(), len(v))
-        out_len = 0
-        p = c_yyjson_mut_write(mut_doc, __ptr__(out_len))
-        c_yyjson_mut_doc_free(mut_doc)
-        if not bool(p):
-            return "{}"
-        s = _to_unicode_str(p, out_len)
-        c_free(p.as_byte())
-        return s
+            c_json_stream_append_str_pair(stream, k.c_str().as_byte(), 0, v.c_str().as_byte(), 0)
+        written = c_json_stream_finish(stream)
+        if written <= 0:
+            # Fallback to standard AST dumps if stream overflowed (>4KB)
+            mut_doc = c_yyjson_mut_doc_new()
+            root = c_yyjson_mut_obj(mut_doc)
+            c_yyjson_mut_doc_set_root(mut_doc, root)
+            for k, v in d.items():
+                c_yyjson_mut_obj_add_strn(mut_doc, root, k.c_str().as_byte(), len(k), v.c_str().as_byte(), len(v))
+            out_len = 0
+            p = c_yyjson_mut_write(mut_doc, __ptr__(out_len))
+            c_yyjson_mut_doc_free(mut_doc)
+            if not bool(p):
+                return "{}"
+            s = _to_unicode_str(p, out_len)
+            c_free(p.as_byte())
+            return s
+        return _to_unicode_str(raw_buf, written)
 
     @staticmethod
     def parse_to_dict(raw: str) -> dict[str, str]:
@@ -213,3 +256,147 @@ class FastJson:
 
         c_yyjson_doc_free(doc_ptr)
         return res
+
+    @staticmethod
+    def parse_slice_to_dict(src: ByteSlice) -> dict[str, str]:
+        """Production drop-in zero-copy replacement for Json.parse_object directly from ByteSlice."""
+        res: dict[str, str] = {}
+        if src.len < 2:
+            return res
+
+        doc_ptr = c_yyjson_read(src.ptr, src.len)
+        if not bool(doc_ptr):
+            return res
+
+        root = c_yyjson_doc_get_root(doc_ptr)
+        if c_yyjson_is_obj(root) == 0:
+            c_yyjson_doc_free(doc_ptr)
+            return res
+
+        iter_buf = Ptr[byte](64)
+        c_obj_iter_init(root, iter_buf)
+
+        key_ptr = Ptr[byte](0)
+        key_len = 0
+        val_ptr = cobj()
+        val_buf = Ptr[byte](4096)
+
+        while c_obj_iter_next(iter_buf, __ptr__(key_ptr), __ptr__(key_len), __ptr__(val_ptr)) != 0:
+            if bool(key_ptr):
+                k = _to_unicode_str(key_ptr, key_len)
+                out_len = 0
+                p = c_yyjson_val_to_str(val_ptr, val_buf, 4096, __ptr__(out_len))
+                if bool(p) and out_len > 0:
+                    v = _to_unicode_str(p, out_len)
+                    res[k] = v
+                else:
+                    res[k] = ""
+
+        c_yyjson_doc_free(doc_ptr)
+        return res
+
+class FastJsonStream:
+    @staticmethod
+    def write_dict(dest: ByteBuffer, d: dict[str, str]) -> int:
+        """Direct-to-buffer zero-copy JSON streaming without pre-scan overhead."""
+        if len(d) == 0:
+            dest.append_str("{}")
+            return 2
+        dest.ensure_writable(4096)
+        buf_ptr = dest.ptr + dest.write_pos
+        stream = c_get_tls_json_stream()
+        c_json_stream_init(stream, buf_ptr, dest.writable_bytes())
+        for k, v in d.items():
+            c_json_stream_append_str_pair(stream, k.c_str().as_byte(), 0, v.c_str().as_byte(), 0)
+        written = c_json_stream_finish(stream)
+        if written > 0:
+            dest.advance_write(written)
+            return written
+        # Fallback path if extreme overflow occurred (>4KB dict)
+        fallback_str = FastJson.dumps_dict(d)
+        dest.append_str(fallback_str)
+        return len(fallback_str)
+
+
+class FastJsonWriter:
+    """Industrial-Grade SIMD/LUT-Accelerated Streaming JSON Writer.
+    Encodes flat & nested fields with 0 heap allocation during serialization pass.
+    Guarantees strict RFC 8259 escape compliance for all control characters and symbols.
+    Supports dual-channel output: returning heap `str` or zero-copy streaming to `ByteBuffer`.
+    """
+    _stream: cobj
+    _buf: Ptr[byte]
+    _cap: int
+    _dest: Optional[ByteBuffer]
+
+    def __init__(self, capacity: int = 4096):
+        self._cap = capacity
+        self._buf = Ptr[byte](capacity)
+        self._dest = None
+        self._stream = c_get_tls_json_stream()
+        c_json_stream_init(self._stream, self._buf, self._cap)
+
+    def __init__(self, dest: ByteBuffer, min_cap: int = 4096):
+        dest.ensure_writable(min_cap)
+        self._cap = dest.writable_bytes()
+        self._buf = dest.ptr + dest.write_pos
+        self._dest = Optional[ByteBuffer](dest)
+        self._stream = c_get_tls_json_stream()
+        c_json_stream_init(self._stream, self._buf, self._cap)
+
+    def write_str(self, key: str, val: str):
+        c_json_stream_append_str_pair(self._stream, key.c_str().as_byte(), len(key), val.c_str().as_byte(), len(val))
+
+    def write_int(self, key: str, val: int):
+        c_json_stream_append_int_pair(self._stream, key.c_str().as_byte(), len(key), val)
+
+    def write_float(self, key: str, val: float):
+        c_json_stream_append_float_pair(self._stream, key.c_str().as_byte(), len(key), val)
+
+    def write_bool(self, key: str, val: bool):
+        c_json_stream_append_bool_pair(self._stream, key.c_str().as_byte(), len(key), 1 if val else 0)
+
+    def write_null(self, key: str):
+        c_json_stream_append_null_pair(self._stream, key.c_str().as_byte(), len(key))
+
+    def write_raw(self, key: str, raw: str):
+        c_json_stream_append_raw_pair(self._stream, key.c_str().as_byte(), len(key), raw.c_str().as_byte(), len(raw))
+
+    def begin_array(self, key: str):
+        c_json_stream_begin_array(self._stream, key.c_str().as_byte(), len(key))
+
+    def append_arr_str(self, val: str):
+        c_json_stream_append_arr_str(self._stream, val.c_str().as_byte(), len(val))
+
+    def append_arr_int(self, val: int):
+        c_json_stream_append_arr_int(self._stream, val)
+
+    def append_arr_float(self, val: float):
+        c_json_stream_append_arr_float(self._stream, val)
+
+    def append_arr_bool(self, val: bool):
+        c_json_stream_append_arr_bool(self._stream, 1 if val else 0)
+
+    def append_arr_raw(self, raw: str):
+        c_json_stream_append_arr_raw(self._stream, raw.c_str().as_byte(), len(raw))
+
+    def end_array(self):
+        c_json_stream_end_array(self._stream)
+
+    def finish(self) -> str:
+        written = c_json_stream_finish(self._stream)
+        if written <= 0:
+            return "{}"
+        if self._dest is not None:
+            self._dest.advance_write(written)
+        return _to_unicode_str(self._buf, written)
+
+    def finish_buffer(self) -> int:
+        written = c_json_stream_finish(self._stream)
+        if written <= 0:
+            return 0
+        if self._dest is not None:
+            self._dest.advance_write(written)
+        return written
+
+

@@ -1,11 +1,14 @@
+import time
 from typing import Callable, Optional
 from asyncio import Coroutine
 from src.config.server import ServerConfig
 from src.os.socket import Socket
+from src.os.constants import WNOHANG
 from src.os.linux import (
     fork as c_fork,
     waitpid as c_waitpid,
-    getpid as c_getpid
+    getpid as c_getpid,
+    bind_cpu_core
 )
 from src.http.request import Request
 from src.http.response import Response
@@ -109,7 +112,9 @@ class App:
         docs_url: str = "/docs",
         redoc_url: str = "/redoc",
         openapi_url: str = "/openapi.json",
-        enable_openapi: bool = True
+        enable_openapi: bool = True,
+        driver: str = "epoll",
+        cpu_affinity: bool = False
     ):
         self.config = ServerConfig(
             host=host,
@@ -118,7 +123,9 @@ class App:
             read_buffer_size=read_buffer_size,
             reuse_port=reuse_port,
             tcp_nodelay=tcp_nodelay,
-            workers=workers
+            workers=workers,
+            driver=driver,
+            cpu_affinity=cpu_affinity
         )
         self.router = Router()
         self.middlewares = list[Middleware]()
@@ -580,6 +587,12 @@ class App:
         return decorator
 
     def _run_worker(self, worker_id: int) -> None:
+        # Optional CPU Affinity Pinning for Multi-Reactor Workers (Default: Unpinned / False)
+        if self.config.cpu_affinity:
+            pinned_core = bind_cpu_core(worker_id)
+            # if pinned_core >= 0:
+            #     print("[CodonWeb] Worker " + str(worker_id) + " pinned to CPU Core #" + str(pinned_core))
+
         self.mount_openapi_routes()
 
         sock = Socket.create_tcp()
@@ -605,7 +618,9 @@ class App:
             handler=pipeline_handler,
             max_events=self.config.epoll_max_events,
             buffer_size=self.config.read_buffer_size,
-            keep_alive_timeout_sec=float(self.config.keep_alive_timeout_ms) / 1000.0
+            keep_alive_timeout_sec=float(self.config.keep_alive_timeout_ms) / 1000.0,
+            async_timeout_sec=float(self.config.async_timeout_ms) / 1000.0,
+            driver=self.config.driver
         )
         self.event_loop = loop
         loop.run()
@@ -615,11 +630,13 @@ class App:
             hook = self.shutdown_hooks[i]
             hook()
 
-    def run(self, host: str = "", port: int = 0, workers: int = 0) -> None:
+    def run(self, host: str = "", port: int = 0, workers: int = 0, cpu_affinity: Optional[bool] = None) -> None:
         if len(host) > 0:
             self.config.host = host
         if port > 0:
             self.config.port = port
+        if cpu_affinity is not None:
+            self.config.cpu_affinity = cpu_affinity
         w = workers if workers > 0 else self.config.workers
         if w <= 0:
             w = 1
@@ -629,13 +646,14 @@ class App:
             print("[CodonWeb] Interactive API Docs: http://" + self.config.host + ":" + str(self.config.port) + self.docs_url)
             print("[CodonWeb] ReDoc Docs:           http://" + self.config.host + ":" + str(self.config.port) + self.redoc_url)
             print("[CodonWeb] OpenAPI 3.0 Spec:     http://" + self.config.host + ":" + str(self.config.port) + self.openapi_url)
-        print("[CodonWeb] Multi-Reactor workers: " + str(w) + ", Active middlewares: " + str(len(self.middlewares)))
+        affinity_info = "Enabled" if self.config.cpu_affinity else "Disabled"
+        print("[CodonWeb] Multi-Reactor workers: " + str(w) + " (CPU Affinity: " + affinity_info + "), Active middlewares: " + str(len(self.middlewares)))
 
         if w == 1:
             self._run_worker(0)
             return
 
-        pids: list[i32] = []
+        worker_map: dict[int, i32] = {}
         for i in range(w):
             pid = c_fork()
             if pid < i32(0):
@@ -644,9 +662,36 @@ class App:
                 self._run_worker(i)
                 return
             else:
-                pids.append(pid)
+                worker_map[i] = pid
 
-        print("[CodonWeb] Master process monitoring " + str(len(pids)) + " worker processes")
+        print("[CodonWeb] Master Supervisor active: monitoring " + str(len(worker_map)) + " worker processes")
         status = i32(0)
-        for i in range(len(pids)):
-            c_waitpid(pids[i], __ptr__(status), i32(0))
+
+        # Industrial-grade Arbiter Loop with Auto-Restart
+        while len(worker_map) > 0:
+            dead_pid = c_waitpid(i32(-1), __ptr__(status), WNOHANG)
+            if dead_pid > i32(0):
+                dead_id = -1
+                for wid, p in worker_map.items():
+                    if p == dead_pid:
+                        dead_id = wid
+                        break
+
+                if dead_id >= 0:
+                    status_int = int(status)
+                    exit_code = (status_int >> 8) & 255
+                    term_sig = status_int & 127
+                    print("[CodonWeb] Worker " + str(dead_id) + " (PID " + str(dead_pid) + ") exited (status=" + str(exit_code) + ", signal=" + str(term_sig) + "). Auto-respawning replacement...")
+
+                    new_pid = c_fork()
+                    if new_pid < i32(0):
+                        print("[CodonWeb] Error: failed to respawn worker " + str(dead_id))
+                        del worker_map[dead_id]
+                    elif new_pid == i32(0):
+                        self._run_worker(dead_id)
+                        return
+                    else:
+                        worker_map[dead_id] = new_pid
+                        print("[CodonWeb] Worker " + str(dead_id) + " respawned successfully (PID " + str(new_pid) + ")")
+            else:
+                time.sleep(0.05)

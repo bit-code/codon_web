@@ -1,0 +1,461 @@
+# Industrial-Grade Pure-Codon Schema AST Parser
+# Zero CPython dependency - runs natively inside Codon Ahead-Of-Time toolchain.
+
+class ParsedField:
+    name: str
+    field_type: str
+    has_default: bool
+    default_val: str
+    required: bool
+    min_length: int
+    max_length: int
+    has_ge: bool
+    ge: int
+    has_le: bool
+    le: int
+    has_gt: bool
+    gt: int
+    has_lt: bool
+    lt: int
+    has_ge_f: bool
+    ge_f: float
+    has_le_f: bool
+    le_f: float
+    has_gt_f: bool
+    gt_f: float
+    has_lt_f: bool
+    lt_f: float
+    format: str
+    pattern: str
+    choices: List[str]
+    description: str
+    alias: str
+    strip_whitespace: bool
+    min_items: int
+    max_items: int
+    is_list: bool
+    list_item_type: str
+    is_optional: bool
+    inner_type: str
+    is_submodel: bool
+    submodel_name: str
+
+    def __init__(self, name: str, field_type: str):
+        self.name = name
+        self.field_type = field_type
+        self.has_default = False
+        self.default_val = ""
+        self.required = True
+        self.min_length = 0
+        self.max_length = 0
+        self.has_ge = False
+        self.ge = 0
+        self.has_le = False
+        self.le = 0
+        self.has_gt = False
+        self.gt = 0
+        self.has_lt = False
+        self.lt = 0
+        self.has_ge_f = False
+        self.ge_f = 0.0
+        self.has_le_f = False
+        self.le_f = 0.0
+        self.has_gt_f = False
+        self.gt_f = 0.0
+        self.has_lt_f = False
+        self.lt_f = 0.0
+        self.format = ""
+        self.pattern = ""
+        self.choices = List[str]()
+        self.description = ""
+        self.alias = ""
+        self.strip_whitespace = False
+        self.min_items = 0
+        self.max_items = 0
+        self.is_list = False
+        self.list_item_type = ""
+        self.is_optional = False
+        self.inner_type = field_type
+        self.is_submodel = False
+        self.submodel_name = ""
+
+
+class ParsedClass:
+    name: str
+    base_name: str
+    docstring: str
+    fields: List[ParsedField]
+    custom_methods: List[str]
+
+    def __init__(self, name: str, base_name: str = "BaseModel"):
+        self.name = name
+        self.base_name = base_name
+        self.docstring = ""
+        self.fields = List[ParsedField]()
+        self.custom_methods = List[str]()
+
+
+def _split_args(s: str) -> List[str]:
+    """Splits arguments by comma, strictly respecting quotes and square brackets."""
+    res = List[str]()
+    cur = ""
+    in_quotes = False
+    quote_char = ""
+    in_bracket = False
+
+    for i in range(len(s)):
+        ch = s[i]
+        if not in_quotes and (ch == '"' or ch == "'"):
+            in_quotes = True
+            quote_char = ch
+            cur += ch
+        elif in_quotes and ch == quote_char:
+            in_quotes = False
+            quote_char = ""
+            cur += ch
+        elif not in_quotes and ch == '[':
+            in_bracket = True
+            cur += ch
+        elif not in_quotes and ch == ']':
+            in_bracket = False
+            cur += ch
+        elif ch == ',' and not in_quotes and not in_bracket:
+            trimmed = cur.strip()
+            if len(trimmed) > 0:
+                res.append(trimmed)
+            cur = ""
+        else:
+            cur += ch
+
+    trimmed = cur.strip()
+    if len(trimmed) > 0:
+        res.append(trimmed)
+    return res
+
+
+def _strip_quotes(s: str) -> str:
+    trimmed = s.strip()
+    if (trimmed.startswith('r"') and trimmed.endswith('"')) or (trimmed.startswith("r'") and trimmed.endswith("'")):
+        if len(trimmed) >= 3:
+            return trimmed[2:-1]
+    if len(trimmed) >= 2:
+        if (trimmed[0] == '"' and trimmed[-1] == '"') or (trimmed[0] == "'" and trimmed[-1] == "'"):
+            return trimmed[1:-1]
+    return trimmed
+
+
+
+def _parse_list_elements(s: str) -> List[str]:
+    """Parses bracketed list such as ['a', 'b', 'c']"""
+    res = List[str]()
+    trimmed = s.strip()
+    if trimmed.startswith("[") and trimmed.endswith("]"):
+        inner = trimmed[1:-1]
+        items = _split_args(inner)
+        for item in items:
+            res.append(_strip_quotes(item))
+    return res
+
+
+def _populate_field_args(pf: ParsedField, arg_str: str) -> None:
+    args = _split_args(arg_str)
+    for i in range(len(args)):
+        arg = args[i]
+        eq_pos = arg.find("=")
+        if eq_pos < 0:
+            if i == 0:
+                if arg == "...":
+                    pf.required = True
+                else:
+                    pf.has_default = True
+                    pf.required = False
+                    pf.default_val = arg
+            continue
+        k = arg[:eq_pos].strip()
+        v = arg[eq_pos + 1:].strip()
+
+        if k == "min_length":
+            try:
+                pf.min_length = int(v)
+            except:
+                pass
+        elif k == "max_length":
+            try:
+                pf.max_length = int(v)
+            except:
+                pass
+        elif k == "ge":
+            try:
+                if "." in v:
+                    pf.has_ge_f = True
+                    pf.ge_f = float(v)
+                else:
+                    pf.has_ge = True
+                    pf.ge = int(v)
+            except:
+                pass
+        elif k == "le":
+            try:
+                if "." in v:
+                    pf.has_le_f = True
+                    pf.le_f = float(v)
+                else:
+                    pf.has_le = True
+                    pf.le = int(v)
+            except:
+                pass
+        elif k == "gt":
+            try:
+                if "." in v:
+                    pf.has_gt_f = True
+                    pf.gt_f = float(v)
+                else:
+                    pf.has_gt = True
+                    pf.gt = int(v)
+            except:
+                pass
+        elif k == "lt":
+            try:
+                if "." in v:
+                    pf.has_lt_f = True
+                    pf.lt_f = float(v)
+                else:
+                    pf.has_lt = True
+                    pf.lt = int(v)
+            except:
+                pass
+        elif k == "format":
+            pf.format = _strip_quotes(v)
+        elif k == "pattern":
+            pf.pattern = _strip_quotes(v)
+        elif k == "description":
+            pf.description = _strip_quotes(v)
+        elif k == "alias":
+            pf.alias = _strip_quotes(v)
+        elif k == "strip_whitespace":
+            pf.strip_whitespace = (v.lower() == "true")
+        elif k == "min_items":
+            try:
+                pf.min_items = int(v)
+            except:
+                pass
+        elif k == "max_items":
+            try:
+                pf.max_items = int(v)
+            except:
+                pass
+        elif k == "choices":
+            pf.choices = _parse_list_elements(v)
+        elif k == "required":
+            pf.required = (v.lower() == "true")
+        elif k == "default":
+            pf.has_default = True
+            pf.required = False
+            pf.default_val = v
+
+
+def _is_valid_schema_class(c: ParsedClass) -> bool:
+    if c.base_name != "BaseModel" and c.base_name != "SchemaModel":
+        return False
+    if len(c.fields) == 0:
+        return False
+    return True
+
+
+def _is_model_type_name(t: str, known_models: List[str]) -> bool:
+    for km in known_models:
+        if t == km:
+            return True
+    if len(t) > 0 and t[0].isupper():
+        if t != "List" and t != "Optional" and t != "Dict" and t != "Tuple" and t != "Set" and t != "Ptr" and t != "ByteSlice":
+            return True
+    return False
+
+
+def _resolve_field_type(pf: ParsedField, known_models: List[str]) -> None:
+    t = pf.field_type.strip()
+
+    # 1. Check for Optional[T]
+    if t.startswith("Optional[") and t.endswith("]"):
+        pf.is_optional = True
+        inner = t[9:-1].strip()
+        pf.inner_type = inner
+        if not pf.has_default:
+            pf.has_default = True
+            pf.required = False
+            pf.default_val = "None"
+    else:
+        pf.inner_type = t
+
+    # 2. Check for List[T]
+    if pf.inner_type.startswith("List[") and pf.inner_type.endswith("]"):
+        pf.is_list = True
+        pf.list_item_type = pf.inner_type[5:-1].strip()
+        if _is_model_type_name(pf.list_item_type, known_models):
+            pf.is_submodel = True
+            pf.submodel_name = pf.list_item_type
+    # 3. Check for SubModel
+    elif _is_model_type_name(pf.inner_type, known_models):
+        pf.is_submodel = True
+        pf.submodel_name = pf.inner_type
+
+
+def parse_schema_source(source_text: str) -> List[ParsedClass]:
+    """Parses Python-like schema definitions into strongly-typed AST ParsedClass list."""
+    classes = List[ParsedClass]()
+
+    # Strict signature guard: must import from CodonWeb schema or use SchemaModel/Field
+    has_schema_signature = (
+        ("from src.schema" in source_text) or
+        ("from codon_web" in source_text) or
+        ("import SchemaModel" in source_text) or
+        ("class SchemaModel" in source_text) or
+        ("BaseModel" in source_text and ("StrField" in source_text or "IntField" in source_text or "Field." in source_text or "Field(" in source_text or "ListField" in source_text))
+    )
+    if not has_schema_signature:
+        return classes
+
+    # Strip any previously injected in-place auto-generated blocks
+    clean_src = source_text
+    auto_marker = "# ==================== AUTO-GENERATED METHODS"
+    m_idx = clean_src.find(auto_marker)
+    if m_idx >= 0:
+        clean_src = clean_src[:m_idx]
+
+    lines = clean_src.split("\n")
+
+    current_class: Optional[ParsedClass] = None
+    in_docstring = False
+    in_method = False
+
+    for line_idx in range(len(lines)):
+        raw_line = lines[line_idx]
+        trimmed = raw_line.strip()
+
+        if len(trimmed) == 0:
+            if in_method and current_class is not None:
+                current_class.custom_methods.append(raw_line)
+            continue
+
+        # Handle comments
+        if trimmed.startswith("#"):
+            continue
+
+        # Class definition: class UserCreate(BaseModel): or class UserCreate(SchemaModel):
+        if trimmed.startswith("class ") and trimmed.endswith(":"):
+            if current_class is not None and _is_valid_schema_class(current_class):
+                classes.append(current_class)
+            in_method = False
+            in_docstring = False
+
+            class_decl = trimmed[6:-1].strip()
+            cls_name = class_decl
+            base_name = "BaseModel"
+
+            paren_pos = class_decl.find("(")
+            if paren_pos > 0 and class_decl.endswith(")"):
+                cls_name = class_decl[:paren_pos].strip()
+                base_name = class_decl[paren_pos + 1:-1].strip()
+
+            current_class = ParsedClass(cls_name, base_name)
+            continue
+
+        # Check indentation for class members
+        indent_level = len(raw_line) - len(raw_line.lstrip())
+
+        # If unindented line, class scope terminates
+        if indent_level == 0 and current_class is not None:
+            if _is_valid_schema_class(current_class):
+                classes.append(current_class)
+            current_class = None
+            in_method = False
+            in_docstring = False
+            continue
+
+        if current_class is None:
+            continue
+
+        # If currently inside a custom method, collect method lines
+        if in_method:
+            if indent_level >= 4:
+                current_class.custom_methods.append(raw_line)
+                continue
+            else:
+                in_method = False
+
+        # Custom method definition inside class
+        if trimmed.startswith("def "):
+            in_method = True
+            current_class.custom_methods.append(raw_line)
+            continue
+
+        # Class-level docstrings (only immediately after class definition)
+        if len(current_class.fields) == 0 and not in_method:
+            if trimmed.startswith('"""') or trimmed.startswith("'''"):
+                if in_docstring:
+                    in_docstring = False
+                else:
+                    in_docstring = True
+                    doc = trimmed[3:]
+                    if doc.endswith('"""') or doc.endswith("'''"):
+                        current_class.docstring = doc[:-3].strip()
+                        in_docstring = False
+                    else:
+                        current_class.docstring = doc.strip()
+                continue
+            elif in_docstring:
+                if trimmed.endswith('"""') or trimmed.endswith("'''"):
+                    current_class.docstring += " " + trimmed[:-3].strip()
+                    in_docstring = False
+                else:
+                    current_class.docstring += " " + trimmed
+                continue
+
+        # Parse field definition: <name>: <type> [= <FieldExpr>(...)]
+        colon_pos = trimmed.find(":")
+        if colon_pos > 0:
+            field_name = trimmed[:colon_pos].strip()
+            after_colon = trimmed[colon_pos + 1:].strip()
+
+            field_type = "str"
+            has_expr = False
+            expr = ""
+
+            eq_pos = after_colon.find("=")
+            if eq_pos > 0:
+                field_type = after_colon[:eq_pos].strip()
+                expr = after_colon[eq_pos + 1:].strip()
+                has_expr = True
+            else:
+                field_type = after_colon.strip()
+
+            pf = ParsedField(field_name, field_type)
+
+            if has_expr:
+                open_paren = expr.find("(")
+                close_paren = expr.rfind(")")
+                if open_paren > 0 and close_paren > open_paren:
+                    # Constructor like StrField(...) or Field.str(...) or Field(...)
+                    arg_str = expr[open_paren + 1:close_paren]
+                    _populate_field_args(pf, arg_str)
+                else:
+                    # Direct default literal: e.g. age: int = 18 or bio: Optional[str] = None
+                    pf.has_default = True
+                    pf.required = False
+                    pf.default_val = expr
+
+            current_class.fields.append(pf)
+
+    if current_class is not None and _is_valid_schema_class(current_class):
+        classes.append(current_class)
+
+    # Post-processing pass: Type resolution & dependency mapping
+    known_models = List[str]()
+    for c in classes:
+        known_models.append(c.name)
+
+    for c in classes:
+        for f in c.fields:
+            _resolve_field_type(f, known_models)
+
+    return classes

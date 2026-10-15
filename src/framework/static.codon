@@ -1,4 +1,4 @@
-from src.http.request import Request
+from src.http.request import Request, url_decode
 from src.http.response import Response
 from src.framework.route import RouteHandler
 
@@ -24,17 +24,43 @@ class StaticFilesHandler(RouteHandler):
 
     def handle(self, req: Request) -> Response:
         # Obtain relative path from wildcard parameter
-        rel_path = req.param("*")
-        if len(rel_path) == 0:
-            rel_path = "index.html"
+        raw_rel = req.param("*")
+        if len(raw_rel) == 0:
+            raw_rel = "index.html"
 
-        # Security check: Prevent path traversal attacks (../)
-        if ".." in rel_path:
-            return Response.text("Forbidden: Path traversal is not permitted", 403)
-        if rel_path.startswith("/"):
-            rel_path = rel_path[1:]
+        # 1. URL-decode the path parameter (handles %2e%2e, %2f, etc.)
+        decoded = url_decode(raw_rel)
 
-        full_path = self.base_dir + "/" + rel_path
+        # 2. Reject null byte injection
+        for i in range(len(decoded)):
+            if ord(decoded[i]) == 0:
+                return Response.text("Forbidden: Invalid path characters", 400)
+
+        # 3. Normalize path separators (replace backslash with slash)
+        normalized_chars = list[str]()
+        for i in range(len(decoded)):
+            if decoded[i] == '\\':
+                normalized_chars.append('/')
+            else:
+                normalized_chars.append(decoded[i])
+        normalized = "".join(normalized_chars)
+
+        # 4. Strict path traversal guard & canonical segments extraction
+        segments = normalized.split("/")
+        clean_segments = list[str]()
+        for i in range(len(segments)):
+            seg = segments[i].strip()
+            if len(seg) == 0 or seg == ".":
+                continue
+            if seg == ".." or ".." in seg:
+                return Response.text("Forbidden: Path traversal is not permitted", 403)
+            clean_segments.append(seg)
+
+        if len(clean_segments) == 0:
+            clean_segments.append("index.html")
+
+        clean_rel = "/".join(clean_segments)
+        full_path = self.base_dir + "/" + clean_rel
         resp = Response.file(full_path)
         if resp.status_code != 200:
             return resp

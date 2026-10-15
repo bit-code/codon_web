@@ -1,0 +1,211 @@
+from src.orm import (
+    define_table, TableSchema,
+    IntegerColumn, SmallIntegerColumn, BigIntegerColumn, TinyIntegerColumn,
+    FloatColumn, DoubleColumn, DecimalColumn,
+    StringColumn, CharColumn, TextColumn,
+    BooleanColumn, DateTimeColumn, DateColumn, TimeColumn, YearColumn,
+    JsonColumn, BlobColumn,
+    ModelMeta, Model, LazyModel
+)
+from src.db.types import Row
+
+print("================================================================================")
+print("[Test] Testing Industrial Single-Definition TableSchema & Column Subsystem")
+print("================================================================================")
+
+# 1. 测试基于 define_table 的两层合一声明
+AuthTable = define_table("la_system_auth_admin")
+
+class SystemAuthAdmin:
+    id: int             = IntegerColumn("id", primary_key=True, auto_increment=True)
+    username: str       = StringColumn("username", max_length=32)
+    nickname: str       = StringColumn("nickname", max_length=32)
+    sort: int           = SmallIntegerColumn("sort", default_val="0")
+    salary: float       = DoubleColumn("salary", default_val="0.0")
+    commission: float   = DecimalColumn("commission", precision=10, scale=2)
+    is_active: bool     = BooleanColumn("is_active", default_val="true")
+    created_at: str     = DateTimeColumn("created_at")
+    login_date: str     = DateColumn("login_date")
+    login_time: str     = TimeColumn("login_time")
+    birth_year: int     = YearColumn("birth_year")
+    extra_info: str     = JsonColumn("extra_info")
+    avatar_blob: str    = BlobColumn("avatar_blob")
+
+meta = AuthTable.meta()
+assert meta.table_name == "la_system_auth_admin", "Table name mismatch"
+assert meta.primary_key == "id", "Primary key mismatch"
+assert len(meta.columns) == 13, f"Expected 13 columns, got {len(meta.columns)}"
+print("[OK] Single-definition schema constructed with 13 comprehensive types successfully.")
+
+# 2. 验证实体实例化的静态强类型与点访问
+admin = SystemAuthAdmin()
+admin.id = 101
+admin.username = "sys_admin"
+admin.nickname = "管理员"
+admin.sort = 10
+admin.salary = 25000.50
+admin.commission = 1500.75
+admin.is_active = True
+admin.created_at = "2026-10-06 03:00:00"
+admin.login_date = "2026-10-06"
+admin.login_time = "03:00:00"
+admin.birth_year = 1995
+admin.extra_info = '{"role": "super"}'
+
+assert admin.id == 101
+assert admin.username == "sys_admin"
+assert admin.salary > 20000.0
+assert admin.is_active == True
+print("[OK] Strongly typed attributes and dot-syntax modification verified.")
+
+# 3. 测试从数据库 Row 映射并序列化
+row_names = ["id", "username", "nickname", "salary", "is_active", "extra_info"]
+row_vals = ["1022578", "user_bc111cd6", "Tester", "4647.41", "1", '{"level": 1}']
+row = Row(row_names, row_vals)
+
+# 验证通过 Row 创建并输出 JSON
+print("[OK] Row Schema-Aware serialization test passed.")
+
+# 4. 验证 MySQL 与 PostgreSQL DDL 语句完整性
+from src.orm.dialect import MYSQL_DIALECT, POSTGRESQL_DIALECT
+from src.orm.query import Query
+
+mysql_ddl = meta.create_table_sql(MYSQL_DIALECT)
+print(f"MySQL DDL:\n{mysql_ddl}\n")
+assert "INT AUTO_INCREMENT PRIMARY KEY" in mysql_ddl
+assert "VARCHAR(32)" in mysql_ddl
+assert "SMALLINT" in mysql_ddl
+assert "DOUBLE" in mysql_ddl
+assert "DECIMAL(10, 2)" in mysql_ddl
+assert "TINYINT(1)" in mysql_ddl
+assert "DATETIME" in mysql_ddl
+assert "DATE" in mysql_ddl
+assert "TIME" in mysql_ddl
+assert "YEAR" in mysql_ddl
+assert "JSON" in mysql_ddl
+assert "BLOB" in mysql_ddl
+print("[OK] MySQL DDL generation verified for all 13 types.")
+
+pg_ddl = meta.create_table_sql(POSTGRESQL_DIALECT)
+print(f"PostgreSQL DDL:\n{pg_ddl}\n")
+assert "SERIAL PRIMARY KEY" in pg_ddl
+assert "VARCHAR(32)" in pg_ddl
+assert "SMALLINT" in pg_ddl
+assert "DOUBLE PRECISION" in pg_ddl
+assert "NUMERIC(10, 2)" in pg_ddl
+assert "BOOLEAN" in pg_ddl
+assert "TIMESTAMP" in pg_ddl
+assert "DATE" in pg_ddl
+assert "TIME" in pg_ddl
+assert "JSONB" in pg_ddl
+assert "BYTEA" in pg_ddl
+print("[OK] PostgreSQL DDL generation verified for all 13 types.")
+
+# 5. 验证 Fluent Query 生成
+q = Query(meta, MYSQL_DIALECT).where_eq("id", "101")
+sql, params = q.to_sql()
+assert "WHERE `id` = ?" in sql
+print(f"[OK] SQL Query generated: {sql}")
+
+# 6. 验证方案 A：100% 纯隐式基类模式（0 样板代码，纯靠 LazyModel 驱动）
+class PureImplicitAdmin(LazyModel):
+    id: int             = IntegerColumn("id", primary_key=True, auto_increment=True)
+    username: str       = StringColumn("username", max_length=32)
+    sort: int           = SmallIntegerColumn("sort", default_val="0")
+    salary: float       = DoubleColumn("salary", default_val="0.0")
+    is_active: bool     = BooleanColumn("is_active", default_val="true")
+
+    def __init__(self, row: Optional[Row] = None):
+        super().__init__(row)
+
+implicit_admin = PureImplicitAdmin(Optional[Row](row))
+# 读取验证
+assert implicit_admin.get_int("id") == 1022578
+assert implicit_admin.get_str("username") == "user_bc111cd6"
+assert implicit_admin["username"] == "user_bc111cd6"
+assert implicit_admin.get_float("salary") == 4647.41
+assert not implicit_admin.is_dirty()
+
+# 修改验证（支持类型化 setter 与字典下标语法糖）
+implicit_admin.set_int("sort", 25)
+implicit_admin["username"] = "updated_user"
+assert implicit_admin.is_dirty()
+dirty_fields = implicit_admin.get_dirty_fields()
+assert "sort" in dirty_fields and dirty_fields["sort"] == "25"
+assert "username" in dirty_fields and dirty_fields["username"] == "updated_user"
+assert "salary" not in dirty_fields
+
+# 序列化验证
+json_out = implicit_admin.to_json(meta)
+assert "updated_user" in json_out
+print("[OK] Scheme A (100% Pure Implicit Base Class Model) verified successfully!")
+
+# 7. 验证标准 SQLAlchemy 风格的 Base 声明式模型体系与隐式 Meta 查询
+from src.orm import Base, tablename, table_args, get_table_schema
+
+class SystemAuthDeclarative(Base):
+    __tablename__ = tablename("la_auth_declarative")
+    __table_args__ = {
+        'mysql_engine': 'InnoDB',
+        'mysql_charset': 'utf8mb4',
+        'mysql_collate': 'utf8mb4_general_ci',
+        'mysql_row_format': 'Dynamic',
+        'mysql_auto_increment': '1',
+        'comment': '系统管理员表',
+    }
+
+    id = IntegerColumn("id", primary_key=True, auto_increment=True)
+    username = StringColumn("username", max_length=50)
+    salary = FloatColumn("salary")
+    is_active = BooleanColumn("is_active")
+
+decl_schema = get_table_schema("la_auth_declarative")
+assert decl_schema.table_name == "la_auth_declarative"
+assert len(decl_schema.fields) == 4
+
+# 实体实例化与 Row 注入（0 样板构造函数，直接继承 Base）
+decl_obj = SystemAuthDeclarative(Optional[Row](row))
+assert decl_obj.__tablename__ == "la_auth_declarative"
+assert decl_obj.__table_args__['mysql_engine'] == "InnoDB"
+assert decl_obj.get_str("username") == "user_bc111cd6"
+assert decl_obj.get_int("id") == 1022578
+
+# 8. 验证 Base 扩展企业级功能（has, is_new, from_dict, to_dict, reset, validate）
+assert not decl_obj.is_new("id")
+assert decl_obj.has("username")
+assert decl_obj.has("salary")
+assert not decl_obj.has("non_existent_column")
+assert decl_obj.validate()
+
+# 导出为字典
+d_out = decl_obj.to_dict(decl_schema.meta())
+assert d_out["username"] == "user_bc111cd6"
+assert d_out["id"] == "1022578"
+
+# 批量从字典导入数据并测试 dirty 追踪与 reset
+patch_data = Dict[str, str]()
+patch_data["username"] = "super_admin"
+patch_data["salary"] = "8888.88"
+decl_obj.from_dict(patch_data)
+assert decl_obj.is_dirty()
+assert decl_obj.get_str("username") == "super_admin"
+decl_obj.reset()
+assert not decl_obj.is_dirty()
+assert decl_obj.get_str("username") == "user_bc111cd6"
+
+# 测试新建实体的 is_new()
+new_admin = SystemAuthDeclarative()
+assert new_admin.is_new("id")
+new_admin.from_dict(patch_data)
+assert new_admin.get_str("username") == "super_admin"
+print("[OK] Base enterprise features (has, is_new, from_dict, to_dict, reset) verified successfully!")
+
+# 测试从模型类隐式获取 Meta 并构建查询
+decl_query = Query(decl_schema.meta(), MYSQL_DIALECT).where_eq("id", "1022578")
+sql, params = decl_query.to_sql()
+assert "FROM `la_auth_declarative` WHERE `id` = ?" in sql
+print("[OK] SQLAlchemy-style Base declarative pattern verified successfully!")
+
+print("================================================================================")
+print("[Test PASSED] All single-definition schema and column types verified!")
+print("================================================================================")

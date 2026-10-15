@@ -1,0 +1,257 @@
+# PostgreSQL Driver Connection & Cursor (based on libpq)
+from typing import Optional, List, Dict
+from src.db.types import FieldInfo, Row
+from src.db.errors import DatabaseError, InterfaceError, OperationalError, ProgrammingError, IntegrityError
+
+from C import strlen(Ptr[byte]) -> int
+
+from C import c_pg_connect(Ptr[byte]) -> Ptr[byte]
+from C import c_pg_status(Ptr[byte]) -> int
+from C import c_pg_error_message(Ptr[byte]) -> Ptr[byte]
+from C import c_pg_finish(Ptr[byte]) -> None
+
+from C import c_pg_exec_params(Ptr[byte], Ptr[byte], int, Ptr[Ptr[byte]]) -> Ptr[byte]
+from C import c_pg_result_status(Ptr[byte]) -> int
+from C import c_pg_result_error(Ptr[byte]) -> Ptr[byte]
+from C import c_pg_result_sqlstate(Ptr[byte]) -> Ptr[byte]
+from C import c_pg_clear_result(Ptr[byte]) -> None
+
+from C import c_pg_ntuples(Ptr[byte]) -> int
+from C import c_pg_nfields(Ptr[byte]) -> int
+from C import c_pg_fname(Ptr[byte], int) -> Ptr[byte]
+from C import c_pg_getvalue(Ptr[byte], int, int) -> Ptr[byte]
+from C import c_pg_getisnull(Ptr[byte], int, int) -> int
+from C import c_pg_cmd_tuples(Ptr[byte]) -> int
+from C import c_pg_ftype(Ptr[byte], int) -> int
+
+def _to_str(ptr: Ptr[byte]) -> str:
+    if not ptr:
+        return ""
+    l = strlen(ptr)
+    if l <= 0:
+        return ""
+    buf = Ptr[byte](l)
+    str.memcpy(buf, ptr, l)
+    return str(buf, l)
+
+
+class PostgresCursor:
+    conn_handle: Ptr[byte]
+    _rows: List[Row]
+    _row_idx: int
+    _fields: List[FieldInfo]
+    _field_names: List[str]
+    _affected_rows: int
+    _is_closed: bool
+
+    def __init__(self, conn_handle: Ptr[byte]):
+        self.conn_handle = conn_handle
+        self._rows = List[Row]()
+        self._row_idx = 0
+        self._fields = List[FieldInfo]()
+        self._field_names = List[str]()
+        self._affected_rows = 0
+        self._is_closed = False
+
+    @property
+    def rowcount(self) -> int:
+        if len(self._rows) > 0:
+            return len(self._rows)
+        return self._affected_rows
+
+    @property
+    def description(self) -> List[FieldInfo]:
+        return self._fields
+
+    def _reset(self) -> None:
+        self._rows.clear()
+        self._row_idx = 0
+        self._fields.clear()
+        self._field_names.clear()
+        self._affected_rows = 0
+
+    def execute(self, sql: str, params: list[str] = list[str]()) -> int:
+        self._reset()
+        if self._is_closed or not self.conn_handle:
+            raise InterfaceError("Cannot execute on closed PostgreSQL cursor/connection")
+
+        c_sql = sql.c_str().as_byte()
+        n_params = len(params)
+        
+        c_res: Ptr[byte] = Ptr[byte](0)
+        if n_params > 0:
+            param_ptrs = Ptr[Ptr[byte]](n_params)
+            for i in range(n_params):
+                param_ptrs[i] = params[i].c_str().as_byte()
+            c_res = c_pg_exec_params(self.conn_handle, c_sql, n_params, param_ptrs)
+        else:
+            c_res = c_pg_exec_params(self.conn_handle, c_sql, 0, Ptr[Ptr[byte]](0))
+
+        if not c_res:
+            err = _to_str(c_pg_error_message(self.conn_handle))
+            raise OperationalError("PostgreSQL query failed: " + err)
+
+        status = c_pg_result_status(c_res)
+        if status < 0:
+            err = _to_str(c_pg_result_error(c_res))
+            sqlstate = _to_str(c_pg_result_sqlstate(c_res))
+            c_pg_clear_result(c_res)
+            if sqlstate.startswith("23"):
+                raise IntegrityError("PostgreSQL IntegrityError [" + sqlstate + "]: " + err)
+            elif sqlstate.startswith("42"):
+                raise ProgrammingError("PostgreSQL ProgrammingError [" + sqlstate + "]: " + err)
+            elif sqlstate.startswith("08"):
+                raise OperationalError("PostgreSQL OperationalError [" + sqlstate + "]: " + err)
+            else:
+                raise DatabaseError("PostgreSQL SQL error [" + sqlstate + "]: " + err)
+
+        if status == 1:
+            # COMMAND_OK (INSERT / UPDATE / DELETE / DDL)
+            self._affected_rows = c_pg_cmd_tuples(c_res)
+            c_pg_clear_result(c_res)
+            return self._affected_rows
+        elif status == 2:
+            # TUPLES_OK (SELECT or INSERT...RETURNING)
+            n_rows = c_pg_ntuples(c_res)
+            n_cols = c_pg_nfields(c_res)
+
+            for j in range(n_cols):
+                col_name = _to_str(c_pg_fname(c_res, j))
+                col_oid = c_pg_ftype(c_res, j)
+                self._field_names.append(col_name)
+                self._fields.append(FieldInfo(name=col_name, column_type=col_oid))
+
+            for r in range(n_rows):
+                vals = List[Optional[str]]()
+                for c in range(n_cols):
+                    if c_pg_getisnull(c_res, r, c) == 1:
+                        vals.append(None)
+                    else:
+                        val_str = _to_str(c_pg_getvalue(c_res, r, c))
+                        vals.append(val_str)
+                self._rows.append(Row(self._field_names, vals, self._fields))
+
+            c_pg_clear_result(c_res)
+            return len(self._rows)
+
+        c_pg_clear_result(c_res)
+        return 0
+
+    def fetchone(self) -> Optional[Row]:
+        if self._row_idx < len(self._rows):
+            row = self._rows[self._row_idx]
+            self._row_idx += 1
+            return row
+        return None
+
+    def fetchall(self) -> List[Row]:
+        if self._row_idx == 0:
+            self._row_idx = len(self._rows)
+            return list(self._rows)
+        remaining = List[Row]()
+        while self._row_idx < len(self._rows):
+            remaining.append(self._rows[self._row_idx])
+            self._row_idx += 1
+        return remaining
+
+    def close(self) -> None:
+        self._is_closed = True
+        self._reset()
+
+
+class PostgresConnection:
+    conn_handle: Ptr[byte]
+    is_closed: bool
+    database: str
+    in_transaction: bool
+
+    def __init__(self, conninfo: str, database: str = ""):
+        self.conn_handle = Ptr[byte](0)
+        self.is_closed = True
+        self.database = database
+        self.in_transaction = False
+
+        h = c_pg_connect(conninfo.c_str().as_byte())
+        if not h or c_pg_status(h) != 0:
+            err = ""
+            if h:
+                err = _to_str(c_pg_error_message(h))
+                c_pg_finish(h)
+            raise OperationalError("Failed to connect to PostgreSQL: " + err)
+
+        self.conn_handle = h
+        self.is_closed = False
+
+    def cursor(self) -> PostgresCursor:
+        if self.is_closed or not self.conn_handle:
+            raise InterfaceError("Cannot create cursor on closed PostgreSQL connection")
+        return PostgresCursor(self.conn_handle)
+
+    def execute(self, sql: str, params: list[str] = list[str]()) -> Tuple[int, List[Row]]:
+        cur = self.cursor()
+        cnt = cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+        return (cnt, rows)
+
+    def commit(self) -> None:
+        if self.is_closed or not self.conn_handle:
+            raise InterfaceError("Cannot commit on closed connection")
+        cur = self.cursor()
+        cur.execute("COMMIT")
+        cur.close()
+        self.in_transaction = False
+
+    def rollback(self) -> None:
+        if self.is_closed or not self.conn_handle:
+            raise InterfaceError("Cannot rollback on closed connection")
+        cur = self.cursor()
+        cur.execute("ROLLBACK")
+        cur.close()
+        self.in_transaction = False
+
+    def begin(self) -> None:
+        if self.is_closed or not self.conn_handle:
+            raise InterfaceError("Cannot begin transaction on closed connection")
+        cur = self.cursor()
+        cur.execute("BEGIN")
+        cur.close()
+        self.in_transaction = True
+
+    def ping(self) -> bool:
+        if self.is_closed or not self.conn_handle:
+            return False
+        return (c_pg_status(self.conn_handle) == 0)
+
+    def close(self) -> None:
+        if not self.is_closed and self.conn_handle:
+            c_pg_finish(self.conn_handle)
+            self.conn_handle = Ptr[byte](0)
+            self.is_closed = True
+
+    def __del__(self):
+        if not self.is_closed and self.conn_handle:
+            c_pg_finish(self.conn_handle)
+            self.conn_handle = Ptr[byte](0)
+            self.is_closed = True
+
+
+def connect(
+    host: str = "127.0.0.1",
+    port: int = 5432,
+    user: str = "postgres",
+    password: str = "",
+    database: str = "postgres",
+    conninfo: str = ""
+) -> PostgresConnection:
+    if len(conninfo) == 0:
+        info_parts = [
+            "host=" + host,
+            "port=" + str(port),
+            "user=" + user,
+            "dbname=" + database
+        ]
+        if len(password) > 0:
+            info_parts.append("password=" + password)
+        conninfo = " ".join(info_parts)
+    return PostgresConnection(conninfo, database=database)

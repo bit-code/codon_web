@@ -3,6 +3,7 @@ from src.http.request import Request
 from src.http.response import Response
 from src.http.fast_json import FastJson, FastJsonDoc
 from src.memory.slice import ByteSlice
+from src.memory.buffer import ByteBuffer
 
 def make_req(body_str: str) -> Request:
     req = Request()
@@ -94,6 +95,23 @@ def test_unicode_utf8():
     assert d2["url"] == "https://example.com/api?a=1&b=2"
     print("PASS: Unicode UTF-8 & special characters round-trip")
 
+def test_large_field_protection():
+    # Test 64KB+ large field to ensure no truncation occurs
+    large_val = "x" * 65536
+    payload = {
+        "status": "ok",
+        "data": large_val,
+        "tail": "end_of_payload"
+    }
+    resp = Response.json(payload, 200)
+    dest = ByteBuffer(131072)
+    resp.serialize(dest, keep_alive=True)
+    body_str = resp.body
+    assert len(body_str) >= 65536
+    assert '"status":"ok"' in body_str
+    assert '"tail":"end_of_payload"' in body_str
+    print("PASS: Large field (64KB+) serialization with zero truncation")
+
 def main():
     print("--- Running FastJson Integration Tests ---")
     test_request_json()
@@ -102,6 +120,7 @@ def main():
     test_response_json_doc()
     test_response_json_dict()
     test_unicode_utf8()
+    test_large_field_protection()
     print("==========================================")
     print("ALL PHASE 1 & PHASE 2 INTEGRATION TESTS PASSED!")
     print("==========================================")

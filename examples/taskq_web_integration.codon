@@ -1,0 +1,103 @@
+# CodonWeb + TaskQ Real-World Web Integration Example
+# Demonstrates:
+# 1. Initiating background tasks from REST API endpoints (POST /api/jobs)
+# 2. Returning HTTP 202 Accepted immediately with a unique task_id
+# 3. Querying task status and result via polling API (GET /api/jobs/{task_id})
+# 4. Scheduling delayed ETA tasks from HTTP request (POST /api/jobs/delayed)
+
+from codon_web import App, Request, Response
+from src.taskq import (
+    TaskClient,
+    MemoryBroker,
+    RedisBroker,
+    AsyncTaskHandler,
+    AsyncTaskRegistry,
+    AsyncWorker,
+    AsyncWorkerConfig
+)
+
+# ----------------- 1. Define Asynchronous Tasks -----------------
+
+class WebCrawlerTask(AsyncTaskHandler):
+    def __init__(self):
+        super().__init__("crawler:fetch", max_retries=3, default_queue="crawlers")
+
+    async def run(self, payload: str):
+        from src.core.async import sleep
+        # Simulate non-blocking asynchronous web page scraping (e.g. 50ms)
+        await sleep(0.05)
+        return f'{{"scraped": true, "url": "{payload}", "status": 200}}'
+
+
+# ----------------- 2. Setup Broker, Client & Registry -----------------
+
+# Use RedisBroker(host="127.0.0.1", port=6379) in production
+broker = MemoryBroker()
+task_client = TaskClient(broker=broker, default_queue="crawlers")
+
+registry = AsyncTaskRegistry()
+registry.register(WebCrawlerTask())
+
+# ----------------- 3. Build Web API Application -----------------
+
+app = App()
+
+# API 1: Submit an asynchronous background job
+# POST /api/jobs
+# Body: {"url": "https://news.ycombinator.com"}
+@app.post("/api/jobs")
+def create_crawl_job(req: Request) -> Response:
+    body = req.json()
+    url = body.get("url", "")
+    if len(url) == 0:
+        return Response.json('{"error": "Missing \'url\' in request body"}', 400)
+
+    # Dispatch to background queue in sub-millisecond time (NON-BLOCKING)
+    task_id = task_client.delay("crawler:fetch", url, queue="crawlers")
+
+    # Standard RESTful design: Return 202 Accepted with polling URL
+    resp_body = (
+        f'{{"status":"queued","task_id":"{task_id}",'
+        f'"check_url":"/api/jobs/{task_id}"}}'
+    )
+    return Response.json(resp_body, 202)
+
+
+# API 2: Query task execution status and result
+# GET /api/jobs/{task_id}
+@app.get("/api/jobs/{task_id:str}")
+def get_job_status(req: Request) -> Response:
+    task_id = req.param("task_id")
+    result = task_client.get_result(task_id)
+
+    if result is None:
+        # Task is still in queue or currently running
+        return Response.json(f'{{"task_id":"{task_id}","status":"PENDING"}}', 200)
+
+    # Task is completed (SUCCESS / FAILURE / RETRY)
+    return Response.json(result.to_json(), 200)
+
+
+# API 3: Schedule a delayed task (e.g. delay execution by N seconds)
+# POST /api/jobs/delayed
+# Query param: ?delay=10
+@app.post("/api/jobs/delayed")
+def create_delayed_job(req: Request) -> Response:
+    body = req.json()
+    url = body.get("url", "")
+    delay_sec = req.query_param_int("delay", 5)
+
+    task_id = task_client.delay("crawler:fetch", url, queue="crawlers", eta_sec=delay_sec)
+
+    return Response.json(
+        f'{{"status":"scheduled","task_id":"{task_id}","eta_seconds":{delay_sec}}}',
+        202
+    )
+
+if __name__ == "__main__":
+    print("CodonWeb + TaskQ API Server listening on http://127.0.0.1:8080")
+    print("Endpoints:")
+    print("  POST /api/jobs          -> Submit async crawl job")
+    print("  GET  /api/jobs/{task_id} -> Query task execution result")
+    print("  POST /api/jobs/delayed  -> Schedule delayed job")
+    app.run(host="127.0.0.1", port=8080)

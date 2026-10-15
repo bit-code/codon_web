@@ -1,0 +1,369 @@
+# Select Query Builder for Codon ORM
+from typing import List, Tuple, Optional
+from src.orm.dialect import Dialect, MYSQL_DIALECT, POSTGRESQL_DIALECT
+from src.orm.engine import escape_sql_param
+from src.orm.model import ModelMeta
+from src.orm.sql.expression import (
+    CompileContext, ClauseElement, BinaryClause, UnaryClause, InClause, BetweenClause,
+    CompoundClause, RawClause
+)
+from src.orm.sql.column import Column, OrderByClause
+from src.orm.sql.table import Table
+from src.orm.sql.compiler import SQLCompiler
+
+class JoinClause:
+    join_type: str # "INNER JOIN", "LEFT JOIN", "RIGHT JOIN"
+    table_name: str
+    table_alias: str
+    on_clause: ClauseElement
+
+    def __init__(self, join_type: str, table_name: str, table_alias: str, on_clause: ClauseElement):
+        self.join_type = join_type.strip().upper()
+        self.table_name = table_name
+        self.table_alias = table_alias
+        self.on_clause = on_clause
+
+
+class Select:
+    _columns: List[Column]
+    _from_table: str
+    _from_alias: str
+    _where_clauses: List[ClauseElement]
+    _order_by_clauses: List[OrderByClause]
+    _group_by_columns: List[str]
+    _having_clauses: List[ClauseElement]
+    _joins: List[JoinClause]
+    _limit_val: int
+    _offset_val: int
+    _is_distinct: bool
+    _lock_mode: str
+    _lock_nowait: bool
+    _lock_skip_locked: bool
+
+    def __init__(self):
+        self._columns = List[Column]()
+        self._from_table = ""
+        self._from_alias = ""
+        self._where_clauses = List[ClauseElement]()
+        self._order_by_clauses = List[OrderByClause]()
+        self._group_by_columns = List[str]()
+        self._having_clauses = List[ClauseElement]()
+        self._joins = List[JoinClause]()
+        self._limit_val = -1
+        self._offset_val = -1
+        self._is_distinct = False
+        self._lock_mode = "NONE"
+        self._lock_nowait = False
+        self._lock_skip_locked = False
+
+    def select_from(self, table: Table) -> Select:
+        self._from_table = table.name
+        self._from_alias = table.alias
+        return self
+
+    def select_from(self, table_name: str) -> Select:
+        self._from_table = table_name
+        self._from_alias = ""
+        return self
+
+    def select_from(self, meta: ModelMeta) -> Select:
+        self._from_table = meta.table_name
+        self._from_alias = ""
+        return self
+
+    def where(self, *args) -> Select:
+        for a in args:
+            if isinstance(a, ClauseElement):
+                self._where_clauses.append(a)
+            elif isinstance(a, str):
+                self._where_clauses.append(RawClause(a))
+            elif isinstance(a, list):
+                for item in a:
+                    if isinstance(item, ClauseElement):
+                        self._where_clauses.append(item)
+                    elif isinstance(item, str):
+                        self._where_clauses.append(RawClause(item))
+        return self
+
+    def order_by(self, *args) -> Select:
+        for a in args:
+            if isinstance(a, OrderByClause):
+                self._order_by_clauses.append(a)
+            elif isinstance(a, Column):
+                self._order_by_clauses.append(a.asc())
+            elif isinstance(a, str):
+                parts = a.strip().split()
+                if len(parts) >= 2 and parts[1].upper() == "DESC":
+                    self._order_by_clauses.append(OrderByClause(parts[0], "DESC"))
+                else:
+                    self._order_by_clauses.append(OrderByClause(parts[0], "ASC"))
+            elif isinstance(a, list):
+                for item in a:
+                    if isinstance(item, OrderByClause):
+                        self._order_by_clauses.append(item)
+                    elif isinstance(item, Column):
+                        self._order_by_clauses.append(item.asc())
+                    elif isinstance(item, str):
+                        parts = item.strip().split()
+                        if len(parts) >= 2 and parts[1].upper() == "DESC":
+                            self._order_by_clauses.append(OrderByClause(parts[0], "DESC"))
+                        else:
+                            self._order_by_clauses.append(OrderByClause(parts[0], "ASC"))
+        return self
+
+    def group_by(self, *args) -> Select:
+        for a in args:
+            if isinstance(a, Column):
+                self._group_by_columns.append(a.get_qualified_name())
+            elif isinstance(a, str):
+                self._group_by_columns.append(a)
+            elif isinstance(a, list):
+                for item in a:
+                    if isinstance(item, Column):
+                        self._group_by_columns.append(item.get_qualified_name())
+                    elif isinstance(item, str):
+                        self._group_by_columns.append(item)
+        return self
+
+    def having(self, *args) -> Select:
+        for a in args:
+            if isinstance(a, ClauseElement):
+                self._having_clauses.append(a)
+            elif isinstance(a, str):
+                self._having_clauses.append(RawClause(a))
+            elif isinstance(a, list):
+                for item in a:
+                    if isinstance(item, ClauseElement):
+                        self._having_clauses.append(item)
+                    elif isinstance(item, str):
+                        self._having_clauses.append(RawClause(item))
+        return self
+
+    def limit(self, count: int) -> Select:
+        self._limit_val = count
+        return self
+
+    def offset(self, off: int) -> Select:
+        self._offset_val = off
+        return self
+
+    def distinct(self, flag: bool = True) -> Select:
+        self._is_distinct = flag
+        return self
+
+    def for_update(self, nowait: bool = False, skip_locked: bool = False) -> Select:
+        self._lock_mode = "FOR UPDATE"
+        self._lock_nowait = nowait
+        self._lock_skip_locked = skip_locked
+        return self
+
+    def with_for_update(self, nowait: bool = False, skip_locked: bool = False) -> Select:
+        return self.for_update(nowait=nowait, skip_locked=skip_locked)
+
+    def for_share(self, nowait: bool = False, skip_locked: bool = False) -> Select:
+        self._lock_mode = "FOR SHARE"
+        self._lock_nowait = nowait
+        self._lock_skip_locked = skip_locked
+        return self
+
+    def with_for_share(self, nowait: bool = False, skip_locked: bool = False) -> Select:
+        return self.for_share(nowait=nowait, skip_locked=skip_locked)
+
+    def join(self, table: Table, on_clause: ClauseElement) -> Select:
+        self._joins.append(JoinClause("INNER JOIN", table.name, table.alias, on_clause))
+        return self
+
+    def join(self, table_name: str, on_clause: ClauseElement) -> Select:
+        self._joins.append(JoinClause("INNER JOIN", table_name, "", on_clause))
+        return self
+
+    def inner_join(self, table: Table, on_clause: ClauseElement) -> Select:
+        return self.join(table, on_clause)
+
+    def inner_join(self, table_name: str, on_clause: ClauseElement) -> Select:
+        return self.join(table_name, on_clause)
+
+    def left_join(self, table: Table, on_clause: ClauseElement) -> Select:
+        self._joins.append(JoinClause("LEFT JOIN", table.name, table.alias, on_clause))
+        return self
+
+    def left_join(self, table_name: str, on_clause: ClauseElement) -> Select:
+        self._joins.append(JoinClause("LEFT JOIN", table_name, "", on_clause))
+        return self
+
+    def right_join(self, table: Table, on_clause: ClauseElement) -> Select:
+        self._joins.append(JoinClause("RIGHT JOIN", table.name, table.alias, on_clause))
+        return self
+
+    def right_join(self, table_name: str, on_clause: ClauseElement) -> Select:
+        self._joins.append(JoinClause("RIGHT JOIN", table_name, "", on_clause))
+        return self
+
+    def compile_inner(self, compiler: CompileContext) -> str:
+        dialect = compiler.dialect
+
+        # 1. SELECT clause
+        select_kw = "SELECT DISTINCT " if self._is_distinct else "SELECT "
+        cols_parts = List[str]()
+        if len(self._columns) == 0:
+            cols_parts.append("*")
+        else:
+            for col in self._columns:
+                q_name = compiler.quote_identifier(col.get_qualified_name())
+                if len(col.alias) > 0:
+                    cols_parts.append(q_name + " AS " + dialect.quote_identifier(col.alias))
+                else:
+                    cols_parts.append(q_name)
+        sql = select_kw + ", ".join(cols_parts)
+
+        # 2. FROM clause
+        if len(self._from_table) > 0:
+            q_table = compiler.quote_identifier(self._from_table)
+            if len(self._from_alias) > 0:
+                q_table += " AS " + dialect.quote_identifier(self._from_alias)
+            sql += " FROM " + q_table
+        elif len(self._columns) > 0 and len(self._columns[0].table_name) > 0:
+            # Auto-infer FROM table from first column if not explicitly given
+            q_table = compiler.quote_identifier(self._columns[0].table_name)
+            sql += " FROM " + q_table
+
+        # 3. JOIN clauses
+        for j in self._joins:
+            on_sql = compiler.compile_clause(j.on_clause)
+            q_target = compiler.quote_identifier(j.table_name)
+            if len(j.table_alias) > 0:
+                q_target += " AS " + dialect.quote_identifier(j.table_alias)
+            sql += " " + j.join_type + " " + q_target + " ON " + on_sql
+
+        # 4. WHERE clause
+        if len(self._where_clauses) > 0:
+            where_parts = List[str]()
+            for w in self._where_clauses:
+                part = compiler.compile_clause(w)
+                if len(part) > 0:
+                    where_parts.append(part)
+            if len(where_parts) > 0:
+                sql += " WHERE " + " AND ".join(where_parts)
+
+        # 5. GROUP BY clause
+        if len(self._group_by_columns) > 0:
+            q_groups = List[str]()
+            for gb in self._group_by_columns:
+                q_groups.append(compiler.quote_identifier(gb))
+            sql += " GROUP BY " + ", ".join(q_groups)
+
+        # 6. HAVING clause
+        if len(self._having_clauses) > 0:
+            having_parts = List[str]()
+            for h in self._having_clauses:
+                part = compiler.compile_clause(h)
+                if len(part) > 0:
+                    having_parts.append(part)
+            if len(having_parts) > 0:
+                sql += " HAVING " + " AND ".join(having_parts)
+
+        # 7. ORDER BY clause
+        if len(self._order_by_clauses) > 0:
+            order_parts = List[str]()
+            for ob in self._order_by_clauses:
+                q_col = compiler.quote_identifier(ob.column_name)
+                order_parts.append(q_col + " " + ob.direction)
+            sql += " ORDER BY " + ", ".join(order_parts)
+
+        # 8. LIMIT and OFFSET
+        sql += dialect.limit_offset(self._limit_val, self._offset_val)
+
+        # 9. Locking hints (FOR UPDATE / FOR SHARE)
+        if self._lock_mode == "FOR UPDATE":
+            sql += " FOR UPDATE"
+            if self._lock_nowait:
+                sql += " NOWAIT"
+            elif self._lock_skip_locked:
+                sql += " SKIP LOCKED"
+        elif self._lock_mode == "FOR SHARE":
+            sql += " FOR SHARE"
+            if self._lock_nowait:
+                sql += " NOWAIT"
+            elif self._lock_skip_locked:
+                sql += " SKIP LOCKED"
+
+        return sql
+
+    def to_sql(self, dialect: Dialect = MYSQL_DIALECT) -> Tuple[str, List[str]]:
+        compiler = SQLCompiler(dialect)
+        sql = self.compile_inner(compiler)
+        return (sql, compiler.params)
+
+    def compile(self, dialect: Dialect = MYSQL_DIALECT) -> str:
+        sql, params = self.to_sql(dialect)
+        if len(params) == 0:
+            return sql
+        # Interpolate parameters safely for logging / inspection
+        parts = List[str]()
+        param_idx = 0
+        i = 0
+        while i < len(sql):
+            c = sql[i]
+            if c == '?' or (dialect.name == "postgresql" and c == '$'):
+                if c == '$':
+                    # Skip digits
+                    i += 1
+                    while i < len(sql) and sql[i] >= '0' and sql[i] <= '9':
+                        i += 1
+                    if param_idx < len(params):
+                        parts.append(escape_sql_param(params[param_idx]))
+                        param_idx += 1
+                    continue
+                else:
+                    if param_idx < len(params):
+                        parts.append(escape_sql_param(params[param_idx]))
+                        param_idx += 1
+                    else:
+                        parts.append("?")
+                    i += 1
+            else:
+                parts.append(c)
+                i += 1
+        return "".join(parts)
+
+
+def select(*args) -> Select:
+    stmt = Select()
+    for a in args:
+        if isinstance(a, Column):
+            stmt._columns.append(a)
+        elif isinstance(a, str):
+            stmt._columns.append(Column(a))
+        elif isinstance(a, list):
+            for item in a:
+                if isinstance(item, Column):
+                    stmt._columns.append(item)
+                elif isinstance(item, str):
+                    stmt._columns.append(Column(item))
+    return stmt
+
+
+class SubqueryInClause(ClauseElement):
+    column_name: str
+    subquery: Select
+    is_not: bool
+
+    def __init__(self, column_name: str, subquery: Select, is_not: bool = False):
+        self.column_name = column_name
+        self.subquery = subquery
+        self.is_not = is_not
+
+    def compile(self, ctx: CompileContext) -> str:
+        left_str = ctx.quote_identifier(self.column_name)
+        inner_sql = self.subquery.compile_inner(ctx)
+        in_kw = "NOT IN" if self.is_not else "IN"
+        return left_str + " " + in_kw + " (" + inner_sql + ")"
+
+
+@extend
+class Column:
+    def in_(self, subquery: Select) -> SubqueryInClause:
+        return SubqueryInClause(self.get_qualified_name(), subquery, is_not=False)
+
+    def not_in(self, subquery: Select) -> SubqueryInClause:
+        return SubqueryInClause(self.get_qualified_name(), subquery, is_not=True)

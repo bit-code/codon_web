@@ -1,0 +1,87 @@
+# Async Distributed Task Queue Demo - High-Concurrency Web Crawler
+# Demonstrates running 30 concurrent async I/O crawler tasks on 1 single Worker instance
+
+import time
+from src.core.async import run, sleep
+from src.taskq import (
+    TaskClient,
+    MemoryBroker,
+    RedisBroker,
+    AsyncTaskHandler,
+    AsyncTaskRegistry,
+    AsyncWorker,
+    AsyncWorkerConfig
+)
+
+# ----------------- 1. Define Asynchronous Tasks -----------------
+
+class AsyncWebCrawler(AsyncTaskHandler):
+    def __init__(self):
+        super().__init__("crawler:fetch", max_retries=3, default_queue="crawlers")
+
+    async def run(self, payload: str):
+        # Simulate non-blocking HTTP request with Epoll
+        # e.g. awaiting remote DNS resolution + TLS handshake + HTTP response
+        await sleep(0.08)
+        return f'{{"url": "{payload}", "status_code": 200, "content_length": 34812}}'
+
+
+class AsyncDataProcessor(AsyncTaskHandler):
+    def __init__(self):
+        super().__init__("pipeline:process", max_retries=2, default_queue="pipeline")
+
+    async def run(self, payload: str):
+        # Simulate async database write or cache warmup
+        await sleep(0.04)
+        return f'{{"status": "indexed", "item": "{payload}"}}'
+
+
+# ----------------- 2. Producer & Consumer Workflow -----------------
+
+async def main():
+    print("==================================================================")
+    print("      Codon TaskQ - Async High-Concurrency Task Engine Demo       ")
+    print("==================================================================")
+
+    broker = MemoryBroker() # In production, use RedisBroker(host="127.0.0.1")
+    registry = AsyncTaskRegistry()
+
+    # Register handlers
+    registry.register(AsyncWebCrawler())
+    registry.register(AsyncDataProcessor())
+
+    client = TaskClient(broker=broker, default_queue="crawlers")
+
+    # A. Enqueue 30 Crawler Tasks
+    num_crawlers = 30
+    print(f"\n[Producer] Submitting {num_crawlers} async crawler tasks...")
+    for i in range(num_crawlers):
+        client.delay("crawler:fetch", f"https://example.com/products/{1000 + i}", queue="crawlers")
+
+    # B. Initialize 1 Single AsyncWorker with concurrency=50
+    print("[Worker] Starting 1 single AsyncWorker (Concurrency = 50)...")
+    worker = AsyncWorker(
+        broker=broker,
+        registry=registry,
+        config=AsyncWorkerConfig(queues=["crawlers", "pipeline"], concurrency=50)
+    )
+
+    t0 = time.time()
+
+    # Worker event loop runs non-blockingly
+    while worker.stats.total_succeeded < num_crawlers:
+        await worker.step()
+        await sleep(0.005)
+
+    elapsed = time.time() - t0
+
+    print("\n--- Execution Performance Benchmark ---")
+    print(f"Total Tasks Completed:    {worker.stats.total_succeeded} / {num_crawlers}")
+    print(f"Actual Wall-Clock Time:   {elapsed:.3f} seconds (1 Worker instance)")
+    print(f"Sequential Expected Time: {num_crawlers * 0.08:.2f} seconds")
+    speedup = (num_crawlers * 0.08) / max(0.001, elapsed)
+    print(f"Concurrency Speedup:      {speedup:.1f}x faster!")
+    print("\n High-concurrency async crawling on 1 Worker completed successfully!")
+
+if __name__ == "__main__":
+    run(main())

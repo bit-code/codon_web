@@ -1,0 +1,32 @@
+from C import c_get_http_date_rfc1123(Ptr[byte], int) -> int
+from src.memory.slice import ByteSlice
+
+class DateCache:
+    ptr: Ptr[byte]
+    len: int
+    initialized: bool
+
+    def __init__(self):
+        self.ptr = Ptr[byte](64)
+        self.len = 0
+        self.initialized = False
+        self.update()
+
+    def update(self) -> None:
+        n = c_get_http_date_rfc1123(self.ptr, 64)
+        if n > 0:
+            self.len = n
+            self.initialized = True
+
+    def get_slice(self) -> ByteSlice:
+        if not self.initialized:
+            self.update()
+        return ByteSlice(self.ptr, self.len)
+
+_global_date_cache: Optional[DateCache] = None
+
+def get_date_cache() -> DateCache:
+    global _global_date_cache
+    if _global_date_cache is None:
+        _global_date_cache = DateCache()
+    return _global_date_cache

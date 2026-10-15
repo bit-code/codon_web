@@ -13,20 +13,26 @@ METHOD_UNKNOWN: i32 = i32(0)
 class HttpMethod:
     @staticmethod
     def from_slice(s: ByteSlice) -> i32:
-        if s.equals_ascii("GET"):
-            return METHOD_GET
-        if s.equals_ascii("POST"):
-            return METHOD_POST
-        if s.equals_ascii("PUT"):
-            return METHOD_PUT
-        if s.equals_ascii("DELETE"):
-            return METHOD_DELETE
-        if s.equals_ascii("HEAD"):
-            return METHOD_HEAD
-        if s.equals_ascii("OPTIONS"):
-            return METHOD_OPTIONS
-        if s.equals_ascii("PATCH"):
-            return METHOD_PATCH
+        slen = s.len
+        if slen == 3:
+            if s.ptr[0] == byte(71) and s.ptr[1] == byte(69) and s.ptr[2] == byte(84): # GET
+                return METHOD_GET
+            if s.ptr[0] == byte(80) and s.ptr[1] == byte(85) and s.ptr[2] == byte(84): # PUT
+                return METHOD_PUT
+        elif slen == 4:
+            if s.ptr[0] == byte(80) and s.ptr[1] == byte(79) and s.ptr[2] == byte(83) and s.ptr[3] == byte(84): # POST
+                return METHOD_POST
+            if s.ptr[0] == byte(72) and s.ptr[1] == byte(69) and s.ptr[2] == byte(65) and s.ptr[3] == byte(68): # HEAD
+                return METHOD_HEAD
+        elif slen == 6:
+            if s.equals_ascii("DELETE"):
+                return METHOD_DELETE
+        elif slen == 5:
+            if s.equals_ascii("PATCH"):
+                return METHOD_PATCH
+        elif slen == 7:
+            if s.equals_ascii("OPTIONS"):
+                return METHOD_OPTIONS
         return METHOD_UNKNOWN
 
     @staticmethod

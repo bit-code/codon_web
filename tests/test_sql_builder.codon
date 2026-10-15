@@ -1,0 +1,346 @@
+# Comprehensive Test Suite for SQLAlchemy-Style SQL Builder in Codon ORM
+from typing import List, Tuple, Dict
+from src.orm.dialect import MYSQL_DIALECT, POSTGRESQL_DIALECT
+from src.orm.sql import (
+    select, Select, Table, Column, OrderByClause,
+    and_, or_, not_, text, desc, asc, func,
+    insert, update, delete, Insert, Update, Delete
+)
+from src.orm.model import ModelMeta
+from src.orm.fields import Field, IntegerField, CharField, DateTimeField
+
+print("=== Starting SQL Builder Industrial Test Suite ===")
+
+# ==============================================================================
+# 1. User Scenario: Exact user syntax pattern
+# select(*self.list_columns).select_from(yx_rx_gpc_demand_err).where(*conditions).order_by(table.ID.desc())
+# ==============================================================================
+print("\n--- 1. User Scenario Exact Syntax Test ---")
+
+class DemandErrorService:
+    list_columns: Tuple[Column, Column, Column]
+
+    def __init__(self, table: Table):
+        self.list_columns = (table.ID, table["err_code"], table["err_msg"])
+
+    def build_query(self, table: Table, *conditions):
+        # Target syntax
+        return (
+            select(*self.list_columns)
+            .select_from(table)
+            .where(*conditions)
+            .order_by(table.ID.desc())
+        )
+
+yx_rx_gpc_demand_err = Table("yx_rx_gpc_demand_err")
+service = DemandErrorService(yx_rx_gpc_demand_err)
+
+# Conditions passed as tuple unpacking (*conditions)
+conditions = (
+    yx_rx_gpc_demand_err.ID > 1000,
+    yx_rx_gpc_demand_err["status"] == "FAILED"
+)
+
+stmt = service.build_query(yx_rx_gpc_demand_err, *conditions)
+sql_my, params_my = stmt.to_sql(MYSQL_DIALECT)
+print("MySQL SQL:", sql_my)
+print("MySQL Params:", params_my)
+
+assert sql_my == "SELECT `yx_rx_gpc_demand_err`.`id`, `yx_rx_gpc_demand_err`.`err_code`, `yx_rx_gpc_demand_err`.`err_msg` FROM `yx_rx_gpc_demand_err` WHERE `yx_rx_gpc_demand_err`.`id` > ? AND `yx_rx_gpc_demand_err`.`status` = ? ORDER BY `yx_rx_gpc_demand_err`.`id` DESC"
+assert len(params_my) == 2
+assert params_my[0] == "1000"
+assert params_my[1] == "FAILED"
+
+# Also check PostgreSQL compilation ($1, $2 and double quotes)
+sql_pg, params_pg = stmt.to_sql(POSTGRESQL_DIALECT)
+print("PG SQL:", sql_pg)
+assert sql_pg == "SELECT \"yx_rx_gpc_demand_err\".\"id\", \"yx_rx_gpc_demand_err\".\"err_code\", \"yx_rx_gpc_demand_err\".\"err_msg\" FROM \"yx_rx_gpc_demand_err\" WHERE \"yx_rx_gpc_demand_err\".\"id\" > $1 AND \"yx_rx_gpc_demand_err\".\"status\" = $2 ORDER BY \"yx_rx_gpc_demand_err\".\"id\" DESC"
+assert params_pg == ["1000", "FAILED"]
+
+print("[PASS] 1. Exact user syntax pattern verified on MySQL & PG!")
+
+# ==============================================================================
+# 2. Dynamic List Form (passing List of columns and List of conditions)
+# ==============================================================================
+print("\n--- 2. Dynamic List Form Test ---")
+col_names = ["id", "err_code", "created_at"]
+cond_list = [yx_rx_gpc_demand_err.ID == 42, yx_rx_gpc_demand_err["retry_count"] < 3]
+
+stmt_dyn = (
+    select(col_names)
+    .select_from("yx_rx_gpc_demand_err")
+    .where(cond_list)
+    .order_by(yx_rx_gpc_demand_err.ID.asc())
+)
+sql_dyn, params_dyn = stmt_dyn.to_sql(MYSQL_DIALECT)
+print("Dynamic SQL:", sql_dyn)
+print("Dynamic Params:", params_dyn)
+assert sql_dyn == "SELECT `id`, `err_code`, `created_at` FROM `yx_rx_gpc_demand_err` WHERE `yx_rx_gpc_demand_err`.`id` = ? AND `yx_rx_gpc_demand_err`.`retry_count` < ? ORDER BY `yx_rx_gpc_demand_err`.`id` ASC"
+assert params_dyn == ["42", "3"]
+print("[PASS] 2. Dynamic List Form (select(list) & where(list)) verified!")
+
+# ==============================================================================
+# 3. Compound Boolean Logic (&, |, ~, and_, or_, not_)
+# ==============================================================================
+print("\n--- 3. Compound Boolean Logic Test ---")
+t = Table("orders")
+cond1 = t.STATUS == "PAID"
+cond2 = t["amount"] > 100
+cond3 = t["is_vip"] == True
+
+# Operator overloading: (cond1 & cond2) | cond3
+complex_cond = (cond1 & cond2) | cond3
+stmt_logic = select().select_from(t).where(complex_cond)
+sql_logic, params_logic = stmt_logic.to_sql(MYSQL_DIALECT)
+print("Complex logic SQL:", sql_logic)
+assert "((`orders`.`status` = ? AND `orders`.`amount` > ?) OR `orders`.`is_vip` = ?)" in sql_logic
+assert params_logic == ["PAID", "100", "1"]
+
+# not_ / ~ operator
+stmt_not = select().select_from(t).where(~(t.STATUS == "DELETED"))
+sql_not, p_not = stmt_not.to_sql(MYSQL_DIALECT)
+assert "NOT (`orders`.`status` = ?)" in sql_not
+assert p_not == ["DELETED"]
+
+print("[PASS] 3. Complex compound boolean logic (&, |, ~, not_) verified!")
+
+# ==============================================================================
+# 4. Rich SQL Predicates: LIKE, ILIKE, IN, NOT IN, IS NULL, BETWEEN
+# ==============================================================================
+print("\n--- 4. Rich SQL Predicates Test ---")
+user_tbl = Table("users")
+p_stmt = (
+    select(user_tbl.ID, user_tbl.NAME)
+    .select_from(user_tbl)
+    .where(
+        user_tbl.NAME.like("admin%"),
+        user_tbl["role"].in_(["superadmin", "editor"]),
+        user_tbl["deleted_at"].is_null(),
+        user_tbl["age"].between(18, 60)
+    )
+)
+sql_p, params_p = p_stmt.to_sql(MYSQL_DIALECT)
+print("Predicates SQL:", sql_p)
+print("Predicates Params:", params_p)
+assert "`users`.`name` LIKE ?" in sql_p
+assert "`users`.`role` IN (?, ?)" in sql_p
+assert "`users`.`deleted_at` IS NULL" in sql_p
+assert "`users`.`age` BETWEEN ? AND ?" in sql_p
+assert params_p == ["admin%", "superadmin", "editor", "18", "60"]
+
+print("[PASS] 4. Predicates (LIKE, IN, IS NULL, BETWEEN) verified!")
+
+# ==============================================================================
+# 5. Joins: INNER JOIN, LEFT JOIN with ON condition
+# ==============================================================================
+print("\n--- 5. JOIN Expressions Test ---")
+tbl_orders = Table("orders", alias="o")
+tbl_users = Table("users", alias="u")
+
+stmt_join = (
+    select(tbl_orders["id"].label("order_id"), tbl_users["username"])
+    .select_from(tbl_orders)
+    .left_join(tbl_users, tbl_orders["user_id"] == tbl_users["id"])
+    .where(tbl_orders["status"] == "COMPLETED")
+    .order_by(tbl_orders["created_at"].desc())
+)
+sql_join, params_join = stmt_join.to_sql(MYSQL_DIALECT)
+print("JOIN SQL:", sql_join)
+assert "SELECT `o`.`id` AS `order_id`, `u`.`username` FROM `orders` AS `o` LEFT JOIN `users` AS `u` ON `o`.`user_id` = `u`.`id` WHERE `o`.`status` = ? ORDER BY `o`.`created_at` DESC" == sql_join
+assert params_join == ["COMPLETED"]
+
+print("[PASS] 5. Table alias and LEFT JOIN verified!")
+
+# ==============================================================================
+# 6. Aggregates, GROUP BY, HAVING, DISTINCT, LIMIT/OFFSET
+# ==============================================================================
+print("\n--- 6. Aggregates & Grouping Test ---")
+stmt_agg = (
+    select(user_tbl["department"], func.count(user_tbl.ID).label("total_members"))
+    .select_from(user_tbl)
+    .where(user_tbl["is_active"] == True)
+    .group_by(user_tbl["department"])
+    .having(func.count(user_tbl.ID) > 5)
+    .limit(10)
+    .offset(20)
+)
+sql_agg, params_agg = stmt_agg.to_sql(MYSQL_DIALECT)
+print("Agg SQL:", sql_agg)
+assert "COUNT(" in sql_agg and ") AS `total_members`" in sql_agg
+assert "GROUP BY `users`.`department`" in sql_agg
+assert "HAVING COUNT(" in sql_agg and ") > ?" in sql_agg
+assert "LIMIT 20, 10" in sql_agg
+assert params_agg == ["1", "5"]
+
+print("[PASS] 6. Aggregates (func.count), GROUP BY, HAVING, LIMIT/OFFSET verified!")
+
+# ==============================================================================
+# 7. Safe SQL Compilation (compile() with SQL Injection prevention)
+# ==============================================================================
+print("\n--- 7. Safe SQL Injection Prevention Test ---")
+malicious_input = "admin'; DROP TABLE users; --"
+stmt_safe = select().select_from(user_tbl).where(user_tbl.NAME == malicious_input)
+compiled_sql = stmt_safe.compile(MYSQL_DIALECT)
+print("Compiled safe SQL:", compiled_sql)
+# Injection attempt should be safely quoted/escaped in single string compilation
+assert "\\'admin\\'; DROP TABLE users; --\\'" in compiled_sql or "admin\\'; DROP TABLE users; --" in compiled_sql
+
+# And in parameterized query it is strictly bound as parameter:
+raw_sql, raw_params = stmt_safe.to_sql(MYSQL_DIALECT)
+assert raw_params[0] == malicious_input
+assert "?" in raw_sql
+
+print("[PASS] 7. SQL injection defense verified!")
+
+# ==============================================================================
+# 8. ModelMeta integration (Table.from_meta)
+# ==============================================================================
+print("\n--- 8. ModelMeta Integration Test ---")
+fields = List[Field]()
+fields.append(IntegerField("id", primary_key=True))
+fields.append(CharField("title", max_length=100))
+fields.append(DateTimeField("created_at"))
+article_meta = ModelMeta("articles", fields)
+article_table = Table.from_meta(article_meta)
+
+stmt_meta = (
+    select(article_table.ID, article_table["title"])
+    .select_from(article_meta)
+    .where(article_table.ID >= 1)
+    .order_by(article_table.ID.desc())
+)
+sql_meta, p_meta = stmt_meta.to_sql(MYSQL_DIALECT)
+assert sql_meta == "SELECT `articles`.`id`, `articles`.`title` FROM `articles` WHERE `articles`.`id` >= ? ORDER BY `articles`.`id` DESC"
+assert p_meta == ["1"]
+
+print("[PASS] 8. ModelMeta integration verified!")
+
+# ==============================================================================
+# 9. P1: Fluent DML Operations (insert, update, delete)
+# ==============================================================================
+print("\n--- 9. P1: Fluent DML Operations Test ---")
+
+# 9.1 Insert single row with dictionary
+tbl_task = Table("tasks")
+v1 = Dict[str, str]()
+v1["title"] = "Refactor ORM"
+v1["status"] = "OPEN"
+stmt_ins = insert(tbl_task).values(v1)
+sql_ins, p_ins = stmt_ins.to_sql(MYSQL_DIALECT)
+print("Insert SQL:", sql_ins)
+assert "INSERT INTO `tasks` (`title`, `status`) VALUES (?, ?)" == sql_ins or "INSERT INTO `tasks` (`status`, `title`) VALUES (?, ?)" == sql_ins
+assert "Refactor ORM" in p_ins and "OPEN" in p_ins
+
+# 9.2 Insert with fluent .set() method
+stmt_ins_set = insert("tasks").set("title", "Fix bug").set("priority", 1)
+sql_set, p_set = stmt_ins_set.to_sql(MYSQL_DIALECT)
+assert sql_set == "INSERT INTO `tasks` (`title`, `priority`) VALUES (?, ?)"
+assert p_set == ["Fix bug", "1"]
+
+# 9.3 Batch Insert
+row1 = Dict[str, str]()
+row1["name"] = "Alice"
+row1["role"] = "Admin"
+row2 = Dict[str, str]()
+row2["name"] = "Bob"
+row2["role"] = "User"
+batch_rows = List[Dict[str, str]]()
+batch_rows.append(row1)
+batch_rows.append(row2)
+stmt_batch = insert("members").values(batch_rows)
+sql_batch, p_batch = stmt_batch.to_sql(MYSQL_DIALECT)
+print("Batch Insert SQL:", sql_batch)
+assert "INSERT INTO `members` (`name`, `role`) VALUES (?, ?), (?, ?)" == sql_batch or "INSERT INTO `members` (`role`, `name`) VALUES (?, ?), (?, ?)" == sql_batch
+assert len(p_batch) == 4
+
+# 9.4 PostgreSQL RETURNING
+stmt_pg_ret = insert(tbl_task).set("title", "New Task").returning(tbl_task.ID)
+sql_pg_ret, _ = stmt_pg_ret.to_sql(POSTGRESQL_DIALECT)
+print("PG RETURNING SQL:", sql_pg_ret)
+assert 'RETURNING "tasks"."id"' in sql_pg_ret or 'RETURNING "id"' in sql_pg_ret
+
+# 9.5 Update with where conditions
+up_dict = Dict[str, str]()
+up_dict["status"] = "COMPLETED"
+up_dict["progress"] = "100"
+stmt_up = update(tbl_task).where(tbl_task.ID == 10).values(up_dict)
+sql_up, p_up = stmt_up.to_sql(MYSQL_DIALECT)
+print("Update SQL:", sql_up)
+assert "UPDATE `tasks` SET " in sql_up
+assert "`status` = ?" in sql_up and "`progress` = ?" in sql_up
+assert "WHERE `tasks`.`id` = ?" in sql_up
+assert "10" in p_up
+
+# 9.6 Delete with where conditions
+stmt_del = delete(tbl_task).where((tbl_task.STATUS == "ARCHIVED") & (tbl_task.ID < 100))
+sql_del, p_del = stmt_del.to_sql(MYSQL_DIALECT)
+print("Delete SQL:", sql_del)
+assert sql_del == "DELETE FROM `tasks` WHERE (`tasks`.`status` = ? AND `tasks`.`id` < ?)"
+assert p_del == ["ARCHIVED", "100"]
+
+print("[PASS] 9. Fluent DML (insert, update, delete, batch, returning) verified!")
+
+# ==============================================================================
+# 10. P2: Subquery Support (IN / NOT IN subquery)
+# ==============================================================================
+print("\n--- 10. P2: Subquery Support Test ---")
+tbl_users = Table("users")
+tbl_orders = Table("orders")
+
+# Subquery: SELECT user_id FROM orders WHERE status = 'PENDING'
+subq = select(tbl_orders["user_id"]).select_from(tbl_orders).where(tbl_orders["status"] == "PENDING")
+
+# Main query: SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE status = 'PENDING')
+main_stmt = select(tbl_users.ID, tbl_users.NAME).select_from(tbl_users).where(tbl_users.ID.in_(subq))
+
+sql_sub_my, p_sub_my = main_stmt.to_sql(MYSQL_DIALECT)
+print("Subquery MySQL:", sql_sub_my)
+assert sql_sub_my == "SELECT `users`.`id`, `users`.`name` FROM `users` WHERE `users`.`id` IN (SELECT `orders`.`user_id` FROM `orders` WHERE `orders`.`status` = ?)"
+assert p_sub_my == ["PENDING"]
+
+# PostgreSQL sequential parameter indexing ($1, $2, ...)
+main_pg_stmt = (
+    select(tbl_users.ID)
+    .select_from(tbl_users)
+    .where(
+        tbl_users["is_active"] == True,
+        tbl_users.ID.in_(subq)
+    )
+)
+sql_sub_pg, p_sub_pg = main_pg_stmt.to_sql(POSTGRESQL_DIALECT)
+print("Subquery PG:", sql_sub_pg)
+# Main query param is $1 ('1'), subquery param should seamlessly be $2 ('PENDING')!
+assert '"users"."id" IN (SELECT "orders"."user_id" FROM "orders" WHERE "orders"."status" = $2)' in sql_sub_pg
+assert p_sub_pg == ["1", "PENDING"]
+
+print("[PASS] 10. Subquery (IN/NOT IN) with seamless parameter indexing verified!")
+
+# ==============================================================================
+# 11. P2: Row Locking Hints (FOR UPDATE / FOR SHARE / NOWAIT / SKIP LOCKED)
+# ==============================================================================
+print("\n--- 11. P2: Row Locking Hints Test ---")
+# 11.1 Standard FOR UPDATE
+q_lock1 = select(tbl_users.ID).select_from(tbl_users).where(tbl_users.ID == 1).for_update()
+sql_l1, _ = q_lock1.to_sql(MYSQL_DIALECT)
+assert sql_l1.endswith("FOR UPDATE")
+
+# 11.2 FOR UPDATE NOWAIT
+q_lock2 = select(tbl_users.ID).select_from(tbl_users).where(tbl_users.ID == 1).for_update(nowait=True)
+sql_l2, _ = q_lock2.to_sql(MYSQL_DIALECT)
+assert sql_l2.endswith("FOR UPDATE NOWAIT")
+
+# 11.3 FOR UPDATE SKIP LOCKED
+q_lock3 = select(tbl_users.ID).select_from(tbl_users).where(tbl_users.ID == 1).with_for_update(skip_locked=True)
+sql_l3, _ = q_lock3.to_sql(MYSQL_DIALECT)
+assert sql_l3.endswith("FOR UPDATE SKIP LOCKED")
+
+# 11.4 FOR SHARE
+q_lock4 = select(tbl_users.ID).select_from(tbl_users).where(tbl_users.ID == 1).for_share()
+sql_l4, _ = q_lock4.to_sql(MYSQL_DIALECT)
+assert sql_l4.endswith("FOR SHARE")
+
+print("[PASS] 11. Row Locking (FOR UPDATE, NOWAIT, SKIP LOCKED, FOR SHARE) verified!")
+
+print("\n=======================================================")
+print(">>> ALL INDUSTRIAL SQL BUILDER & DML TESTS PASSED! <<<")
+print("=======================================================")

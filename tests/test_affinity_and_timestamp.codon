@@ -1,0 +1,46 @@
+import time
+from src.os.linux import bind_cpu_core, get_cpu_cores
+from src.runtime.connection import Connection
+from src.runtime.epoll import Epoll
+from src.http.response import Response
+
+def test_cpu_affinity():
+    print("Testing CPU affinity binding...")
+    cores = get_cpu_cores()
+    assert cores > 0, "CPU core count should be > 0"
+    print("  Detected CPU cores:", cores)
+
+    # Test pinning to core 0
+    bound = bind_cpu_core(0)
+    assert bound == 0, f"Expected bound to 0, got {bound}"
+    print("  PASS: Pinned to CPU core #0")
+
+    # Test modulo wrap-around for worker IDs > num_cores
+    target_worker = cores + 1
+    bound_wrapped = bind_cpu_core(target_worker)
+    assert bound_wrapped == (target_worker % cores), f"Expected {target_worker % cores}, got {bound_wrapped}"
+    print("  PASS: Worker ID wrap-around affinity correctly pinned to core #" + str(bound_wrapped))
+
+def test_timestamp_cache():
+    print("Testing coarse timestamp caching in Connection...")
+    conn = Connection(i32(10), "127.0.0.1", 8080, 4096)
+    
+    # Test setting timestamp explicitly without syscall
+    custom_now = 1700000000.5
+    conn.update_activity(custom_now)
+    assert conn.last_active_time == custom_now, f"Expected {custom_now}, got {conn.last_active_time}"
+    print("  PASS: update_activity(now) respects coarse timestamp")
+
+    # Test reset_pool with cached timestamp
+    conn.reset_pool(i32(11), "127.0.0.1", 8081, custom_now + 10.0)
+    assert conn.last_active_time == (custom_now + 10.0), "reset_pool should use provided timestamp"
+    print("  PASS: reset_pool respects cached timestamp")
+
+def main():
+    print("=== RUNNING CPU AFFINITY & TIMESTAMP CACHE TESTS ===")
+    test_cpu_affinity()
+    test_timestamp_cache()
+    print("=== ALL TESTS PASSED SUCCESSFULLY! ===")
+
+if __name__ == "__main__":
+    main()

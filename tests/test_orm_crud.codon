@@ -1,0 +1,146 @@
+# End-to-End ORM Integration and CRUD Test
+from typing import List, Dict, Optional
+from src.orm import (
+    Model, ModelMeta, Field, IntegerField, CharField, BooleanField, FloatField,
+    DatabaseEngine, Session, Query, MYSQL_DIALECT, POSTGRESQL_DIALECT
+)
+from src.db.types import Row
+
+print("=== 1. Testing DatabaseEngine URL Parser ===")
+engine_my = DatabaseEngine.from_url("mysql://root:hujinlong@172.23.176.1:3306/ths", min_pool_size=1, max_pool_size=5)
+assert engine_my.db_type == "mysql"
+assert engine_my.user == "root"
+assert engine_my.password == "hujinlong"
+assert engine_my.host == "172.23.176.1"
+assert engine_my.port == 3306
+assert engine_my.database == "ths"
+assert engine_my.dialect.name == "mysql"
+print("[PASS] MySQL URL parsed correctly!")
+
+engine_pg = DatabaseEngine.from_url("postgresql://postgres:secret@127.0.0.1:5432/mydb", min_pool_size=0, max_pool_size=5)
+assert engine_pg.db_type == "postgresql"
+assert engine_pg.user == "postgres"
+assert engine_pg.password == "secret"
+assert engine_pg.port == 5432
+assert engine_pg.database == "mydb"
+assert engine_pg.dialect.name == "postgresql"
+print("[PASS] PostgreSQL URL parsed correctly!")
+
+print("\n=== 2. Testing Model Base & Row Deserialization ===")
+class User(Model):
+    def __init__(self):
+        super().__init__()
+
+    @staticmethod
+    def get_meta() -> ModelMeta:
+        fields = List[Field]()
+        fields.append(IntegerField("id", primary_key=True, auto_increment=True))
+        fields.append(CharField("username", max_length=64, unique=True))
+        fields.append(CharField("email", max_length=128))
+        fields.append(IntegerField("age", default_val="18"))
+        fields.append(FloatField("score", default_val="0.0"))
+        return ModelMeta("codon_orm_users", fields)
+
+# Test Model setters and getters
+u = User()
+u.set("username", "bob")
+u.set("email", "bob@test.com")
+u.set("age", "30")
+assert u.get("username") == "bob"
+assert u.get("age") == "30"
+assert u.to_dict()["email"] == "bob@test.com"
+
+# Test deserializing from Row
+mock_vals = List[Optional[str]]()
+mock_vals.append("101")
+mock_vals.append("carol")
+mock_vals.append("carol@test.com")
+mock_vals.append("22")
+mock_vals.append("99.5")
+mock_row = Row(["id", "username", "email", "age", "score"], mock_vals)
+u2 = User()
+u2.from_row(mock_row)
+assert u2.get("id") == "101"
+assert u2.get("username") == "carol"
+assert u2.get("score") == "99.5"
+print("[PASS] Model serialization and Row mapping verified!")
+
+print("\n=== 3. Testing Real Database End-to-End CRUD Lifecycle ===")
+session = Session(engine_my)
+meta = User.get_meta()
+
+# Clean slate: Drop table if exists
+session.drop_table(meta)
+
+# Step A: Create Table
+session.create_table(meta)
+print("[PASS] Table created successfully via DDL!")
+
+# Step B: Insert records
+u1_data = {
+    "username": "alice",
+    "email": "alice@example.com",
+    "age": "24",
+    "score": "88.5"
+}
+id1 = session.insert(meta, u1_data)
+assert id1 > 0
+print("[PASS] Inserted Alice with generated PK ID:", id1)
+
+u2_data = {
+    "username": "charlie",
+    "email": "charlie@example.com",
+    "age": "29",
+    "score": "95.0"
+}
+id2 = session.insert(meta, u2_data)
+assert id2 > id1
+print("[PASS] Inserted Charlie with generated PK ID:", id2)
+
+# Step C: Query with QueryBuilder
+query = session.query(meta)
+query.where_gte("age", "20").order_by("id", desc=False)
+rows = session.execute_query(query)
+assert len(rows) >= 2
+assert rows[0]["username"] == "alice"
+assert rows[1]["username"] == "charlie"
+print("[PASS] Query executed and verified: found", len(rows), "users!")
+
+# Step D: Count query
+q_count = session.query(meta).where_gt("age", "25")
+cnt = session.count(q_count)
+assert cnt == 1
+print("[PASS] Count query verified: users with age > 25 count =", cnt)
+
+# Step E: Get by Primary Key
+row1 = session.get(meta, str(id1))
+assert row1 is not None
+assert row1["username"] == "alice"
+print("[PASS] Get by PK verified!")
+
+# Step F: Update
+up_data = {"email": "alice_updated@example.com", "score": "92.0"}
+aff = session.update(meta, str(id1), up_data)
+assert aff == 1
+row1_updated = session.get(meta, str(id1))
+assert row1_updated is not None
+assert row1_updated["email"] == "alice_updated@example.com"
+assert float(row1_updated["score"]) == 92.0
+print("[PASS] Update record verified!")
+
+# Step G: Delete
+del_aff = session.delete(meta, str(id2))
+assert del_aff == 1
+row2_after_del = session.get(meta, str(id2))
+assert row2_after_del is None
+print("[PASS] Delete record verified!")
+
+# Step H: Clean up
+session.drop_table(meta)
+print("[PASS] Table dropped cleanly!")
+
+engine_my.close()
+
+print("\n=======================================================")
+print(">>> ALL ORM INTEGRATION & CRUD TESTS PASSED CLEANLY! <<<")
+print("=======================================================")

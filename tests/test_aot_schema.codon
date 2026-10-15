@@ -1,0 +1,288 @@
+# Comprehensive Industrial Test Suite for Code-First AOT Schema & Validation
+from tools.codegen.schema_parser import parse_schema_source, ParsedClass
+from tools.codegen.schema_generator import generate_source_file, generate_in_place_content
+from examples.schemas.user import UserCreate
+from src.http.fast_json import FastJson
+from src.schema.errors import ValidationError, ValidationResult
+from src.memory.buffer import ByteBuffer
+import re
+
+print("================================================================================")
+print("[Test] Code-First AOT Schema & Industrial Data Validation Subsystem")
+print("================================================================================")
+
+# -----------------------------------------------------------------------------
+# Stage 1: Parser & Code Generator Verification
+# -----------------------------------------------------------------------------
+sample_schema_source = """
+from src.schema import BaseModel, StrField, IntField, FloatField, BoolField, ListField, ValidationError
+
+class OrderItem(BaseModel):
+    \"\"\"Nested order line item.\"\"\"
+    sku_id: str = StrField(min_length=3, max_length=16, pattern=r"^[A-Z0-9_-]+$", description="SKU identifier")
+    price: float = FloatField(gt=0.0, description="Unit price strictly positive")
+    qty: int = IntField(ge=1, le=100, default=1, description="Quantity")
+
+class UserCreate(BaseModel):
+    \"\"\"User registration request schema with strict field-level and domain constraints.\"\"\"
+    username: str = StrField(min_length=3, max_length=32, strip_whitespace=True, alias="loginName", description="Unique login account name")
+    age: int = IntField(ge=0, le=150, gt=-1, lt=151, default=18, description="User age in years")
+    email: str = StrField(format="email", description="Primary contact email address")
+    balance: float = FloatField(ge=0.0, le=1000000.0, default=0.0, description="Initial wallet balance")
+    is_active: bool = BoolField(default=True, description="Account active flag")
+    role: str = StrField(choices=["admin", "member", "guest"], default="member", description="Account permission role")
+    tags: List[str] = ListField(min_items=1, max_items=5, description="User interest tags")
+    items: List[OrderItem] = ListField(min_items=0, max_items=20, description="Attached cart items")
+
+    def custom_validate(self) -> List[ValidationError]:
+        \"\"\"Cross-field business logic validation hook.\"\"\"
+        errs = List[ValidationError]()
+        if self.role == "admin" and self.age < 21:
+            errs.append(ValidationError("age", "Administrator accounts must be at least 21 years old", "value_error.business"))
+        return errs
+"""
+
+classes = parse_schema_source(sample_schema_source)
+assert len(classes) == 2, f"Expected 2 parsed classes, got {len(classes)}"
+
+c_item = classes[0]
+assert c_item.name == "OrderItem"
+assert len(c_item.fields) == 3
+assert c_item.fields[0].name == "sku_id" and c_item.fields[0].pattern == r"^[A-Z0-9_-]+$"
+assert c_item.fields[1].name == "price" and c_item.fields[1].has_gt_f and c_item.fields[1].gt_f == 0.0
+
+c_user = classes[1]
+assert c_user.name == "UserCreate"
+assert len(c_user.fields) == 8
+
+# Verify advanced field metadata
+f_user = c_user.fields[0]
+assert f_user.name == "username" and f_user.alias == "loginName" and f_user.strip_whitespace == True
+assert f_user.min_length == 3 and f_user.max_length == 32
+
+f_age = c_user.fields[1]
+assert f_age.name == "age" and f_age.has_ge and f_age.has_gt and f_age.gt == -1 and f_age.has_lt and f_age.lt == 151
+
+f_tags = c_user.fields[6]
+assert f_tags.name == "tags" and f_tags.is_list and f_tags.list_item_type == "str"
+assert f_tags.min_items == 1 and f_tags.max_items == 5
+
+f_items = c_user.fields[7]
+assert f_items.name == "items" and f_items.is_list and f_items.is_submodel and f_items.submodel_name == "OrderItem"
+
+# Verify generator emits valid code
+code_out = generate_source_file(classes)
+assert "class OrderItem(BaseModel):" in code_out
+assert "class UserCreate(BaseModel):" in code_out
+assert "def from_fast_json(val: FastJsonVal)" in code_out
+assert "def from_json(raw: str)" in code_out
+assert "def to_json(self) -> str:" in code_out
+assert "def model_dump_json(self) -> str:" in code_out
+
+in_place_out = generate_in_place_content(sample_schema_source, classes)
+assert "@extend" in in_place_out
+assert "class OrderItem:" in in_place_out
+assert "class UserCreate:" in in_place_out
+print("[OK] Stage 1 (AST Parser & Code Generator with Advanced Pydantic Metadata): PASSED")
+
+
+# -----------------------------------------------------------------------------
+# Stage 2: Runtime Validation via FastJson (yyjson SIMD Deserialization)
+# -----------------------------------------------------------------------------
+
+# Test 2.1: Valid payload
+json_valid = '{"username":"antigravity","age":28,"email":"admin@codon-web.io","balance":1250.75,"is_active":true,"role":"member"}'
+doc1 = FastJson.loads(json_valid)
+res1 = UserCreate.from_fast_json(doc1.root)
+assert res1.is_ok(), "Expected valid payload to pass validation"
+u1 = res1.unwrap()
+assert u1.username == "antigravity"
+assert u1.age == 28
+assert u1.email == "admin@codon-web.io"
+assert u1.balance == 1250.75
+assert u1.is_active == True
+assert u1.role == "member"
+doc1.close()
+print("[OK] Test 2.1 (Valid FastJson payload deserialization): PASSED")
+
+# Test 2.2: Missing required field (username)
+json_missing = '{"age":28,"email":"admin@codon-web.io"}'
+doc2 = FastJson.loads(json_missing)
+res2 = UserCreate.from_fast_json(doc2.root)
+assert not res2.is_ok(), "Expected missing field to fail validation"
+assert len(res2.errors) >= 1
+assert res2.errors[0].field == "username"
+assert res2.errors[0].err_type == "missing"
+doc2.close()
+print("[OK] Test 2.2 (Missing required field detection): PASSED")
+
+# Test 2.3: String length boundary check (< 3 chars)
+json_short_user = '{"username":"ab","email":"admin@codon-web.io"}'
+doc3 = FastJson.loads(json_short_user)
+res3 = UserCreate.from_fast_json(doc3.root)
+assert not res3.is_ok()
+assert res3.errors[0].field == "username"
+assert res3.errors[0].err_type == "value_error.length.min"
+doc3.close()
+print("[OK] Test 2.3 (String min_length validation): PASSED")
+
+# Test 2.4: Integer boundary check (age > 150)
+json_invalid_age = '{"username":"johndoe","age":199,"email":"john@codon-web.io"}'
+doc4 = FastJson.loads(json_invalid_age)
+res4 = UserCreate.from_fast_json(doc4.root)
+assert not res4.is_ok()
+assert res4.errors[0].field == "age"
+assert res4.errors[0].err_type == "value_error.number.le"
+doc4.close()
+print("[OK] Test 2.4 (Integer maximum boundary validation): PASSED")
+
+# Test 2.5: Email format check
+json_bad_email = '{"username":"johndoe","email":"not-an-email"}'
+doc5 = FastJson.loads(json_bad_email)
+res5 = UserCreate.from_fast_json(doc5.root)
+assert not res5.is_ok()
+assert res5.errors[0].field == "email"
+assert res5.errors[0].err_type == "value_error.format.email"
+doc5.close()
+print("[OK] Test 2.5 (Email format validation): PASSED")
+
+# Test 2.6: Enum choices check
+json_bad_role = '{"username":"johndoe","email":"john@codon-web.io","role":"superhero"}'
+doc6 = FastJson.loads(json_bad_role)
+res6 = UserCreate.from_fast_json(doc6.root)
+assert not res6.is_ok()
+assert res6.errors[0].field == "role"
+assert res6.errors[0].err_type == "value_error.choices"
+doc6.close()
+print("[OK] Test 2.6 (Enum choices constraint validation): PASSED")
+
+# Test 2.7: Custom cross-field validation (role=admin, age < 21)
+json_underage_admin = '{"username":"young_admin","age":18,"email":"admin@corp.io","role":"admin"}'
+doc7 = FastJson.loads(json_underage_admin)
+res7 = UserCreate.from_fast_json(doc7.root)
+assert not res7.is_ok()
+assert res7.errors[0].field == "age"
+assert res7.errors[0].err_type == "value_error.business"
+doc7.close()
+
+json_valid_admin = '{"username":"senior_admin","age":35,"email":"admin@corp.io","role":"admin"}'
+doc7b = FastJson.loads(json_valid_admin)
+res7b = UserCreate.from_fast_json(doc7b.root)
+assert res7b.is_ok()
+assert res7b.unwrap().role == "admin"
+doc7b.close()
+print("[OK] Test 2.7 (Custom cross-field domain logic hook): PASSED")
+
+# Test 2.8: HTTP 422 Response Generation (FastAPI/RFC 7807 parity)
+resp = res7.to_response(422)
+assert resp.status_code == 422
+assert '"loc":["body","age"]' in resp._body
+assert '"Administrator accounts must be at least 21 years old"' in resp._body
+print("[OK] Test 2.8 (RFC 7807 HTTP 422 Response formatting): PASSED")
+
+# Test 2.9: 1-Line Convenience from_json(raw) parsing
+res8 = UserCreate.from_json(json_valid)
+assert res8.is_ok()
+u8 = res8.unwrap()
+assert u8.username == "antigravity"
+assert u8.balance == 1250.75
+print("[OK] Test 2.9 (Convenient 1-line UserCreate.from_json): PASSED")
+
+# Test 2.10: to_json() / model_dump_json() & Pydantic v2 parity & zero-copy buffer
+json_dump = u8.to_json()
+assert '"username":"antigravity"' in json_dump
+assert '"age":28' in json_dump
+assert '"email":"admin@codon-web.io"' in json_dump
+assert u8.model_dump_json() == json_dump
+d_dump = u8.model_dump()
+assert d_dump["username"] == "antigravity"
+res_v2 = UserCreate.model_validate_json(json_valid)
+assert res_v2.is_ok()
+assert UserCreate.model_json_schema() == UserCreate.openapi_schema_json()
+
+# Verify zero-copy buffer streaming
+net_buf = ByteBuffer(4096)
+bytes_written = u8.write_to_buffer(net_buf)
+assert bytes_written > 0
+assert bytes_written == len(json_dump)
+assert net_buf.readable_bytes() == bytes_written
+
+# Verify RFC 8259 control character escaping (e.g. \n, \t)
+user_escaped = UserCreate("special\nname\t!", 25, "esc@codon.io", 100.0, True, "member")
+esc_json = user_escaped.to_json()
+assert r"\n" in esc_json
+assert r"\t" in esc_json
+# Round-trip verification: parser recovers unescaped string seamlessly
+esc_doc = FastJson.loads(esc_json)
+assert esc_doc.root["username"].as_str() == "special\nname\t!"
+print("[OK] Test 2.10 (to_json, write_to_buffer and RFC 8259 escape parity): PASSED")
+
+
+# Test 2.11: ValidationResult unwrap_or & errors_json
+dummy_default = UserCreate("default_user", 20, "def@corp.io", 0.0, True, "member")
+fallback_user = res7.unwrap_or(dummy_default)
+assert fallback_user.username == "default_user"
+assert res7.error_count() == 1
+err_json = res7.errors_json()
+assert '"value_error.business"' in err_json
+print("[OK] Test 2.11 (ValidationResult unwrap_or and error utilities): PASSED")
+
+
+# -----------------------------------------------------------------------------
+# Stage 3: Form & Query String Dictionary Validation
+# -----------------------------------------------------------------------------
+d_valid = Dict[str, str]()
+d_valid["username"] = "web_user"
+d_valid["email"] = "web@service.org"
+d_valid["age"] = "42"
+d_valid["balance"] = "99.9"
+d_valid["is_active"] = "true"
+d_valid["role"] = "member"
+
+res_dict = UserCreate.from_dict(d_valid)
+assert res_dict.is_ok(), "Expected valid dict to pass validation"
+u_dict = res_dict.unwrap()
+assert u_dict.username == "web_user"
+assert u_dict.age == 42
+assert u_dict.balance == 99.9
+assert u_dict.is_active == True
+assert UserCreate.model_validate(d_valid).is_ok()
+print("[OK] Stage 3 (URL Query / Form Dict Parsing & Type Coercion): PASSED")
+
+
+# -----------------------------------------------------------------------------
+# Stage 4: OpenAPI 3.0 Schema Specification Generation
+# -----------------------------------------------------------------------------
+openapi_json = UserCreate.openapi_schema_json()
+assert '"title":"UserCreate"' in openapi_json
+assert '"type":"object"' in openapi_json
+assert '"username":{' in openapi_json
+assert '"minLength":3' in openapi_json
+assert '"maxLength":32' in openapi_json
+assert '"enum":["admin","member","guest"]' in openapi_json
+assert '"required":["username","email"]' in openapi_json
+print("[OK] Stage 4 (OpenAPI 3.0 Spec JSON Generation): PASSED")
+
+
+# -----------------------------------------------------------------------------
+# Stage 5: Hierarchical Loc Paths & Nested Error Prefixes
+# -----------------------------------------------------------------------------
+leaf_err = ValidationError("price", "Price must be strictly positive", "value_error.number.gt")
+assert leaf_err.loc == ["body", "price"]
+assert leaf_err.loc_path() == "price"
+
+# Add index prefix: items.0.price
+indexed_err = leaf_err.with_prefix("0")
+assert indexed_err.loc == ["body", "0", "price"]
+
+# Add parent list prefix: items.0.price
+parent_err = indexed_err.with_prefix("items")
+assert parent_err.loc == ["body", "items", "0", "price"]
+assert parent_err.loc_path() == "items.0.price"
+assert '"loc":["body","items","0","price"]' in parent_err.to_json()
+print("[OK] Stage 5 (Hierarchical Loc Path & Nested Prefix Traversal): PASSED")
+
+
+print("================================================================================")
+print("ALL Industrial Code-First AOT Schema & Data Validation Tests PASSED!")
+print("================================================================================")

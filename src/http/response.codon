@@ -1,17 +1,30 @@
-from C import strlen(cobj) -> int
 from src.http.status import HttpStatus
 from src.http.mime import MimeType
 from src.http.streaming import ChunkedEncoder, ServerSentEvent
 from src.memory.buffer import ByteBuffer
-from src.http.fast_json import FastJson, FastJsonDoc
+from src.http.fast_json import FastJson, FastJsonDoc, FastJsonStream
+from src.runtime.date_cache import get_date_cache
+from src.db.types import Row, RowView
+
+# Worker-local reusable zero-copy scratch buffer (one per reactor process)
+_WORKER_SCRATCH_BUF = ByteBuffer(65536)
+_HTTP_200_TEXT_PREFIX = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: "
+_HTTP_200_JSON_PREFIX = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: "
 
 class Response:
     status_code: int
     content_type: str
-    body: str
+    _body: str
     custom_headers: list[Tuple[str, str]]
+    has_custom_headers: bool
     is_chunked: bool
     is_deferred: bool
+    raw_dict: Optional[dict[str, str]]
+    has_raw_dict: bool
+    raw_row: Optional[Row]
+    has_raw_row: bool
+    raw_view: Optional[RowView]
+    has_raw_view: bool
 
     def __init__(
         self,
@@ -23,13 +36,90 @@ class Response:
     ):
         self.status_code = status_code
         self.content_type = content_type
-        self.body = body
+        self._body = body
         self.custom_headers = []
+        self.has_custom_headers = False
         self.is_chunked = is_chunked
         self.is_deferred = is_deferred
+        self.raw_dict = None
+        self.has_raw_dict = False
+        self.raw_row = None
+        self.has_raw_row = False
+        self.raw_view = None
+        self.has_raw_view = False
+
+    def reset(
+        self,
+        body: str = "",
+        status_code: int = 200,
+        content_type: str = "text/plain; charset=utf-8",
+        is_chunked: bool = False,
+        is_deferred: bool = False
+    ) -> None:
+        self.status_code = status_code
+        self.content_type = content_type
+        self._body = body
+        if len(self.custom_headers) > 0:
+            self.custom_headers.clear()
+        self.has_custom_headers = False
+        self.is_chunked = is_chunked
+        self.is_deferred = is_deferred
+        self.raw_dict = None
+        self.has_raw_dict = False
+        self.raw_row = None
+        self.has_raw_row = False
+        self.raw_view = None
+        self.has_raw_view = False
+
+    @staticmethod
+    def create(
+        body: str = "",
+        status_code: int = 200,
+        content_type: str = "text/plain; charset=utf-8",
+        is_chunked: bool = False,
+        is_deferred: bool = False
+    ) -> Response:
+        if len(_FREE_RESPONSES) > 0:
+            resp = _FREE_RESPONSES.pop()
+            resp.reset(body, status_code, content_type, is_chunked, is_deferred)
+            return resp
+        return Response(body=body, status_code=status_code, content_type=content_type, is_chunked=is_chunked, is_deferred=is_deferred)
+
+    @staticmethod
+    def recycle(resp: Response) -> None:
+        if not resp.is_deferred and len(_FREE_RESPONSES) < _MAX_FREE_RESPONSES:
+            resp.reset()
+            _FREE_RESPONSES.append(resp)
+
+    @property
+    def body(self) -> str:
+        if len(self._body) > 0:
+            return self._body
+        if self.has_raw_dict and self.raw_dict is not None:
+            self._body = FastJson.dumps_dict(self.raw_dict)
+            return self._body
+        if self.has_raw_row and self.raw_row is not None:
+            r = self.raw_row
+            if r is not None:
+                self._body = r.to_json()
+                return self._body
+        if self.has_raw_view and self.raw_view is not None:
+            v = self.raw_view
+            if v is not None:
+                self._body = v.to_json()
+                return self._body
+        return ""
+
+    @body.setter
+    def body(self, val: str) -> None:
+        self._body = val
+        self.has_raw_dict = False
 
     def set_header(self, name: str, value: str) -> None:
-        self.custom_headers.append((name, value))
+        clean_name = name.replace("\r", "").replace("\n", "").strip()
+        clean_val = value.replace("\r", "").replace("\n", "").strip()
+        self.custom_headers.append((clean_name, clean_val))
+        self.has_custom_headers = True
 
     def set_cookie(
         self,
@@ -68,33 +158,50 @@ class Response:
 
     @staticmethod
     def text(content: str, status: int = 200) -> Response:
-        return Response(body=content, status_code=status, content_type="text/plain; charset=utf-8")
+        return Response.create(body=content, status_code=status, content_type="text/plain; charset=utf-8")
 
     @staticmethod
     def json(content: str, status: int = 200) -> Response:
-        return Response(body=content, status_code=status, content_type="application/json; charset=utf-8")
+        return Response.create(body=content, status_code=status, content_type="application/json; charset=utf-8")
 
     @staticmethod
     def json(doc: FastJsonDoc, status: int = 200) -> Response:
-        return Response(body=doc.dumps(), status_code=status, content_type="application/json; charset=utf-8")
+        return Response.create(body=doc.dumps(), status_code=status, content_type="application/json; charset=utf-8")
 
     @staticmethod
     def json(d: dict[str, str], status: int = 200) -> Response:
-        return Response(body=FastJson.dumps_dict(d), status_code=status, content_type="application/json; charset=utf-8")
+        resp = Response.create(body="", status_code=status, content_type="application/json; charset=utf-8")
+        resp.raw_dict = d
+        resp.has_raw_dict = True
+        return resp
+
+    @staticmethod
+    def json(row: Row, status: int = 200) -> Response:
+        resp = Response.create(body="", status_code=status, content_type="application/json; charset=utf-8")
+        resp.raw_row = row
+        resp.has_raw_row = True
+        return resp
+
+    @staticmethod
+    def json(view: RowView, status: int = 200) -> Response:
+        resp = Response.create(body="", status_code=status, content_type="application/json; charset=utf-8")
+        resp.raw_view = view
+        resp.has_raw_view = True
+        return resp
 
     @staticmethod
     def html(content: str, status: int = 200) -> Response:
-        return Response(body=content, status_code=status, content_type="text/html; charset=utf-8")
+        return Response.create(body=content, status_code=status, content_type="text/html; charset=utf-8")
 
     @staticmethod
     def redirect(location: str, status: int = 302) -> Response:
-        resp = Response(body="", status_code=status, content_type="text/plain; charset=utf-8")
+        resp = Response.create(body="", status_code=status, content_type="text/plain; charset=utf-8")
         resp.set_header("Location", location)
         return resp
 
     @staticmethod
     def empty(status: int = 204) -> Response:
-        return Response(body="", status_code=status, content_type="text/plain; charset=utf-8")
+        return Response.create(body="", status_code=status, content_type="text/plain; charset=utf-8")
 
     @staticmethod
     def not_modified(etag: str = "") -> Response:
@@ -108,10 +215,12 @@ class Response:
         return Response(is_deferred=True)
 
     @staticmethod
-    def file(filepath: str, content_type: str = "") -> Response:
+    def file(filepath: str, content_type: str = "", max_size: int = 52428800) -> Response:
         try:
             with open(filepath, "r") as f:
                 content = f.read()
+            if len(content) > max_size:
+                return Response.text("Payload Too Large", 413)
             ct = content_type if len(content_type) > 0 else MimeType.from_path(filepath)
             return Response(body=content, status_code=200, content_type=ct)
         except:
@@ -143,26 +252,153 @@ class Response:
         resp.set_header("X-Accel-Buffering", "no")
         return resp
 
+    def _write_fast_payload(self) -> int:
+        _WORKER_SCRATCH_BUF.reset()
+        if self.has_raw_dict and self.raw_dict is not None:
+            return FastJsonStream.write_dict(_WORKER_SCRATCH_BUF, self.raw_dict)
+        if self.has_raw_row and self.raw_row is not None:
+            r = self.raw_row
+            if r is not None:
+                return r.write_json_direct(_WORKER_SCRATCH_BUF)
+        if self.has_raw_view and self.raw_view is not None:
+            v = self.raw_view
+            if v is not None:
+                return v.write_json_direct(_WORKER_SCRATCH_BUF)
+        return 0
+
     def serialize(self, dest: ByteBuffer, keep_alive: bool = True) -> None:
-        # HTTP/1.1 <status> <reason>\r\n
-        reason = HttpStatus.get_reason_phrase(self.status_code)
-        dest.append_str("HTTP/1.1 ")
-        dest.append_str(str(self.status_code))
-        dest.append_str(" ")
-        dest.append_str(reason)
-        dest.append_str("\r\nServer: CodonWeb/0.1\r\nContent-Type: ")
-        dest.append_str(self.content_type)
+        has_fast = self.has_raw_dict or self.has_raw_row or self.has_raw_view
 
-        if self.is_chunked:
-            dest.append_str("\r\nTransfer-Encoding: chunked")
+        # Fast Path 1: Streamlined Zero-Copy for 200 OK Keep-Alive without custom headers
+        if self.status_code == 200 and not self.is_chunked and not self.has_custom_headers and keep_alive:
+            if not has_fast:
+                blen = len(self._body)
+                dest.ensure_writable(160 + blen)
+                if self.content_type == "text/plain; charset=utf-8":
+                    dest.append_str(_HTTP_200_TEXT_PREFIX)
+                elif self.content_type == "application/json; charset=utf-8":
+                    dest.append_str(_HTTP_200_JSON_PREFIX)
+                else:
+                    dest.append_str("HTTP/1.1 200 OK\r\nContent-Type: ")
+                    dest.append_str(self.content_type)
+                    dest.append_str("\r\nContent-Length: ")
+                dest.append_int(blen)
+                dest.append_str("\r\n")
+                dest.append_slice(get_date_cache().get_slice())
+                dest.append_str("\r\n")
+                dest.append_str(self._body)
+                return
+            else:
+                written = self._write_fast_payload()
+                if written > 0:
+                    json_slice = _WORKER_SCRATCH_BUF.readable_slice()
+                    dest.append_str("HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ")
+                    dest.append_int(json_slice.len)
+                    dest.append_str("\r\n")
+                    dest.append_slice(get_date_cache().get_slice())
+                    dest.append_str("\r\n")
+                    dest.append_slice(json_slice)
+                    return
+
+        # 1. Zero-Copy Fast Path: Streaming JSON payload (dict / row / view)
+        if has_fast:
+            written = self._write_fast_payload()
+            if written > 0:
+                json_slice = _WORKER_SCRATCH_BUF.readable_slice()
+                body_len = json_slice.len
+
+                sc = self.status_code
+                if sc == 200:
+                    dest.append_str("HTTP/1.1 200 OK\r\nServer: CodonWeb/0.1\r\n")
+                elif sc == 201:
+                    dest.append_str("HTTP/1.1 201 Created\r\nServer: CodonWeb/0.1\r\n")
+                else:
+                    reason = HttpStatus.get_reason_phrase(sc)
+                    dest.append_str("HTTP/1.1 ")
+                    dest.append_int(sc)
+                    dest.append_str(" ")
+                    dest.append_str(reason)
+                    dest.append_str("\r\nServer: CodonWeb/0.1\r\n")
+
+                dest.append_slice(get_date_cache().get_slice())
+                dest.append_str("Content-Type: application/json; charset=utf-8\r\nContent-Length: ")
+                dest.append_int(body_len)
+                if keep_alive:
+                    dest.append_str("\r\nConnection: keep-alive\r\n")
+                else:
+                    dest.append_str("\r\nConnection: close\r\n")
+
+                for i in range(len(self.custom_headers)):
+                    k, v = self.custom_headers[i]
+                    dest.append_str(k)
+                    dest.append_str(": ")
+                    dest.append_str(v)
+                    dest.append_str("\r\n")
+
+                dest.append_str("\r\n")
+                dest.append_slice(json_slice)
+                return
+
+        # 2. Standard Path
+        sc = self.status_code
+        if sc == 200:
+            dest.append_str("HTTP/1.1 200 OK\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 201:
+            dest.append_str("HTTP/1.1 201 Created\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 204:
+            dest.append_str("HTTP/1.1 204 No Content\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 301:
+            dest.append_str("HTTP/1.1 301 Moved Permanently\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 302:
+            dest.append_str("HTTP/1.1 302 Found\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 304:
+            dest.append_str("HTTP/1.1 304 Not Modified\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 400:
+            dest.append_str("HTTP/1.1 400 Bad Request\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 401:
+            dest.append_str("HTTP/1.1 401 Unauthorized\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 403:
+            dest.append_str("HTTP/1.1 403 Forbidden\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 404:
+            dest.append_str("HTTP/1.1 404 Not Found\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 405:
+            dest.append_str("HTTP/1.1 405 Method Not Allowed\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 422:
+            dest.append_str("HTTP/1.1 422 Unprocessable Entity\r\nServer: CodonWeb/0.1\r\n")
+        elif sc == 500:
+            dest.append_str("HTTP/1.1 500 Internal Server Error\r\nServer: CodonWeb/0.1\r\n")
         else:
-            dest.append_str("\r\nContent-Length: ")
-            dest.append_str(str(strlen(self.body.c_str().as_byte())))
+            reason = HttpStatus.get_reason_phrase(sc)
+            dest.append_str("HTTP/1.1 ")
+            dest.append_int(sc)
+            dest.append_str(" ")
+            dest.append_str(reason)
+            dest.append_str("\r\nServer: CodonWeb/0.1\r\n")
 
-        dest.append_str("\r\nConnection: ")
-        dest.append_str("keep-alive" if keep_alive else "close")
+        # 2. Date Header (Zero-alloc global cached slice)
+        date_slice = get_date_cache().get_slice()
+        dest.append_slice(date_slice)
+
+        # 3. Content-Type Header
+        dest.append_str("Content-Type: ")
+        dest.append_str(self.content_type)
         dest.append_str("\r\n")
 
+        # 4. Content-Length or Transfer-Encoding (Zero-alloc append_int)
+        if self.is_chunked:
+            dest.append_str("Transfer-Encoding: chunked\r\n")
+        else:
+            dest.append_str("Content-Length: ")
+            dest.append_int(len(self._body))
+            dest.append_str("\r\n")
+
+        # 5. Connection Header
+        if keep_alive:
+            dest.append_str("Connection: keep-alive\r\n")
+        else:
+            dest.append_str("Connection: close\r\n")
+
+        # 6. Custom Headers
         for i in range(len(self.custom_headers)):
             k, v = self.custom_headers[i]
             dest.append_str(k)
@@ -170,5 +406,9 @@ class Response:
             dest.append_str(v)
             dest.append_str("\r\n")
 
+        # 7. End of Headers & Body
         dest.append_str("\r\n")
-        dest.append_str(self.body)
+        dest.append_str(self._body)
+
+_FREE_RESPONSES = list[Response]()
+_MAX_FREE_RESPONSES = 2048

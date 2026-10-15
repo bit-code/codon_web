@@ -166,7 +166,7 @@ class SQLiteCursor[Conn]:
                             row_vals.append(s)
                         else:
                             row_vals.append("")
-                row = Row(self._field_names, row_vals)
+                row = Row(self._field_names, row_vals, self._fields)
                 self._rows.append(row)
 
             elif step_rc == i32(101): # SQLITE_DONE

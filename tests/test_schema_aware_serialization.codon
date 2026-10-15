@@ -1,0 +1,159 @@
+# Industrial Test Suite for Schema-Aware Zero-Copy Serialization (Scheme 3)
+from typing import List, Optional
+from src.db.types import (
+    Row, RowView, FieldInfo,
+    COL_KIND_INT, COL_KIND_FLOAT, COL_KIND_BOOL, COL_KIND_STR
+)
+from src.memory.buffer import ByteBuffer
+from src.orm import (
+    Model, ModelMeta, Field, IntegerField, CharField, FloatField, BooleanField
+)
+
+print("=== 1. Testing Raw Row with Schema-Aware Column Types ===")
+
+fields = List[FieldInfo]()
+fields.append(FieldInfo("id", column_type=3, kind=COL_KIND_INT))            # MySQL LONG / INT
+fields.append(FieldInfo("username", column_type=253, kind=COL_KIND_STR))     # MySQL VAR_STRING
+fields.append(FieldInfo("balance", column_type=5, kind=COL_KIND_FLOAT))      # MySQL DOUBLE
+fields.append(FieldInfo("is_active", column_type=1, kind=COL_KIND_BOOL))     # MySQL TINYINT(1) / BOOL
+fields.append(FieldInfo("remark", column_type=253, kind=COL_KIND_STR))        # Null field
+
+names = ["id", "username", "balance", "is_active", "remark"]
+vals = List[Optional[str]]()
+vals.append("1022578")
+vals.append("alice")
+vals.append("3500.75")
+vals.append("1")
+vals.append(None)
+
+row = Row(names, vals, fields)
+
+# Test 1.1: Typed Getters
+assert row.get_int("id") == 1022578
+assert row.get_str("username") == "alice"
+assert row.get_float("balance") == 3500.75
+assert row.get_bool("is_active") == True
+assert row.is_null("remark") == True
+assert row.get_str("remark", "N/A") == "N/A"
+print("[PASS] 1.1 Typed Getters (get_int, get_float, get_bool, get_str) verified!")
+
+# Test 1.2: Schema-Aware to_json string format
+json_str = row.to_json()
+print("Serialized Row JSON:", json_str)
+assert '"id":1022578' in json_str, "Expected unquoted integer for 'id'"
+assert '"balance":3500.75' in json_str, "Expected unquoted float for 'balance'"
+assert '"is_active":true' in json_str, "Expected unquoted boolean true for 'is_active'"
+assert '"username":"alice"' in json_str, "Expected quoted string for 'username'"
+assert '"remark":null' in json_str, "Expected null literal for 'remark'"
+print("[PASS] 1.2 Schema-Aware Row.to_json output verified (numbers/booleans unquoted, nulls exact)!")
+
+# Test 1.3: C-level direct streaming serialization (Row.write_json_direct)
+buf = ByteBuffer(4096)
+n = row.write_json_direct(buf)
+assert n > 0
+direct_json = str(buf.readable_slice().ptr, buf.readable_slice().len)
+print("Direct Streamed Row JSON:", direct_json)
+assert '"id":1022578' in direct_json
+assert '"balance":3500.75' in direct_json
+assert '"is_active":true' in direct_json
+assert '"username":"alice"' in direct_json
+assert '"remark":null' in direct_json
+print("[PASS] 1.3 C-level fast streaming Row.write_json_direct verified!")
+
+
+print("\n=== 2. Testing RowView Dynamic Modifications & Field Masking ===")
+view = row.create_view()
+view.set_int("vip_level", 9)
+view.set_float("discount", 0.85)
+view.set_bool("is_vip", True)
+view.set_str("masked_email", "a***@example.com")
+view.set_null("balance") # Override balance to null
+view.hide("username")     # Hide sensitive username field
+
+v_buf = ByteBuffer(4096)
+view.write_json_direct(v_buf)
+view_json = str(v_buf.readable_slice().ptr, v_buf.readable_slice().len)
+print("RowView Streamed JSON:", view_json)
+
+assert '"username"' not in view_json, "Hidden field 'username' must not appear in output"
+assert '"id":1022578' in view_json
+assert '"balance":null' in view_json
+assert '"vip_level":9' in view_json
+assert '"discount":0.85' in view_json
+assert '"is_vip":true' in view_json
+assert '"masked_email":"a***@example.com"' in view_json
+print("[PASS] 2.1 RowView dynamic types (set_int, set_float, set_bool, set_null, hide) verified!")
+
+
+print("\n=== 3. Testing ORM Model Integration with Schema-Aware Direct Serialization ===")
+
+class User(Model):
+    def __init__(self):
+        super().__init__()
+
+    def meta(self) -> ModelMeta:
+        return User.get_meta()
+
+    @staticmethod
+    def get_meta() -> ModelMeta:
+        fields = List[Field]()
+        fields.append(IntegerField("id", primary_key=True, auto_increment=True))
+        fields.append(CharField("name", max_length=64))
+        fields.append(FloatField("score", default_val="0.0"))
+        fields.append(BooleanField("is_verified", default_val="false"))
+        return ModelMeta("users", fields)
+
+    @property
+    def id(self) -> int:
+        return self.get_int("id")
+
+    @property
+    def score(self) -> float:
+        return self.get_float("score")
+
+    @property
+    def is_verified(self) -> bool:
+        return self.get_bool("is_verified")
+
+u = User()
+u.set_int("id", 42)
+u.set_str("name", "Bob")
+u.set_float("score", 99.5)
+u.set_bool("is_verified", True)
+
+assert u.id == 42
+assert u.get_str("name") == "Bob"
+assert u.score == 99.5
+assert u.is_verified == True
+print("[PASS] 3.1 Model typed properties and getters verified!")
+
+# Model Schema-Aware serialization
+u_row = u.to_row()
+assert len(u_row.field_infos) == len(u_row.field_names)
+assert u_row.field_infos[0].kind == COL_KIND_INT
+assert u_row.field_infos[1].kind == COL_KIND_STR
+assert u_row.field_infos[2].kind == COL_KIND_FLOAT
+assert u_row.field_infos[3].kind == COL_KIND_BOOL
+
+m_json = u.to_json()
+print("Model Serialized JSON:", m_json)
+assert '"id":42' in m_json, "Model 'id' must be unquoted int"
+assert '"name":"Bob"' in m_json, "Model 'name' must be quoted str"
+assert '"score":99.5' in m_json, "Model 'score' must be unquoted float"
+assert '"is_verified":true' in m_json, "Model 'is_verified' must be unquoted bool"
+print("[PASS] 3.2 Model Schema-Aware to_json verified!")
+
+# Model create_view test
+m_view = u.create_view()
+m_view.set_float("boosted_score", u.score + 5.0)
+m_view.hide("name")
+mv_json = m_view.to_json()
+print("ModelView JSON:", mv_json)
+assert '"name"' not in mv_json
+assert '"id":42' in mv_json
+assert '"boosted_score":104.5' in mv_json
+print("[PASS] 3.3 ModelView derived view with masked & computed fields verified!")
+
+print("\n==================================================================")
+print(">>> ALL INDUSTRIAL SCHEMA-AWARE SERIALIZATION TESTS PASSED! <<<")
+print("==================================================================")

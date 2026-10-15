@@ -1,0 +1,278 @@
+# ==============================================================================
+# Smart Fulfillment Hub - HTTP API Controller Layer
+# Connects CodonWeb routing, RFC 7807 422 error handling, multi-source ingestion,
+# Real Database Asynchronous ORM persistence, and OpenAPI contract exposure.
+# ==============================================================================
+
+from codon_web import (
+    App, Request, Response,
+    CORSMiddleware, RequestIdMiddleware, TimingMiddleware
+)
+from examples.smart_fulfillment.config import app_config
+from examples.smart_fulfillment.schemas import (
+    AddressSchema,
+    FulfillmentItemSchema,
+    FulfillmentRequest,
+    FulfillmentOrderUpdateSchema,
+    WarehouseInventorySchema,
+    InventoryUpdateSchema,
+    LogisticsRoutePointSchema,
+    ShipmentTrackingSchema,
+    ShipmentUpdateSchema
+)
+from examples.smart_fulfillment.services import FulfillmentService
+from examples.smart_fulfillment.sync_service import SyncFulfillmentService
+from examples.smart_fulfillment.entities import (
+    FulfillmentOrderTable,
+    WarehouseInventoryTable,
+    ShipmentTrackingTable
+)
+from src.schema import ValidationError, ValidationResult
+
+
+def create_fulfillment_app() -> App:
+    """Builds and configures the production REST API Application."""
+    app = App(
+        host="0.0.0.0",
+        port=app_config.port,
+        title=app_config.service_name,
+        version="2.0.0",
+        description="High-Throughput Logistics & Fulfillment Hub powered by CodonWeb AOT Schemas & Async ORM"
+    )
+
+    # Attach enterprise middleware
+    app.use(RequestIdMiddleware())
+    app.use(TimingMiddleware())
+    app.use(CORSMiddleware())
+
+    # -------------------------------------------------------------------------
+    # System: Healthcheck & Schema Meta
+    # -------------------------------------------------------------------------
+    @app.get("/health", summary="Service Healthcheck", tags=["Health"])
+    def health_handler(req: Request) -> Response:
+        return Response.json('{"status":"UP","service":"' + app_config.service_name + '"}', 200)
+
+    @app.get("/api/v1/fulfillment/schema", summary="OpenAPI 3.0 Schema Specification", tags=["Meta"])
+    def get_openapi_schema(req: Request) -> Response:
+        return Response.json(FulfillmentRequest.openapi_schema_json(), 200)
+
+    # -------------------------------------------------------------------------
+    # Domain: Order Dispatch Calculation & Multi-Source Query Ingestion
+    # -------------------------------------------------------------------------
+    @app.post("/api/v1/fulfillment/dispatch", summary="Dispatch Fulfillment Order", tags=["Fulfillment"])
+    def dispatch_order(req: Request) -> Response:
+        val_res = FulfillmentRequest.from_json_doc(req.json_doc())
+        if not val_res.is_ok():
+            return val_res.to_response(422)
+
+        order = val_res.unwrap()
+        metrics = FulfillmentService.calculate_order_metrics(order)
+        resp_json = (
+            '{"status":"dispatched",'
+            + '"tracking_sn":"' + order.tracking_sn + '",'
+            + '"item_subtotal":' + str(metrics.item_subtotal) + ','
+            + '"shipping_fee":' + str(metrics.shipping_fee) + ','
+            + '"insurance_fee":' + str(metrics.insurance_fee) + ','
+            + '"discount_amount":' + str(metrics.discount_amount) + ','
+            + '"final_payable":' + str(metrics.final_payable) + '}'
+        )
+        return Response.json(resp_json, 201)
+
+    @app.get("/api/v1/fulfillment/inspect-query", summary="Inspect Address via Query Parameters", tags=["Inspection"])
+    def inspect_query(req: Request) -> Response:
+        val_res = AddressSchema.from_dict(req.get_query_params())
+        if not val_res.is_ok():
+            return val_res.to_response(422)
+        addr = val_res.unwrap()
+        return Response.json(addr.to_json(), 200)
+
+    @app.post("/api/v1/fulfillment/orm-roundtrip", summary="Sync ORM Interop Verification", tags=["SyncORM"])
+    def orm_roundtrip(req: Request) -> Response:
+        val_res = FulfillmentRequest.from_json_doc(req.json_doc())
+        if not val_res.is_ok():
+            return val_res.to_response(422)
+
+        order = val_res.unwrap()
+        table_entity = FulfillmentOrderTable()
+        SyncFulfillmentService.transfer_to_orm(order, table_entity)
+        restored_res = SyncFulfillmentService.restore_from_orm(table_entity)
+        if not restored_res.is_ok():
+            return restored_res.to_response(500)
+        restored_order = restored_res.unwrap()
+        return Response.json('{"synced":true,"tracking_sn":"' + restored_order.tracking_sn + '"}', 200)
+
+    # -------------------------------------------------------------------------
+    # SCENARIO 1: Fulfillment Orders Async ORM CRUD
+    # -------------------------------------------------------------------------
+    @app.async_post("/api/v1/fulfillment/orders", summary="Create Order", tags=["Orders"])
+    async def create_order_endpoint(req: Request):
+        val_res = FulfillmentRequest.from_json_doc(req.json_doc())
+        if not val_res.is_ok():
+            return val_res.to_response(422)
+        order = val_res.unwrap()
+        new_id = await FulfillmentService.create_order(order)
+        return Response.json('{"status":"created","db_id":' + str(new_id) + ',"tracking_sn":"' + order.tracking_sn + '"}', 201)
+
+    @app.async_get("/api/v1/fulfillment/orders", summary="Get Order by Tracking SN", tags=["Orders"])
+    async def get_order_endpoint(req: Request):
+        sn = req.query_param("tracking_sn", "")
+        if len(sn) == 0:
+            return Response.json('{"error":"tracking_sn is required"}', 400)
+        found, order = await FulfillmentService.get_order_by_sn(sn)
+        if not found:
+            return Response.json('{"error":"Order not found"}', 404)
+        return Response.json(order.to_json(), 200)
+
+    @app.async_get("/api/v1/fulfillment/orders/list", summary="List Orders with Filters", tags=["Orders"])
+    async def list_orders_endpoint(req: Request):
+        speed = req.query_param("delivery_speed", "")
+        city = req.query_param("city", "")
+        limit = req.query_param_int("limit", 10)
+        offset = req.query_param_int("offset", 0)
+        orders = await FulfillmentService.list_orders(speed=speed, city=city, limit=limit, offset=offset)
+        parts = List[str]()
+        for o in orders:
+            parts.append(o.to_json())
+        return Response.json("[" + ",".join(parts) + "]", 200)
+
+    @app.async_put("/api/v1/fulfillment/orders", summary="Update Order", tags=["Orders"])
+    async def update_order_endpoint(req: Request):
+        sn = req.query_param("tracking_sn", "")
+        if len(sn) == 0:
+            return Response.json('{"error":"tracking_sn is required"}', 400)
+        val_res = FulfillmentOrderUpdateSchema.from_json_doc(req.json_doc())
+        if not val_res.is_ok():
+            return val_res.to_response(422)
+        up_req = val_res.unwrap()
+        ok = await FulfillmentService.update_order(sn, up_req)
+        if not ok:
+            return Response.json('{"error":"Order not found or update failed"}', 404)
+        return Response.json('{"updated":true,"tracking_sn":"' + sn + '"}', 200)
+
+    @app.async_delete("/api/v1/fulfillment/orders", summary="Delete Order", tags=["Orders"])
+    async def delete_order_endpoint(req: Request):
+        sn = req.query_param("tracking_sn", "")
+        if len(sn) == 0:
+            return Response.json('{"error":"tracking_sn is required"}', 400)
+        ok = await FulfillmentService.delete_order(sn)
+        if not ok:
+            return Response.json('{"error":"Order not found or delete failed"}', 404)
+        return Response.json('{"deleted":true,"tracking_sn":"' + sn + '"}', 200)
+
+    # -------------------------------------------------------------------------
+    # SCENARIO 2: Warehouse Inventory Async ORM CRUD
+    # -------------------------------------------------------------------------
+    @app.async_post("/api/v1/inventory", summary="Create Inventory Item", tags=["Inventory"])
+    async def create_inventory_endpoint(req: Request):
+        val_res = WarehouseInventorySchema.from_json_doc(req.json_doc())
+        if not val_res.is_ok():
+            return val_res.to_response(422)
+        item = val_res.unwrap()
+        new_id = await FulfillmentService.create_inventory(item)
+        return Response.json('{"status":"created","db_id":' + str(new_id) + ',"sku_id":"' + item.sku_id + '"}', 201)
+
+    @app.async_get("/api/v1/inventory", summary="Get Inventory Item by SKU", tags=["Inventory"])
+    async def get_inventory_endpoint(req: Request):
+        sku = req.query_param("sku_id", "")
+        if len(sku) == 0:
+            return Response.json('{"error":"sku_id is required"}', 400)
+        found, item = await FulfillmentService.get_inventory_by_sku(sku)
+        if not found:
+            return Response.json('{"error":"Inventory item not found"}', 404)
+        return Response.json(item.to_json(), 200)
+
+    @app.async_get("/api/v1/inventory/list", summary="List Inventory with Filters", tags=["Inventory"])
+    async def list_inventory_endpoint(req: Request):
+        wh_code = req.query_param("warehouse_code", "")
+        min_stock = req.query_param_int("min_stock", 0)
+        limit = req.query_param_int("limit", 10)
+        offset = req.query_param_int("offset", 0)
+        items = await FulfillmentService.list_inventory(wh_code=wh_code, min_stock=min_stock, limit=limit, offset=offset)
+        parts = List[str]()
+        for it in items:
+            parts.append(it.to_json())
+        return Response.json("[" + ",".join(parts) + "]", 200)
+
+    @app.async_put("/api/v1/inventory", summary="Update Inventory Stock", tags=["Inventory"])
+    async def update_inventory_endpoint(req: Request):
+        sku = req.query_param("sku_id", "")
+        if len(sku) == 0:
+            return Response.json('{"error":"sku_id is required"}', 400)
+        val_res = InventoryUpdateSchema.from_json_doc(req.json_doc())
+        if not val_res.is_ok():
+            return val_res.to_response(422)
+        up_req = val_res.unwrap()
+        ok = await FulfillmentService.update_inventory(sku, up_req)
+        if not ok:
+            return Response.json('{"error":"Item not found or update failed"}', 404)
+        return Response.json('{"updated":true,"sku_id":"' + sku + '"}', 200)
+
+    @app.async_delete("/api/v1/inventory", summary="Delete Inventory Item", tags=["Inventory"])
+    async def delete_inventory_endpoint(req: Request):
+        sku = req.query_param("sku_id", "")
+        if len(sku) == 0:
+            return Response.json('{"error":"sku_id is required"}', 400)
+        ok = await FulfillmentService.delete_inventory(sku)
+        if not ok:
+            return Response.json('{"error":"Item not found or delete failed"}', 404)
+        return Response.json('{"deleted":true,"sku_id":"' + sku + '"}', 200)
+
+    # -------------------------------------------------------------------------
+    # SCENARIO 3: Shipment Tracking Async ORM CRUD
+    # -------------------------------------------------------------------------
+    @app.async_post("/api/v1/shipments", summary="Create Shipment Waybill", tags=["Shipments"])
+    async def create_shipment_endpoint(req: Request):
+        val_res = ShipmentTrackingSchema.from_json_doc(req.json_doc())
+        if not val_res.is_ok():
+            return val_res.to_response(422)
+        shipment = val_res.unwrap()
+        new_id = await FulfillmentService.create_shipment(shipment)
+        return Response.json('{"status":"created","db_id":' + str(new_id) + ',"waybill_no":"' + shipment.waybill_no + '"}', 201)
+
+    @app.async_get("/api/v1/shipments", summary="Get Shipment Waybill", tags=["Shipments"])
+    async def get_shipment_endpoint(req: Request):
+        wb = req.query_param("waybill_no", "")
+        if len(wb) == 0:
+            return Response.json('{"error":"waybill_no is required"}', 400)
+        found, shipment = await FulfillmentService.get_shipment_by_waybill(wb)
+        if not found:
+            return Response.json('{"error":"Shipment not found"}', 404)
+        return Response.json(shipment.to_json(), 200)
+
+    @app.async_get("/api/v1/shipments/list", summary="List Shipments with Filters", tags=["Shipments"])
+    async def list_shipments_endpoint(req: Request):
+        carrier = req.query_param("carrier_code", "")
+        status = req.query_param_int("status_code", -1)
+        limit = req.query_param_int("limit", 10)
+        offset = req.query_param_int("offset", 0)
+        shipments = await FulfillmentService.list_shipments(carrier=carrier, status=status, limit=limit, offset=offset)
+        parts = List[str]()
+        for sh in shipments:
+            parts.append(sh.to_json())
+        return Response.json("[" + ",".join(parts) + "]", 200)
+
+    @app.async_put("/api/v1/shipments", summary="Update Shipment Status", tags=["Shipments"])
+    async def update_shipment_endpoint(req: Request):
+        wb = req.query_param("waybill_no", "")
+        if len(wb) == 0:
+            return Response.json('{"error":"waybill_no is required"}', 400)
+        val_res = ShipmentUpdateSchema.from_json_doc(req.json_doc())
+        if not val_res.is_ok():
+            return val_res.to_response(422)
+        up_req = val_res.unwrap()
+        ok = await FulfillmentService.update_shipment(wb, up_req)
+        if not ok:
+            return Response.json('{"error":"Shipment not found or update failed"}', 404)
+        return Response.json('{"updated":true,"waybill_no":"' + wb + '"}', 200)
+
+    @app.async_delete("/api/v1/shipments", summary="Delete Shipment", tags=["Shipments"])
+    async def delete_shipment_endpoint(req: Request):
+        wb = req.query_param("waybill_no", "")
+        if len(wb) == 0:
+            return Response.json('{"error":"waybill_no is required"}', 400)
+        ok = await FulfillmentService.delete_shipment(wb)
+        if not ok:
+            return Response.json('{"error":"Shipment not found or delete failed"}', 404)
+        return Response.json('{"deleted":true,"waybill_no":"' + wb + '"}', 200)
+
+    return app

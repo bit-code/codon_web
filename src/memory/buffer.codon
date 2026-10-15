@@ -1,11 +1,19 @@
-from C import strlen(cobj) -> int, memcpy(cobj, cobj, int) -> cobj
 from src.memory.slice import ByteSlice
+
+@llvm
+def _get_str_ptr(s: str) -> Ptr[byte]:
+    %p = extractvalue {i8*, i64} %s, 0
+    ret i8* %p
+
+DIGITS_RADIX100 = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+_RADIX100_PTR = DIGITS_RADIX100.c_str().as_byte()
 
 class ByteBuffer:
     ptr: Ptr[byte]
     capacity: int
     read_pos: int
     write_pos: int
+    scratch_int: Ptr[byte]
 
     def __init__(self, initial_capacity: int = 4096):
         cap = initial_capacity if initial_capacity >= 1024 else 1024
@@ -13,6 +21,7 @@ class ByteBuffer:
         self.ptr = Ptr[byte](cap)
         self.read_pos = 0
         self.write_pos = 0
+        self.scratch_int = Ptr[byte](32)
 
     def readable_bytes(self) -> int:
         return self.write_pos - self.read_pos
@@ -47,9 +56,8 @@ class ByteBuffer:
                 self.read_pos = 0
                 self.write_pos = 0
             return
-        # Move readable bytes to front
-        for i in range(rlen):
-            self.ptr[i] = self.ptr[self.read_pos + i]
+        # Move readable bytes to front via native LLVM intrinsic memmove
+        str.memmove(self.ptr.as_byte(), (self.ptr + self.read_pos).as_byte(), rlen)
         self.read_pos = 0
         self.write_pos = rlen
 
@@ -66,8 +74,8 @@ class ByteBuffer:
             new_cap *= 2
         new_ptr = Ptr[byte](new_cap)
         rlen = self.readable_bytes()
-        for i in range(rlen):
-            new_ptr[i] = self.ptr[self.read_pos + i]
+        if rlen > 0:
+            str.memcpy(new_ptr.as_byte(), (self.ptr + self.read_pos).as_byte(), rlen)
         self.ptr = new_ptr
         self.capacity = new_cap
         self.read_pos = 0
@@ -79,21 +87,87 @@ class ByteBuffer:
         self.write_pos += 1
 
     def append_str(self, s: str) -> None:
-        c_str = s.c_str()
-        slen = strlen(c_str.as_byte())
+        slen = len(s)
         if slen == 0:
             return
         self.ensure_writable(slen)
-        memcpy((self.ptr + self.write_pos).as_byte(), c_str.as_byte(), slen)
+        str.memcpy((self.ptr + self.write_pos).as_byte(), _get_str_ptr(s).as_byte(), slen)
         self.write_pos += slen
 
     def append_slice(self, s: ByteSlice) -> None:
-        if s.len == 0:
+        if s.len <= 0:
             return
         self.ensure_writable(s.len)
-        for i in range(s.len):
-            self.ptr[self.write_pos + i] = s.ptr[i]
+        str.memcpy((self.ptr + self.write_pos).as_byte(), s.ptr.as_byte(), s.len)
         self.write_pos += s.len
+
+    def append_c_str_fast(self, ptr: Ptr[byte], length: int) -> None:
+        if length <= 0:
+            return
+        self.ensure_writable(length)
+        str.memcpy((self.ptr + self.write_pos).as_byte(), ptr.as_byte(), length)
+        self.write_pos += length
+
+    def append_int(self, val: int) -> None:
+        self.ensure_writable(24)
+        if val == 0:
+            self.ptr[self.write_pos] = byte(48)
+            self.write_pos += 1
+            return
+
+        neg = False
+        v = val
+        if v < 0:
+            neg = True
+            v = -v
+
+        # Fast path for single digit
+        if v < 10:
+            if neg:
+                self.ptr[self.write_pos] = byte(45)
+                self.write_pos += 1
+            self.ptr[self.write_pos] = byte(48 + v)
+            self.write_pos += 1
+            return
+
+        # Fast path for 2 digits (HTTP status codes, small lengths)
+        if v < 100:
+            if neg:
+                self.ptr[self.write_pos] = byte(45)
+                self.write_pos += 1
+            idx = v * 2
+            self.ptr[self.write_pos] = _RADIX100_PTR[idx]
+            self.ptr[self.write_pos + 1] = _RADIX100_PTR[idx + 1]
+            self.write_pos += 2
+            return
+
+        # Radix-100 backwards format in pre-allocated buffer (zero heap allocation overhead)
+        tmp = self.scratch_int
+        pos = 23
+        while v >= 100:
+            rem = v % 100
+            v = v // 100
+            idx = rem * 2
+            tmp[pos] = _RADIX100_PTR[idx + 1]
+            pos -= 1
+            tmp[pos] = _RADIX100_PTR[idx]
+            pos -= 1
+
+        if v < 10:
+            tmp[pos] = byte(48 + v)
+        else:
+            idx = v * 2
+            tmp[pos] = _RADIX100_PTR[idx + 1]
+            pos -= 1
+            tmp[pos] = _RADIX100_PTR[idx]
+
+        if neg:
+            self.ptr[self.write_pos] = byte(45)
+            self.write_pos += 1
+
+        count = 24 - pos
+        str.memcpy((self.ptr + self.write_pos).as_byte(), (tmp + pos).as_byte(), count)
+        self.write_pos += count
 
     def reset(self) -> None:
         self.read_pos = 0

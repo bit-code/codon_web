@@ -2,7 +2,7 @@
 # Seamlessly bridges coroutine async handlers with the native EventLoop suspend/resume engine
 
 from typing import Callable, Optional
-from asyncio import Coroutine
+from asyncio import Coroutine, Task, CancelledError
 from src.http.request import Request
 from src.http.response import Response
 from src.http.exceptions import HTTPException
@@ -16,8 +16,12 @@ async def _dispatch_async_route(fn: Callable[[Request], Coroutine[Response]], re
         ctx.send(resp)
     except HTTPException as he:
         ctx.send(Response.json('{"code":' + str(he.status_code) + ',"error":"' + he.detail + '"}', he.status_code))
+    except CancelledError:
+        pass
     except Exception as e:
-        ctx.send(Response.json('{"code":500,"error":"Internal Server Error"}', 500))
+        if ctx.is_alive():
+            print("[ASYNC ROUTE ERROR]:", str(e))
+            ctx.send(Response.json('{"code":500,"error":"' + str(e) + '"}', 500))
 
 class AsyncRouteHandler(RouteHandler):
     async_fn: Callable[[Request], Coroutine[Response]]
@@ -30,5 +34,7 @@ class AsyncRouteHandler(RouteHandler):
         if ctx_opt is None:
             return Response.json('{"code":500,"error":"Async context unavailable"}', 500)
         ctx = ctx_opt
-        create_task(_dispatch_async_route(self.async_fn, req, ctx))
+        task = create_task(_dispatch_async_route(self.async_fn, req, ctx))
+        ctx.bind_task(task)
         return deferred_resp
+

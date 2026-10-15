@@ -1,0 +1,366 @@
+# Asynchronous Industrial-Grade PostgreSQL Driver (based on libpq Non-blocking I/O + Epoll EventLoop)
+from typing import Optional, List, Dict, Tuple
+import asyncio
+from asyncio import Future
+from src.core.async.loop import get_event_loop, EpollEventLoop
+from src.db.types import FieldInfo, Row
+from src.db.errors import (
+    DatabaseError, InterfaceError, OperationalError, ProgrammingError, IntegrityError
+)
+
+from C import strlen(Ptr[byte]) -> int
+
+from C import c_pg_connect(Ptr[byte]) -> Ptr[byte]
+from C import c_pg_status(Ptr[byte]) -> int
+from C import c_pg_error_message(Ptr[byte]) -> Ptr[byte]
+from C import c_pg_finish(Ptr[byte]) -> None
+
+from C import c_pg_result_status(Ptr[byte]) -> int
+from C import c_pg_result_error(Ptr[byte]) -> Ptr[byte]
+from C import c_pg_result_sqlstate(Ptr[byte]) -> Ptr[byte]
+from C import c_pg_clear_result(Ptr[byte]) -> None
+
+from C import c_pg_ntuples(Ptr[byte]) -> int
+from C import c_pg_nfields(Ptr[byte]) -> int
+from C import c_pg_fname(Ptr[byte], int) -> Ptr[byte]
+from C import c_pg_getvalue(Ptr[byte], int, int) -> Ptr[byte]
+from C import c_pg_getisnull(Ptr[byte], int, int) -> int
+from C import c_pg_cmd_tuples(Ptr[byte]) -> int
+from C import c_pg_ftype(Ptr[byte], int) -> int
+
+from C import c_pg_set_nonblocking(Ptr[byte], int) -> int
+from C import c_pg_is_nonblocking(Ptr[byte]) -> int
+from C import c_pg_socket(Ptr[byte]) -> int
+from C import c_pg_send_query_params(Ptr[byte], Ptr[byte], int, Ptr[Ptr[byte]]) -> int
+from C import c_pg_flush(Ptr[byte]) -> int
+from C import c_pg_consume_input(Ptr[byte]) -> int
+from C import c_pg_is_busy(Ptr[byte]) -> int
+from C import c_pg_get_result(Ptr[byte]) -> Ptr[byte]
+
+def _to_str(ptr: Ptr[byte]) -> str:
+    if not ptr:
+        return ""
+    l = strlen(ptr)
+    if l <= 0:
+        return ""
+    buf = Ptr[byte](l)
+    str.memcpy(buf, ptr, l)
+    return str(buf, l)
+
+
+class AsyncPostgresCursor[Conn]:
+    _conn: Conn
+    _rows: List[Row]
+    _row_idx: int
+    _fields: List[FieldInfo]
+    _field_names: List[str]
+    _affected_rows: int
+    _is_closed: bool
+
+    def __init__(self, conn: Conn):
+        self._conn = conn
+        self._rows = List[Row]()
+        self._row_idx = 0
+        self._fields = List[FieldInfo]()
+        self._field_names = List[str]()
+        self._affected_rows = 0
+        self._is_closed = False
+
+    @property
+    def rowcount(self) -> int:
+        if len(self._rows) > 0:
+            return len(self._rows)
+        return self._affected_rows
+
+    @property
+    def description(self) -> List[FieldInfo]:
+        return self._fields
+
+    @property
+    def lastrowid(self) -> int:
+        # In PostgreSQL, primary key values are returned via RETURNING id
+        if len(self._rows) > 0:
+            row = self._rows[0]
+            if len(row) > 0:
+                val = row[0]
+                if val is not None:
+                    try:
+                        return int(val)
+                    except:
+                        pass
+        return 0
+
+    def _reset(self) -> None:
+        self._rows = List[Row]()
+        self._row_idx = 0
+        self._fields = List[FieldInfo]()
+        self._field_names = List[str]()
+        self._affected_rows = 0
+
+    async def execute(self, sql: str, params: List[str] = List[str]()):
+        if self._is_closed or self._conn.is_closed or not self._conn.conn_handle:
+            raise InterfaceError("Cannot execute on closed async PostgreSQL cursor/connection")
+
+        self._reset()
+        conn_handle = self._conn.conn_handle
+        fd = self._conn.fd
+        loop = self._conn.loop
+
+        c_sql = sql.c_str().as_byte()
+        n_params = len(params)
+
+        ret = 0
+        if n_params > 0:
+            param_ptrs = Ptr[Ptr[byte]](n_params)
+            for i in range(n_params):
+                param_ptrs[i] = params[i].c_str().as_byte()
+            ret = c_pg_send_query_params(conn_handle, c_sql, n_params, param_ptrs)
+        else:
+            ret = c_pg_send_query_params(conn_handle, c_sql, 0, Ptr[Ptr[byte]](0))
+
+        if ret != 1:
+            err = _to_str(c_pg_error_message(conn_handle))
+            raise OperationalError("Failed to dispatch async query to PostgreSQL: " + err)
+
+        # 1. Flush outbound buffer if not completely written
+        flush_ret = c_pg_flush(conn_handle)
+        if flush_ret == 1:
+            fut_write = loop.create_future(bool)
+            def on_writable():
+                res_f = c_pg_flush(conn_handle)
+                if res_f <= 0:
+                    loop.remove_writer(fd)
+                    fut_write.set_result(res_f == 0)
+            loop.add_writer(fd, on_writable)
+            ok_write = await fut_write
+            if not ok_write:
+                err = _to_str(c_pg_error_message(conn_handle))
+                raise OperationalError("Failed to flush async query to PostgreSQL: " + err)
+        elif flush_ret < 0:
+            err = _to_str(c_pg_error_message(conn_handle))
+            raise OperationalError("Error flushing data to PostgreSQL socket: " + err)
+
+        # 2. Wait for incoming result non-blockingly via Epoll
+        c_pg_consume_input(conn_handle)
+        if c_pg_is_busy(conn_handle) != 0:
+            fut_read = loop.create_future(bool)
+            def on_readable():
+                if c_pg_consume_input(conn_handle) == 0:
+                    loop.remove_reader(fd)
+                    fut_read.set_result(False)
+                    return
+                if c_pg_is_busy(conn_handle) == 0:
+                    loop.remove_reader(fd)
+                    fut_read.set_result(True)
+
+            loop.add_reader(fd, on_readable)
+            ok_read = await fut_read
+            if not ok_read:
+                err = _to_str(c_pg_error_message(conn_handle))
+                raise OperationalError("Connection lost while reading async query response: " + err)
+
+        # 3. Read primary result
+        c_res = c_pg_get_result(conn_handle)
+        if not c_res:
+            err = _to_str(c_pg_error_message(conn_handle))
+            raise OperationalError("PostgreSQL server returned NULL result: " + err)
+
+        # 4. Drain remaining results until NULL (libpq protocol requirement)
+        while True:
+            extra = c_pg_get_result(conn_handle)
+            if not extra:
+                break
+            c_pg_clear_result(extra)
+
+        # 5. Check execution status & SQLSTATE
+        status = c_pg_result_status(c_res)
+        if status < 0:
+            err = _to_str(c_pg_result_error(c_res))
+            sqlstate = _to_str(c_pg_result_sqlstate(c_res))
+            c_pg_clear_result(c_res)
+            if sqlstate.startswith("23"):
+                raise IntegrityError("PostgreSQL IntegrityError [" + sqlstate + "]: " + err)
+            elif sqlstate.startswith("42"):
+                raise ProgrammingError("PostgreSQL ProgrammingError [" + sqlstate + "]: " + err)
+            elif sqlstate.startswith("08"):
+                raise OperationalError("PostgreSQL OperationalError [" + sqlstate + "]: " + err)
+            else:
+                raise DatabaseError("PostgreSQL SQL error [" + sqlstate + "]: " + err)
+
+        if status == 1:
+            # COMMAND_OK (INSERT / UPDATE / DELETE / DDL)
+            self._affected_rows = c_pg_cmd_tuples(c_res)
+            c_pg_clear_result(c_res)
+            return self._affected_rows
+        elif status == 2:
+            # TUPLES_OK (SELECT or INSERT...RETURNING)
+            n_rows = c_pg_ntuples(c_res)
+            n_cols = c_pg_nfields(c_res)
+
+            for j in range(n_cols):
+                col_name = _to_str(c_pg_fname(c_res, j))
+                col_oid = c_pg_ftype(c_res, j)
+                self._field_names.append(col_name)
+                self._fields.append(FieldInfo(name=col_name, column_type=col_oid))
+
+            for r in range(n_rows):
+                vals = List[Optional[str]]()
+                for c in range(n_cols):
+                    if c_pg_getisnull(c_res, r, c) == 1:
+                        vals.append(None)
+                    else:
+                        val_str = _to_str(c_pg_getvalue(c_res, r, c))
+                        vals.append(val_str)
+                self._rows.append(Row(self._field_names, vals, self._fields))
+
+            c_pg_clear_result(c_res)
+            return len(self._rows)
+
+        c_pg_clear_result(c_res)
+        return 0
+
+    def fetchone(self) -> Optional[Row]:
+        if self._row_idx < len(self._rows):
+            row = self._rows[self._row_idx]
+            self._row_idx += 1
+            return row
+        return None
+
+    def fetchall(self) -> List[Row]:
+        if self._row_idx == 0:
+            self._row_idx = len(self._rows)
+            return list(self._rows)
+        remaining = List[Row]()
+        while self._row_idx < len(self._rows):
+            remaining.append(self._rows[self._row_idx])
+            self._row_idx += 1
+        return remaining
+
+    def close(self) -> None:
+        self._is_closed = True
+        self._reset()
+
+
+class AsyncPostgresConnection:
+    conn_handle: Ptr[byte]
+    fd: int
+    loop: EpollEventLoop
+    is_closed: bool
+    database: str
+    in_transaction: bool
+
+    def __init__(self, conninfo: str, database: str = "", loop: Optional[EpollEventLoop] = None):
+        if loop is None:
+            self.loop = get_event_loop()
+        else:
+            self.loop = loop
+
+        self.conn_handle = Ptr[byte](0)
+        self.fd = -1
+        self.is_closed = True
+        self.database = database
+        self.in_transaction = False
+
+        h = c_pg_connect(conninfo.c_str().as_byte())
+        if not h or c_pg_status(h) != 0:
+            err = ""
+            if h:
+                err = _to_str(c_pg_error_message(h))
+                c_pg_finish(h)
+            raise OperationalError("Failed to connect to PostgreSQL: " + err)
+
+        # Set non-blocking mode on connection
+        if c_pg_set_nonblocking(h, 1) != 0:
+            err = _to_str(c_pg_error_message(h))
+            c_pg_finish(h)
+            raise OperationalError("Failed to set non-blocking mode on PostgreSQL connection: " + err)
+
+        fd = c_pg_socket(h)
+        if fd < 0:
+            c_pg_finish(h)
+            raise OperationalError("Failed to extract socket descriptor from PostgreSQL connection")
+
+        self.conn_handle = h
+        self.fd = fd
+        self.is_closed = False
+
+    def cursor(self) -> AsyncPostgresCursor[AsyncPostgresConnection]:
+        if self.is_closed or not self.conn_handle:
+            raise InterfaceError("Cannot create cursor on closed async PostgreSQL connection")
+        return AsyncPostgresCursor(self)
+
+    async def execute(self, sql: str, params: List[str] = List[str]()):
+        cur = self.cursor()
+        cnt = await cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+        return (cnt, rows)
+
+    async def begin(self):
+        if self.is_closed or not self.conn_handle:
+            raise InterfaceError("Cannot begin transaction on closed connection")
+        cur = self.cursor()
+        await cur.execute("BEGIN")
+        cur.close()
+        self.in_transaction = True
+
+    async def commit(self):
+        if self.is_closed or not self.conn_handle:
+            raise InterfaceError("Cannot commit on closed connection")
+        cur = self.cursor()
+        await cur.execute("COMMIT")
+        cur.close()
+        self.in_transaction = False
+
+    async def rollback(self):
+        if self.is_closed or not self.conn_handle:
+            raise InterfaceError("Cannot rollback on closed connection")
+        cur = self.cursor()
+        await cur.execute("ROLLBACK")
+        cur.close()
+        self.in_transaction = False
+
+    async def ping(self):
+        if self.is_closed or not self.conn_handle:
+            return False
+        try:
+            cur = self.cursor()
+            await cur.execute("SELECT 1")
+            cur.close()
+            return True
+        except:
+            return False
+
+    def close(self) -> None:
+        if not self.is_closed and self.conn_handle:
+            c_pg_finish(self.conn_handle)
+            self.conn_handle = Ptr[byte](0)
+            self.is_closed = True
+
+    def __del__(self):
+        if not self.is_closed and self.conn_handle:
+            c_pg_finish(self.conn_handle)
+            self.conn_handle = Ptr[byte](0)
+            self.is_closed = True
+
+
+async def connect_async(
+    host: str = "127.0.0.1",
+    port: int = 5432,
+    user: str = "postgres",
+    password: str = "",
+    database: str = "postgres",
+    conninfo: str = "",
+    loop: Optional[EpollEventLoop] = None
+):
+    if len(conninfo) == 0:
+        info_parts = [
+            "host=" + host,
+            "port=" + str(port),
+            "user=" + user,
+            "dbname=" + database
+        ]
+        if len(password) > 0:
+            info_parts.append("password=" + password)
+        conninfo = " ".join(info_parts)
+    return AsyncPostgresConnection(conninfo, database=database, loop=loop)

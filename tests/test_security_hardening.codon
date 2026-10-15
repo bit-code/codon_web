@@ -1,0 +1,227 @@
+# Comprehensive Security Hardening Test Suite for CodonWeb
+
+from src.ws.crypto import (
+    sha256_hex, hmac_sha256_hex, constant_time_compare
+)
+from src.framework.middleware import (
+    SignedCookieSessionMiddleware, RateLimiterMiddleware, _sign_session_data, _verify_session_data
+)
+from src.framework.static import StaticFilesHandler
+from src.orm.dialect import MySQLDialect, PostgreSQLDialect
+from src.orm.query import WhereCondition, Query
+from src.orm.model import ModelMeta
+from src.orm.fields import Field, IntegerField
+from typing import List
+from src.ws.frame import decode_frame, WSFrame, WS_OPCODE_TEXT, WS_OPCODE_CLOSE
+from src.http.request import Request
+from src.http.response import Response
+
+def test_crypto_sha256_and_hmac():
+    print("--- 1. Testing SHA-256 and HMAC-SHA256 ---")
+    # FIPS 180-4 Standard Test Vector: "" (empty string)
+    h_empty = sha256_hex("")
+    assert h_empty == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "SHA256 empty string failed: " + h_empty
+
+    # FIPS 180-4 Test Vector: "abc"
+    h_abc = sha256_hex("abc")
+    assert h_abc == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA256 'abc' failed: " + h_abc
+
+    # RFC 4231 HMAC-SHA256 Test Vector:
+    # Key: "Jefe", Data: "what do ya want for nothing?"
+    # Expected: 5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
+    hmac_res = hmac_sha256_hex("Jefe", "what do ya want for nothing?")
+    assert hmac_res == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", "HMAC-SHA256 test vector failed: " + hmac_res
+
+    # Test constant-time string comparison
+    assert constant_time_compare("secret_token_123", "secret_token_123") == True
+    assert constant_time_compare("secret_token_123", "secret_token_124") == False
+    assert constant_time_compare("short", "longer_string") == False
+    assert constant_time_compare("", "") == True
+    print("[PASS] SHA-256, HMAC-SHA256 & Constant-Time comparison verified!")
+
+def test_session_hmac():
+    print("--- 2. Testing Cryptographic HMAC Session ---")
+    secret = "production_super_secret_key_9876543210"
+    data = "user_id=10086&role=admin"
+
+    signed = _sign_session_data(data, secret)
+    assert len(signed) > len(data) + 64, "Signed session string too short: " + signed
+    assert signed.startswith(data + "."), "Signed session format invalid: " + signed
+
+    # Valid verification
+    verified = _verify_session_data(signed, secret)
+    assert verified == data, "Legitimate session data failed verification: " + verified
+
+    # Tampered payload attack: modify user_id to 99999
+    tampered_data = "user_id=99999&role=admin." + signed.split(".")[1]
+    assert _verify_session_data(tampered_data, secret) == "", "Tampered session was improperly accepted!"
+
+    # Tampered signature attack: modify signature
+    tampered_sig = data + ".0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    assert _verify_session_data(tampered_sig, secret) == "", "Tampered signature was improperly accepted!"
+
+    # Wrong secret verification
+    assert _verify_session_data(signed, "wrong_secret_key") == "", "Session validated with wrong secret!"
+    print("[PASS] Cryptographic HMAC Session Signing & Anti-Tamper verified!")
+
+def test_static_path_traversal():
+    print("--- 3. Testing Static Path Traversal Protections ---")
+    test_dir = "tests/static_fixture"
+    handler = StaticFilesHandler(test_dir)
+
+    # Normal valid file
+    req_ok = Request()
+    req_ok.path_params["*"] = "hello.txt"
+    resp_ok = handler.handle(req_ok)
+    assert resp_ok.status_code == 200
+
+    # Attack Vector 1: Literal path traversal
+    req_trav1 = Request()
+    req_trav1.path_params["*"] = "../../../etc/passwd"
+    resp_trav1 = handler.handle(req_trav1)
+    assert resp_trav1.status_code == 403
+
+    # Attack Vector 2: URL encoded path traversal (%2e%2e)
+    req_trav2 = Request()
+    req_trav2.path_params["*"] = "%2e%2e/%2e%2e/etc/passwd"
+    resp_trav2 = handler.handle(req_trav2)
+    assert resp_trav2.status_code == 403
+
+    # Attack Vector 3: Windows backslash traversal (..\..\win.ini)
+    req_trav3 = Request()
+    req_trav3.path_params["*"] = "..\\..\\windows\\win.ini"
+    resp_trav3 = handler.handle(req_trav3)
+    assert resp_trav3.status_code == 403
+
+    # Attack Vector 4: Null byte injection
+    req_null = Request()
+    req_null.path_params["*"] = "hello.txt%00.png"
+    resp_null = handler.handle(req_null)
+    assert resp_null.status_code == 400
+
+    print("[PASS] Static path traversal protections (URL-decode, backslash, null-byte) verified!")
+
+def test_orm_sql_injection():
+    print("--- 4. Testing ORM SQL Injection Defenses ---")
+    # 1. MySQL identifier quoting with internal backtick escape
+    mysql = MySQLDialect()
+    quoted_mysql = mysql.quote_identifier("users`drop`table")
+    assert quoted_mysql == "`users``drop``table`", "MySQL backtick escaping failed: " + quoted_mysql
+
+    # Multipart identifier
+    quoted_mysql_multi = mysql.quote_identifier("db.users.id")
+    assert quoted_mysql_multi == "`db`.`users`.`id`"
+
+    # 2. PostgreSQL identifier quoting with internal double-quote escape
+    pg = PostgreSQLDialect()
+    quoted_pg = pg.quote_identifier('users"drop"table')
+    assert quoted_pg == '"users""drop""table"', "PostgreSQL double-quote escaping failed: " + quoted_pg
+
+    # 3. Operator whitelist enforcement
+    valid_cond = WhereCondition("status", "=", "1")
+    assert valid_cond.op == "="
+
+    valid_like = WhereCondition("title", "LIKE", "%test%")
+    assert valid_like.op == "LIKE"
+
+    caught_op = False
+    try:
+        bad_cond = WhereCondition("id", "= 1 UNION SELECT 1, 2 --", "val")
+    except ValueError:
+        caught_op = True
+    assert caught_op, "Disallowed SQL operator was not blocked!"
+
+    # 4. Order By injection check
+    fields = List[Field]()
+    fields.append(IntegerField("id", primary_key=True))
+    meta = ModelMeta("users", fields)
+    q = Query(meta, mysql)
+    caught_order = False
+    try:
+        q.order_by("id; DROP TABLE users; --")
+    except ValueError:
+        caught_order = True
+    assert caught_order, "Injected order_by statement was not blocked!"
+
+    print("[PASS] ORM SQL identifier escaping & operator whitelist verified!")
+
+def test_response_crlf():
+    print("--- 5. Testing CRLF Filtering in Response Headers ---")
+    resp = Response.text("test")
+    resp.set_header("X-Custom\r\nInjected", "value1\r\nSet-Cookie: evil=1\r\n")
+
+    found_injected_line = False
+    for i in range(len(resp.custom_headers)):
+        k, v = resp.custom_headers[i]
+        if "\r" in k or "\n" in k or "\r" in v or "\n" in v:
+            found_injected_line = True
+            break
+    assert not found_injected_line, "CRLF character was not filtered from response headers!"
+    print("[PASS] HTTP Response CRLF injection prevention verified!")
+
+def test_per_ip_rate_limiter():
+    print("--- 6. Testing Per-Client-IP Rate Limiter ---")
+    from src.framework.route import SimpleHandler
+    def ok_handler(req: Request) -> Response:
+        return Response.text("ok", 200)
+
+    limiter = RateLimiterMiddleware(max_requests=2, window_sec=10.0)
+    handler = SimpleHandler(ok_handler)
+
+    # Client A: 192.168.1.100
+    req_a = Request()
+    req_a.headers.set("X-Forwarded-For", "192.168.1.100")
+
+    r_a1 = limiter.handle(req_a, handler)
+    assert r_a1.status_code == 200
+
+    r_a2 = limiter.handle(req_a, handler)
+    assert r_a2.status_code == 200
+
+    # 3rd request from Client A -> 429
+    r_a3 = limiter.handle(req_a, handler)
+    assert r_a3.status_code == 429
+
+    # Client B: 192.168.1.200 (Must NOT be affected by Client A!)
+    req_b = Request()
+    req_b.headers.set("X-Forwarded-For", "192.168.1.200")
+
+    r_b1 = limiter.handle(req_b, handler)
+    assert r_b1.status_code == 200, "Client B was wrongly blocked by Client A's traffic!"
+
+    r_b2 = limiter.handle(req_b, handler)
+    assert r_b2.status_code == 200
+    print("[PASS] Per-Client-IP Rate Limiting successfully isolates abusive clients!")
+
+def test_ws_frame_security():
+    print("--- 7. Testing WebSocket RFC 6455 Frame Hardening ---")
+    # Unmasked frame when require_mask is True -> must return CLOSE frame
+    raw_unmasked = list[byte]()
+    raw_unmasked.append(byte(0x81)) # FIN=1, Opcode=1
+    raw_unmasked.append(byte(0x05)) # MASK=0, len=5
+    for c in "Hello":
+        raw_unmasked.append(byte(ord(c)))
+
+    f_unmasked = decode_frame(raw_unmasked, require_mask=True)
+    assert f_unmasked.opcode == WS_OPCODE_CLOSE, "Unmasked client frame was improperly accepted!"
+
+    # Oversized frame attack (payload_len > max_payload)
+    f_oversized = decode_frame(raw_unmasked, max_payload=3)
+    assert f_oversized.opcode == WS_OPCODE_CLOSE, "Oversized frame was improperly accepted!"
+
+    print("[PASS] WebSocket unmasked rejection & max frame size verified!")
+
+def run():
+    test_crypto_sha256_and_hmac()
+    test_session_hmac()
+    test_static_path_traversal()
+    test_orm_sql_injection()
+    test_response_crlf()
+    test_per_ip_rate_limiter()
+    test_ws_frame_security()
+    print("\n=======================================================")
+    print(">>> ALL INDUSTRIAL-GRADE SECURITY TESTS PASSED! <<<")
+    print("=======================================================")
+
+if __name__ == "__main__":
+    run()

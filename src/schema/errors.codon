@@ -1,0 +1,123 @@
+# Industrial-Grade Validation Errors & RFC 7807 / FastAPI Compliant Error Formatter
+from src.http.response import Response
+
+class ValidationError:
+    field: str
+    message: str
+    err_type: str
+    loc: List[str]
+
+    def __init__(
+        self,
+        field: str = "",
+        message: str = "",
+        err_type: str = "value_error",
+        loc: Optional[List[str]] = None
+    ):
+        self.field = field
+        self.message = message
+        self.err_type = err_type
+        if loc is not None:
+            self.loc = loc
+        else:
+            self.loc = List[str]()
+            self.loc.append("body")
+            if len(field) > 0:
+                self.loc.append(field)
+
+    def with_prefix(self, prefix: str) -> ValidationError:
+        """Prepends a parent field path component into the loc hierarchy."""
+        new_loc = List[str]()
+        if len(self.loc) > 0 and self.loc[0] == "body":
+            new_loc.append("body")
+            new_loc.append(prefix)
+            for i in range(1, len(self.loc)):
+                new_loc.append(self.loc[i])
+        else:
+            new_loc.append("body")
+            new_loc.append(prefix)
+            for item in self.loc:
+                new_loc.append(item)
+        return ValidationError(self.field, self.message, self.err_type, loc=new_loc)
+
+    def loc_path(self) -> str:
+        """Returns dot-delimited field path omitting the root 'body' token."""
+        parts = List[str]()
+        start_idx = 1 if (len(self.loc) > 0 and self.loc[0] == "body") else 0
+        for i in range(start_idx, len(self.loc)):
+            parts.append(self.loc[i])
+        if len(parts) == 0:
+            return self.field
+        return ".".join(parts)
+
+    def to_json(self) -> str:
+        loc_parts = List[str]()
+        for item in self.loc:
+            loc_parts.append('"' + item.replace('"', '\\"') + '"')
+        loc_json = "[" + ",".join(loc_parts) + "]"
+        m_esc = self.message.replace('"', '\\"')
+        t_esc = self.err_type.replace('"', '\\"')
+        return '{"loc":' + loc_json + ',"msg":"' + m_esc + '","type":"' + t_esc + '"}'
+
+    def __repr__(self) -> str:
+        return f"ValidationError(loc={self.loc}, message='{self.message}', type='{self.err_type}')"
+
+
+class ValidationResult[T]:
+    value: Optional[T]
+    errors: List[ValidationError]
+
+    def __init__(self, value: Optional[T], errors: List[ValidationError]):
+        self.value = value
+        self.errors = errors
+
+    @staticmethod
+    def ok(value: T) -> ValidationResult[T]:
+        return ValidationResult[T](Optional[T](value), List[ValidationError]())
+
+    @staticmethod
+    def err(errors: List[ValidationError]) -> ValidationResult[T]:
+        return ValidationResult[T](None, errors)
+
+    @staticmethod
+    def err_one(msg: str, err_type: str = "value_error", field: str = "", loc: List[str] = []) -> ValidationResult[T]:
+        errs = List[ValidationError]()
+        errs.append(ValidationError(field, msg, err_type, loc))
+        return ValidationResult[T](None, errs)
+
+    def is_ok(self) -> bool:
+        return len(self.errors) == 0 and self.value is not None
+
+    def unwrap(self) -> T:
+        if self.value is not None:
+            return self.value
+        if len(self.errors) > 0:
+            raise ValueError("Validation failed: " + self.errors[0].message)
+        raise ValueError("Cannot unwrap None ValidationResult value")
+
+    def unwrap_or(self, default_val: T) -> T:
+        if self.value is not None:
+            return self.value
+        return default_val
+
+    def error_count(self) -> int:
+        return len(self.errors)
+
+    def first_error(self) -> Optional[ValidationError]:
+        if len(self.errors) > 0:
+            return Optional[ValidationError](self.errors[0])
+        return None
+
+    def errors_json(self) -> str:
+        parts = List[str]()
+        for i in range(len(self.errors)):
+            parts.append(self.errors[i].to_json())
+        return "[" + ",".join(parts) + "]"
+
+    def to_response(self, status_code: int = 422) -> Response:
+        parts = List[str]()
+        for i in range(len(self.errors)):
+            parts.append(self.errors[i].to_json())
+        body = '{"detail":[' + ','.join(parts) + ']}'
+        return Response.json(body, status=status_code)
+

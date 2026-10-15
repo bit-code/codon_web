@@ -1,0 +1,323 @@
+# Production Native Redis Broker for TaskQ
+# Zero external dependencies, built directly upon POSIX Sockets and RESP2 Protocol
+
+import time
+from typing import Optional, Tuple
+from src.os.socket import Socket
+from src.taskq.protocol import TaskMessage, TaskResult
+from src.taskq.broker.base import Broker
+
+class RedisConnection:
+    host: str
+    port: int
+    password: str
+    db: int
+    sock: Socket
+    read_buffer: str
+    connected: bool
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 6379, password: str = "", db: int = 0):
+        self.host = host
+        self.port = port
+        self.password = password
+        self.db = db
+        self.sock = Socket(i32(-1))
+        self.read_buffer = ""
+        self.connected = False
+
+    def connect(self) -> bool:
+        self.close()
+        try:
+            self.sock = Socket.create_tcp_client(blocking=True)
+            self.sock.set_tcp_nodelay(True)
+            if not self.sock.connect(self.host, self.port):
+                self.close()
+                return False
+            self.connected = True
+            self.read_buffer = ""
+
+            # AUTH if password provided
+            if len(self.password) > 0:
+                res = self.execute(["AUTH", self.password])
+                if res.startswith("-"):
+                    self.close()
+                    return False
+
+            # SELECT DB if non-zero
+            if self.db != 0:
+                res = self.execute(["SELECT", str(self.db)])
+                if res.startswith("-"):
+                    self.close()
+                    return False
+
+            return True
+        except Exception:
+            self.close()
+            return False
+
+    def ensure_connected(self) -> bool:
+        if not self.connected or self.sock.is_closed:
+            return self.connect()
+        return True
+
+    def close(self) -> None:
+        if self.connected:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.connected = False
+        self.sock = Socket(i32(-1))
+        self.read_buffer = ""
+
+    def _read_line(self) -> str:
+        while True:
+            idx = self.read_buffer.find("\r\n")
+            if idx >= 0:
+                line = self.read_buffer[:idx]
+                self.read_buffer = self.read_buffer[idx + 2:]
+                return line
+            chunk = self.sock.recv_str(4096)
+            if len(chunk) == 0:
+                raise OSError("Redis socket closed unexpectedly")
+            self.read_buffer += chunk
+
+    def _read_bytes(self, n: int) -> str:
+        while len(self.read_buffer) < n + 2:
+            chunk = self.sock.recv_str(4096)
+            if len(chunk) == 0:
+                raise OSError("Redis socket closed unexpectedly")
+            self.read_buffer += chunk
+        data = self.read_buffer[:n]
+        self.read_buffer = self.read_buffer[n + 2:]
+        return data
+
+    def _execute_once(self, cmd_args: list[str]) -> str:
+        if not self.ensure_connected():
+            return "-ERR connection failed"
+
+        req_parts: list[str] = [f"*{len(cmd_args)}\r\n"]
+        for i in range(len(cmd_args)):
+            arg = cmd_args[i]
+            req_parts.append(f"${len(arg)}\r\n{arg}\r\n")
+        req_str = "".join(req_parts)
+
+        try:
+            sent = self.sock.send_str(req_str)
+            if sent < 0:
+                self.close()
+                return "-ERR failed to send"
+
+            line = self._read_line()
+            if len(line) == 0:
+                self.close()
+                return "-ERR empty reply"
+
+            resp_type = line[0]
+            val = line[1:]
+
+            if resp_type == '+':  # Simple string
+                return val
+            elif resp_type == '-':  # Error
+                return "-" + val
+            elif resp_type == ':':  # Integer
+                return val
+            elif resp_type == '$':  # Bulk string
+                str_len = int(val)
+                if str_len < 0:
+                    return ""  # Nil
+                return self._read_bytes(str_len)
+            elif resp_type == '*':  # Array (handled via execute_array)
+                return line
+            return val
+        except Exception as e:
+            self.close()
+            return "-ERR exception: " + str(e)
+
+    def execute(self, cmd_args: list[str]) -> str:
+        res = self._execute_once(cmd_args)
+        if res.startswith("-ERR"):
+            # Auto-reconnect on connection reset or closed socket
+            if "connection" in res or "send" in res or "empty reply" in res or "exception" in res:
+                self.close()
+                if self.connect():
+                    return self._execute_once(cmd_args)
+        return res
+
+    def _execute_array_once(self, cmd_args: list[str]) -> list[str]:
+        if not self.ensure_connected():
+            return []
+
+        req_parts: list[str] = [f"*{len(cmd_args)}\r\n"]
+        for i in range(len(cmd_args)):
+            arg = cmd_args[i]
+            req_parts.append(f"${len(arg)}\r\n{arg}\r\n")
+        req_str = "".join(req_parts)
+
+        try:
+            sent = self.sock.send_str(req_str)
+            if sent < 0:
+                self.close()
+                return []
+
+            line = self._read_line()
+            if len(line) == 0 or line[0] != '*':
+                if len(line) == 0:
+                    self.close()
+                return []
+
+            count = int(line[1:])
+            if count <= 0:
+                return []
+
+            results: list[str] = []
+            for _ in range(count):
+                elem_hdr = self._read_line()
+                if len(elem_hdr) > 0 and elem_hdr[0] == '$':
+                    elem_len = int(elem_hdr[1:])
+                    if elem_len < 0:
+                        results.append("")
+                    else:
+                        results.append(self._read_bytes(elem_len))
+                else:
+                    results.append(elem_hdr)
+            return results
+        except Exception:
+            self.close()
+            return []
+
+    def execute_array(self, cmd_args: list[str]) -> list[str]:
+        res = self._execute_array_once(cmd_args)
+        if len(res) == 0 and not self.connected:
+            if self.connect():
+                return self._execute_array_once(cmd_args)
+        return res
+
+
+class RedisBroker(Broker):
+    client: RedisConnection
+    key_prefix: str
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 6379, password: str = "", db: int = 0, key_prefix: str = "taskq:"):
+        self.client = RedisConnection(host=host, port=port, password=password, db=db)
+        self.key_prefix = key_prefix
+
+    def enqueue(self, queue: str, msg: TaskMessage) -> bool:
+        q_key = self.key_prefix + "queue:" + queue
+        res = self.client.execute(["LPUSH", q_key, msg.to_json()])
+        return not res.startswith("-ERR")
+
+    def dequeue(self, queue: str, timeout_sec: int = 1) -> Optional[TaskMessage]:
+        q_key = self.key_prefix + "queue:" + queue
+        if timeout_sec <= 0:
+            val = self.client.execute(["RPOP", q_key])
+            if len(val) == 0 or val.startswith("-ERR"):
+                return None
+            return TaskMessage.from_json(val)
+
+        # BRPOP returns [key, element] or empty on timeout
+        arr = self.client.execute_array(["BRPOP", q_key, str(timeout_sec)])
+        if len(arr) >= 2:
+            raw_json = arr[1]
+            if len(raw_json) > 0:
+                return TaskMessage.from_json(raw_json)
+        return None
+
+    def dequeue_multi(self, queues: list[str], timeout_sec: int = 1) -> Optional[TaskMessage]:
+        if len(queues) == 0:
+            return None
+        if timeout_sec <= 0:
+            for i in range(len(queues)):
+                msg = self.dequeue(queues[i], 0)
+                if msg is not None:
+                    return msg
+            return None
+
+        # Prioritized multi-queue BRPOP
+        cmd_args: list[str] = ["BRPOP"]
+        for i in range(len(queues)):
+            cmd_args.append(self.key_prefix + "queue:" + queues[i])
+        cmd_args.append(str(timeout_sec))
+
+        arr = self.client.execute_array(cmd_args)
+        if len(arr) >= 2:
+            raw_json = arr[1]
+            if len(raw_json) > 0:
+                return TaskMessage.from_json(raw_json)
+        return None
+
+    def schedule(self, queue: str, msg: TaskMessage, delay_sec: int) -> bool:
+        now_ms = int(time.time() * 1000.0)
+        msg.eta = now_ms + (delay_sec * 1000)
+        delayed_key = self.key_prefix + "delayed:" + queue
+        res = self.client.execute(["ZADD", delayed_key, str(msg.eta), msg.to_json()])
+        return not res.startswith("-ERR")
+
+    def poll_delayed(self, queue: str, limit: int = 50) -> list[TaskMessage]:
+        delayed_key = self.key_prefix + "delayed:" + queue
+        q_key = self.key_prefix + "queue:" + queue
+        now_ms = int(time.time() * 1000.0)
+
+        # Atomic Lua script: fetches ready items, removes from delayed ZSET, and pushes to ready LIST
+        # Eliminates race conditions across multiple distributed workers
+        lua_script = (
+            "local tasks = redis.call('zrangebyscore', KEYS[1], '0', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))\n"
+            "if #tasks > 0 then\n"
+            "    for i = 1, #tasks do\n"
+            "        redis.call('zrem', KEYS[1], tasks[i])\n"
+            "        redis.call('lpush', KEYS[2], tasks[i])\n"
+            "    end\n"
+            "end\n"
+            "return tasks"
+        )
+        items = self.client.execute_array([
+            "EVAL", lua_script, "2", delayed_key, q_key, str(now_ms), str(limit)
+        ])
+        if len(items) == 0:
+            return []
+
+        ready_tasks: list[TaskMessage] = []
+        for i in range(len(items)):
+            ready_tasks.append(TaskMessage.from_json(items[i]))
+
+        return ready_tasks
+
+    def enqueue_dead_letter(self, queue: str, msg: TaskMessage, reason: str) -> bool:
+        dlq_key = self.key_prefix + "dead:" + queue
+        res = self.client.execute(["LPUSH", dlq_key, msg.to_json()])
+        return not res.startswith("-ERR")
+
+    def store_result(self, task_id: str, res: TaskResult, expire_sec: int = 3600) -> bool:
+        res_key = self.key_prefix + "result:" + task_id
+        cmd_res = self.client.execute(["SETEX", res_key, str(expire_sec), res.to_json()])
+        return not cmd_res.startswith("-ERR")
+
+    def get_result(self, task_id: str) -> Optional[TaskResult]:
+        res_key = self.key_prefix + "result:" + task_id
+        val = self.client.execute(["GET", res_key])
+        if len(val) == 0 or val.startswith("-ERR"):
+            return None
+        return TaskResult.from_json(val)
+
+    def cancel_task(self, task_id: str, expire_sec: int = 86400) -> bool:
+        revoked_key = self.key_prefix + "revoked:" + task_id
+        self.client.execute(["SETEX", revoked_key, str(expire_sec), "1"])
+
+        now_ms = int(time.time() * 1000.0)
+        res = TaskResult(
+            task_id=task_id,
+            status="CANCELLED",
+            result="",
+            error="Task was cancelled",
+            completed_at=now_ms
+        )
+        self.store_result(task_id, res, expire_sec)
+        return True
+
+    def is_cancelled(self, task_id: str) -> bool:
+        revoked_key = self.key_prefix + "revoked:" + task_id
+        res = self.client.execute(["EXISTS", revoked_key])
+        return res == "1" or res == ":1"
+
+    def close(self) -> None:
+        self.client.close()

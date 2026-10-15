@@ -1,0 +1,175 @@
+# High-Performance In-Memory Broker for TaskQ
+# Ideal for embedded background processing and isolated unit/integration tests
+
+import time
+from typing import Optional
+from src.taskq.protocol import TaskMessage, TaskResult
+from src.taskq.broker.base import Broker
+
+class MemoryBroker(Broker):
+    queues: dict[str, list[TaskMessage]]
+    delayed_queues: dict[str, list[TaskMessage]]
+    dead_letter_queues: dict[str, list[TaskMessage]]
+    results: dict[str, TaskResult]
+    result_expiries: dict[str, int]
+    revoked_tasks: dict[str, bool]
+
+    def __init__(self):
+        self.queues = {}
+        self.delayed_queues = {}
+        self.dead_letter_queues = {}
+        self.results = {}
+        self.result_expiries = {}
+        self.revoked_tasks = {}
+
+    def enqueue(self, queue: str, msg: TaskMessage) -> bool:
+        if queue not in self.queues:
+            self.queues[queue] = []
+        self.queues[queue].append(msg)
+        return True
+
+    def dequeue(self, queue: str, timeout_sec: int = 1) -> Optional[TaskMessage]:
+        if queue in self.queues and len(self.queues[queue]) > 0:
+            return self.queues[queue].pop(0)
+
+        # Non-blocking or short wait if empty
+        if timeout_sec <= 0:
+            return None
+
+        # Simulated short poll up to timeout_sec
+        steps = timeout_sec * 10
+        for _ in range(steps):
+            time.sleep(0.1)
+            if queue in self.queues and len(self.queues[queue]) > 0:
+                return self.queues[queue].pop(0)
+
+        return None
+
+    def schedule(self, queue: str, msg: TaskMessage, delay_sec: int) -> bool:
+        now_ms = int(time.time() * 1000.0)
+        msg.eta = now_ms + (delay_sec * 1000)
+        if queue not in self.delayed_queues:
+            self.delayed_queues[queue] = []
+        self.delayed_queues[queue].append(msg)
+        return True
+
+    def poll_delayed(self, queue: str, limit: int = 50) -> list[TaskMessage]:
+        if queue not in self.delayed_queues:
+            return []
+
+        now_ms = int(time.time() * 1000.0)
+        ready_tasks: list[TaskMessage] = []
+        remaining_tasks: list[TaskMessage] = []
+
+        delayed_list = self.delayed_queues[queue]
+        for i in range(len(delayed_list)):
+            msg = delayed_list[i]
+            if msg.eta <= now_ms and len(ready_tasks) < limit:
+                ready_tasks.append(msg)
+            else:
+                remaining_tasks.append(msg)
+
+        self.delayed_queues[queue] = remaining_tasks
+
+        # Automatically push ready tasks to active queue
+        for i in range(len(ready_tasks)):
+            self.enqueue(queue, ready_tasks[i])
+
+        return ready_tasks
+
+    def enqueue_dead_letter(self, queue: str, msg: TaskMessage, reason: str) -> bool:
+        dlq_name = queue + ":dead"
+        if dlq_name not in self.dead_letter_queues:
+            self.dead_letter_queues[dlq_name] = []
+        self.dead_letter_queues[dlq_name].append(msg)
+        return True
+
+    def dequeue_multi(self, queues: list[str], timeout_sec: int = 1) -> Optional[TaskMessage]:
+        for i in range(len(queues)):
+            msg = self.dequeue(queues[i], 0)
+            if msg is not None:
+                return msg
+        if timeout_sec > 0 and len(queues) > 0:
+            return self.dequeue(queues[0], timeout_sec)
+        return None
+
+    def cleanup_expired_results(self) -> int:
+        now_sec = int(time.time())
+        expired: list[str] = []
+        for task_id in self.result_expiries:
+            if now_sec > self.result_expiries[task_id]:
+                expired.append(task_id)
+        for i in range(len(expired)):
+            t_id = expired[i]
+            if t_id in self.results:
+                del self.results[t_id]
+            if t_id in self.result_expiries:
+                del self.result_expiries[t_id]
+        return len(expired)
+
+    def store_result(self, task_id: str, res: TaskResult, expire_sec: int = 3600) -> bool:
+        if len(self.results) > 500:
+            self.cleanup_expired_results()
+        now_sec = int(time.time())
+        self.results[task_id] = res
+        self.result_expiries[task_id] = now_sec + expire_sec
+        return True
+
+    def get_result(self, task_id: str) -> Optional[TaskResult]:
+        if task_id not in self.results:
+            return None
+        expire_at = self.result_expiries.get(task_id, 0)
+        if int(time.time()) > expire_at:
+            # Result expired
+            del self.results[task_id]
+            del self.result_expiries[task_id]
+            return None
+        return self.results[task_id]
+
+    def get_dead_letter_count(self, queue: str) -> int:
+        dlq_name = queue + ":dead"
+        if dlq_name in self.dead_letter_queues:
+            return len(self.dead_letter_queues[dlq_name])
+        return 0
+
+    def get_queue_length(self, queue: str) -> int:
+        if queue in self.queues:
+            return len(self.queues[queue])
+        return 0
+
+    def cancel_task(self, task_id: str, expire_sec: int = 86400) -> bool:
+        self.revoked_tasks[task_id] = True
+
+        # Store cancelled status in results backend immediately
+        now_ms = int(time.time() * 1000.0)
+        res = TaskResult(
+            task_id=task_id,
+            status="CANCELLED",
+            result="",
+            error="Task was cancelled",
+            completed_at=now_ms
+        )
+        self.store_result(task_id, res, expire_sec)
+
+        # Purge pending task from active queues
+        for q_name in self.queues:
+            new_q: list[TaskMessage] = []
+            q_list = self.queues[q_name]
+            for i in range(len(q_list)):
+                if q_list[i].task_id != task_id:
+                    new_q.append(q_list[i])
+            self.queues[q_name] = new_q
+
+        # Purge pending task from delayed queues
+        for q_name in self.delayed_queues:
+            new_dq: list[TaskMessage] = []
+            dq_list = self.delayed_queues[q_name]
+            for i in range(len(dq_list)):
+                if dq_list[i].task_id != task_id:
+                    new_dq.append(dq_list[i])
+            self.delayed_queues[q_name] = new_dq
+
+        return True
+
+    def is_cancelled(self, task_id: str) -> bool:
+        return task_id in self.revoked_tasks

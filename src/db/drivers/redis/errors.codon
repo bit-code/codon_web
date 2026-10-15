@@ -1,0 +1,36 @@
+# Industrial-Grade Native Redis Driver Errors for Codon
+
+class RedisError(Exception):
+    """Base exception for all Redis errors."""
+    def __init__(self, message: str = "Redis error"):
+        super().__init__(message)
+
+
+class RedisConnectionError(RedisError):
+    """Raised when connecting or communicating with the Redis server fails."""
+    def __init__(self, message: str = "Redis connection failed"):
+        super().__init__(message)
+
+
+class RedisCommandError(RedisError):
+    """Raised when the Redis server returns an error response (e.g. -ERR)."""
+    def __init__(self, message: str = "Redis command error"):
+        super().__init__(message)
+
+
+class RedisPoolError(RedisError):
+    """Raised when acquiring from or managing the Redis connection pool fails."""
+    def __init__(self, message: str = "Redis pool exhausted or unavailable"):
+        super().__init__(message)
+
+
+class RedisTimeoutError(RedisError):
+    """Raised when an operation or connection wait times out."""
+    def __init__(self, message: str = "Redis operation timed out"):
+        super().__init__(message)
+
+
+class RedisLockError(RedisError):
+    """Raised when acquiring, releasing, or extending a distributed lock fails."""
+    def __init__(self, message: str = "Redis distributed lock error"):
+        super().__init__(message)

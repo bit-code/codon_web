@@ -1,0 +1,138 @@
+# Producer Client and AsyncResult for TaskQ
+# Submits asynchronous tasks, delayed ETA tasks, and queries execution results
+
+import time
+from typing import Optional
+from src.taskq.protocol import TaskMessage, TaskResult, TaskStatus
+from src.taskq.broker.base import Broker
+
+class AsyncResult:
+    task_id: str
+    broker: Broker
+
+    def __init__(self, task_id: str, broker: Broker):
+        self.task_id = task_id
+        self.broker = broker
+
+    def get(self, timeout_sec: float = 5.0, poll_interval_sec: float = 0.05) -> Optional[TaskResult]:
+        t_start = time.time()
+        while time.time() - t_start < timeout_sec:
+            res = self.broker.get_result(self.task_id)
+            if res is not None:
+                # If terminal status reached, return immediately
+                if (res.status == TaskStatus.SUCCESS or 
+                    res.status == TaskStatus.FAILURE or 
+                    res.status == TaskStatus.TIMEOUT or
+                    res.status == TaskStatus.CANCELLED or
+                    res.status == TaskStatus.REVOKED):
+                    return res
+            time.sleep(poll_interval_sec)
+
+        # Final check before timeout
+        return self.broker.get_result(self.task_id)
+
+    def is_ready(self) -> bool:
+        res = self.broker.get_result(self.task_id)
+        if res is None:
+            return False
+        return (
+            res.status == TaskStatus.SUCCESS or 
+            res.status == TaskStatus.FAILURE or 
+            res.status == TaskStatus.TIMEOUT or
+            res.status == TaskStatus.CANCELLED or
+            res.status == TaskStatus.REVOKED
+        )
+
+    def cancel(self, expire_sec: int = 86400) -> bool:
+        """Issues cancellation for this task through the broker."""
+        return self.broker.cancel_task(self.task_id, expire_sec)
+
+    def is_cancelled(self) -> bool:
+        """Returns True if the task has been cancelled or revoked."""
+        res = self.broker.get_result(self.task_id)
+        if res is not None and (res.status == TaskStatus.CANCELLED or res.status == TaskStatus.REVOKED):
+            return True
+        return self.broker.is_cancelled(self.task_id)
+
+    def status(self) -> str:
+        res = self.broker.get_result(self.task_id)
+        if res is None:
+            return TaskStatus.PENDING
+        return res.status
+
+
+class TaskClient:
+    broker: Broker
+    default_queue: str
+    _counter: int
+    _instance_id: int
+
+    def __init__(self, broker: Broker, default_queue: str = "default"):
+        self.broker = broker
+        self.default_queue = default_queue
+        self._counter = 0
+        self._instance_id = int(time.time() * 1000.0) % 100000
+
+    def _generate_task_id(self) -> str:
+        self._counter += 1
+        now_us = int(time.time() * 1000000.0)
+        return f"tq_{now_us}_{self._instance_id}_{self._counter}"
+
+    def delay(
+        self,
+        task_name: str,
+        payload: str = "{}",
+        queue: str = "",
+        eta_sec: int = 0
+    ) -> str:
+        async_res = self.apply_async(
+            task_name=task_name,
+            payload=payload,
+            queue=queue,
+            eta_sec=eta_sec
+        )
+        return async_res.task_id
+
+    def apply_async(
+        self,
+        task_name: str,
+        payload: str = "{}",
+        queue: str = "",
+        eta_sec: int = 0,
+        max_retries: int = 3,
+        timeout_ms: int = 0
+    ) -> AsyncResult:
+        target_queue = queue if len(queue) > 0 else self.default_queue
+        task_id = self._generate_task_id()
+
+        msg = TaskMessage(
+            task_id=task_id,
+            task_name=task_name,
+            payload=payload,
+            queue=target_queue,
+            retry_count=0,
+            max_retries=max_retries,
+            timeout_ms=timeout_ms,
+            eta=0
+        )
+
+        if eta_sec > 0:
+            self.broker.schedule(target_queue, msg, eta_sec)
+        else:
+            self.broker.enqueue(target_queue, msg)
+
+        return AsyncResult(task_id, self.broker)
+
+    def get_result(self, task_id: str) -> Optional[TaskResult]:
+        return self.broker.get_result(task_id)
+
+    def cancel(self, task_id: str, expire_sec: int = 86400) -> bool:
+        """Issues cancellation for the given task_id through the broker."""
+        return self.broker.cancel_task(task_id, expire_sec)
+
+    def is_cancelled(self, task_id: str) -> bool:
+        """Returns True if the task has been cancelled or revoked."""
+        res = self.broker.get_result(task_id)
+        if res is not None and (res.status == TaskStatus.CANCELLED or res.status == TaskStatus.REVOKED):
+            return True
+        return self.broker.is_cancelled(task_id)

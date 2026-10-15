@@ -14,6 +14,18 @@ from src.db.async_pool import AsyncMySQLPool, AsyncPooledConnection
 # Module namespaces
 import src.db.drivers.mysql as mysql
 import src.db.drivers.sqlite as sqlite
+import src.db.drivers.redis as redis
+from src.db.drivers.redis import (
+    Redis,
+    AsyncRedis,
+    RedisConnection,
+    AsyncRedisConnection,
+    RedisPool,
+    AsyncRedisPool,
+    AsyncRedisLock,
+    connect_redis,
+    connect_redis_async
+)
 
 def connect_mysql(
     host: str = "127.0.0.1",

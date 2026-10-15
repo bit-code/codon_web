@@ -1,0 +1,53 @@
+# SQL Helper Functions, and_, or_, not_, text and SQL Aggregate Functions
+from typing import List, Optional
+from src.orm.sql.expression import (
+    ClauseElement, CompoundClause, NotClause, RawClause
+)
+from src.orm.sql.column import Column, OrderByClause
+
+def text(sql_text: str, params: Optional[List[str]] = None) -> RawClause:
+    return RawClause(sql_text, params)
+
+def and_(clauses: List[ClauseElement]) -> CompoundClause:
+    return CompoundClause("AND", clauses)
+
+def or_(clauses: List[ClauseElement]) -> CompoundClause:
+    return CompoundClause("OR", clauses)
+
+def not_(clause: ClauseElement) -> NotClause:
+    return NotClause(clause)
+
+def desc(col: Column) -> OrderByClause:
+    return col.desc()
+
+def asc(col: Column) -> OrderByClause:
+    return col.asc()
+
+class SQLFunctions:
+    def __init__(self):
+        pass
+
+    def count(self, col: Column = Column("*")) -> Column:
+        q_name = col.get_qualified_name()
+        return Column(f"COUNT({q_name})")
+
+    def sum(self, col: Column) -> Column:
+        q_name = col.get_qualified_name()
+        return Column(f"SUM({q_name})")
+
+    def avg(self, col: Column) -> Column:
+        q_name = col.get_qualified_name()
+        return Column(f"AVG({q_name})")
+
+    def min(self, col: Column) -> Column:
+        q_name = col.get_qualified_name()
+        return Column(f"MIN({q_name})")
+
+    def max(self, col: Column) -> Column:
+        q_name = col.get_qualified_name()
+        return Column(f"MAX({q_name})")
+
+    def now(self) -> Column:
+        return Column("NOW()")
+
+func = SQLFunctions()

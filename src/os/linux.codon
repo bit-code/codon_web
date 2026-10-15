@@ -26,6 +26,8 @@ from C import fork() -> i32
 from C import getpid() -> i32
 from C import waitpid(i32, Ptr[i32], i32) -> i32
 from C import kill(i32, i32) -> i32
+from C import c_bind_cpu_core(int) -> int
+from C import c_get_cpu_cores() -> int
 
 def get_errno() -> i32:
     return __errno_location()[0]
@@ -39,4 +41,10 @@ def get_error_message(err: i32) -> str:
     while p[length] != byte(0):
         length += 1
     return str(p, length)
+
+def bind_cpu_core(core_id: int) -> int:
+    return c_bind_cpu_core(core_id)
+
+def get_cpu_cores() -> int:
+    return c_get_cpu_cores()
 

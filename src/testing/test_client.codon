@@ -2,6 +2,7 @@
 # Provides high-performance, socketless end-to-end testing of routes,
 # middlewares, dependencies, exception handlers, and background tasks.
 
+import time
 from typing import Optional, Callable
 from src.framework.app import App
 from src.framework.route import RouteHandler
@@ -15,6 +16,21 @@ from src.http.method import (
 )
 from src.http.json import Json
 from src.memory.slice import ByteSlice
+from src.runtime.async_context import AsyncResumer
+from src.core.async.loop import get_event_loop
+
+class TestClientResumer(AsyncResumer):
+    resp: Optional[Response]
+    is_resumed: bool
+
+    def __init__(self):
+        self.resp = None
+        self.is_resumed = False
+
+    def resume(self, fd: i32, resp: Response) -> bool:
+        self.resp = Optional[Response](resp)
+        self.is_resumed = True
+        return True
 
 class TestResponse:
     status_code: int
@@ -162,8 +178,20 @@ class TestClient:
             cookie_header_val = "; ".join(cookie_parts)
             set_req_header("Cookie", cookie_header_val)
 
+        client_resumer = TestClientResumer()
+        base_resumer: AsyncResumer = client_resumer
+        req.async_resumer = Optional[AsyncResumer](base_resumer)
+
         # 6. Dispatch through complete middleware pipeline
         resp = self.pipeline.handle(req)
+
+        if resp.is_deferred:
+            loop = get_event_loop()
+            start_wait = time.time()
+            while not client_resumer.is_resumed and (time.time() - start_wait < 10.0):
+                loop.run_one_iteration(5)
+            if client_resumer.is_resumed and client_resumer.resp is not None:
+                resp = client_resumer.resp
 
         # 7. Execute registered Post-Response Background Tasks
         for i in range(len(req.background_tasks.tasks)):

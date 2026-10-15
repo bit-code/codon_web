@@ -3,10 +3,10 @@ from src.core.async import run, sleep
 from src.db.drivers.mysql.async_connection import connect_async
 
 async def test_async_mysql_handshake_and_query():
-    print("Testing Async MySQL Connection (172.23.176.1:13306)...")
+    print("Testing Async MySQL Connection (172.23.176.1:3306)...")
     conn = await connect_async(
         host="172.23.176.1",
-        port=13306,
+        port=3306,
         user="root",
         password="hujinlong",
         database="ths"
@@ -48,7 +48,7 @@ async def test_async_mysql_pool():
     from src.db.async_pool import AsyncMySQLPool
     pool = AsyncMySQLPool(
         host="172.23.176.1",
-        port=13306,
+        port=3306,
         user="root",
         password="hujinlong",
         database="ths",

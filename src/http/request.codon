@@ -9,20 +9,30 @@ from src.http.multipart import MultipartFormData, parse_multipart_form_data, Upl
 from src.http.response import Response
 from src.runtime.async_context import AsyncContext, AsyncResumer
 
-def url_decode(s: str) -> str:
-    if len(s) == 0:
+def url_decode_slice(bs: ByteSlice) -> str:
+    if bs.len == 0:
         return ""
+    # Fast path: check if '%' or '+' exists
+    has_special = False
+    for i in range(bs.len):
+        b = bs.ptr[i]
+        if b == byte(37) or b == byte(43): # '%' or '+'
+            has_special = True
+            break
+    if not has_special:
+        return bs.to_str()
+
     res = []
     i = 0
-    n = len(s)
+    n = bs.len
     while i < n:
-        c = s[i]
-        if c == '+':
+        b = bs.ptr[i]
+        if b == byte(43): # '+'
             res.append(' ')
             i += 1
-        elif c == '%' and i + 2 < n:
-            h1 = ord(s[i + 1])
-            h2 = ord(s[i + 2])
+        elif b == byte(37) and i + 2 < n: # '%'
+            h1 = int(bs.ptr[i + 1])
+            h2 = int(bs.ptr[i + 2])
             v1 = -1
             v2 = -1
             if 48 <= h1 <= 57:
@@ -44,12 +54,18 @@ def url_decode(s: str) -> str:
                 res.append(chr(byte_val))
                 i += 3
             else:
-                res.append(c)
+                res.append(chr(int(b)))
                 i += 1
         else:
-            res.append(c)
+            res.append(chr(int(b)))
             i += 1
     return "".join(res)
+
+def url_decode(s: str) -> str:
+    if len(s) == 0:
+        return ""
+    bs = ByteSlice(s.c_str().as_byte(), len(s))
+    return url_decode_slice(bs)
 
 class Request:
     method: i32
@@ -60,6 +76,7 @@ class Request:
     body: ByteSlice
     keep_alive: bool
     path_params: dict[str, str]
+    fast_params: list[Tuple[str, ByteSlice]]
     query_params: dict[str, str]
     parsed_query: bool
     json_data: dict[str, str]
@@ -87,6 +104,7 @@ class Request:
         self.body = ByteSlice(Ptr[byte](0), 0)
         self.keep_alive = True
         self.path_params = {}
+        self.fast_params = list[Tuple[str, ByteSlice]]()
         self.query_params = {}
         self.parsed_query = False
         self.json_data = {}
@@ -114,59 +132,119 @@ class Request:
     def body_str(self) -> str:
         return self.body.to_str()
 
+    def param_slice(self, name: str) -> ByteSlice:
+        for i in range(len(self.fast_params)):
+            if self.fast_params[i][0] == name:
+                return self.fast_params[i][1]
+        return ByteSlice(Ptr[byte](0), 0)
+
     def param(self, name: str) -> str:
+        for i in range(len(self.fast_params)):
+            if self.fast_params[i][0] == name:
+                return self.fast_params[i][1].to_str()
         if name in self.path_params:
             return self.path_params[name]
         return ""
 
-    def param_int(self, name: str) -> int:
+    def param_int(self, name: str, default_val: int = 0) -> int:
+        sl = self.param_slice(name)
+        if sl.len > 0:
+            ok, val = sl.parse_int()
+            if ok:
+                return val
         val_str = self.param(name)
         if len(val_str) == 0:
-            return 0
-        val = 0
-        for i in range(len(val_str)):
-            b = ord(val_str[i])
-            if 48 <= b <= 57:
-                val = val * 10 + (b - 48)
-        return val
+            return default_val
+        bs = ByteSlice(val_str.c_str().as_byte(), len(val_str))
+        ok2, val2 = bs.parse_int()
+        return val2 if ok2 else default_val
 
     def _ensure_query_parsed(self) -> None:
         if self.parsed_query:
             return
         self.parsed_query = True
-        q = self.query_str()
-        if len(q) == 0:
+        if self.query.len == 0:
             return
         
-        pairs = q.split("&")
-        for i in range(len(pairs)):
-            p = pairs[i]
-            eq = p.find("=")
-            if eq >= 0:
-                k = url_decode(p[:eq])
-                v = url_decode(p[eq + 1:])
+        remaining = self.query
+        while remaining.len > 0:
+            pair, rest, found_pair = remaining.split_once(byte(38)) # '&'
+            if found_pair:
+                remaining = rest
+            else:
+                remaining = ByteSlice(Ptr[byte](0), 0)
+            if pair.len == 0:
+                continue
+            k_slice, v_slice, found_eq = pair.split_once(byte(61)) # '='
+            if found_eq:
+                k = url_decode_slice(k_slice)
+                v = url_decode_slice(v_slice)
                 self.query_params[k] = v
             else:
-                self.query_params[url_decode(p)] = ""
+                self.query_params[url_decode_slice(pair)] = ""
+
+    def query_param_slice(self, name: str) -> ByteSlice:
+        if self.query.len == 0:
+            return ByteSlice(Ptr[byte](0), 0)
+        remaining = self.query
+        name_bs = ByteSlice(name.c_str().as_byte(), len(name))
+        while remaining.len > 0:
+            pair, rest, found_pair = remaining.split_once(byte(38)) # '&'
+            if found_pair:
+                remaining = rest
+            else:
+                remaining = ByteSlice(Ptr[byte](0), 0)
+            if pair.len == 0:
+                continue
+            k_slice, v_slice, found_eq = pair.split_once(byte(61)) # '='
+            if found_eq:
+                if k_slice.equals_slice(name_bs):
+                    return v_slice
+            else:
+                if pair.equals_slice(name_bs):
+                    return ByteSlice(pair.ptr + pair.len, 0)
+        return ByteSlice(Ptr[byte](0), 0)
 
     def query_param(self, name: str, default_val: str = "") -> str:
+        if self.parsed_query:
+            if name in self.query_params:
+                return self.query_params[name]
+            return default_val
+        sl = self.query_param_slice(name)
+        if sl.len > 0:
+            has_pct = False
+            for i in range(sl.len):
+                b = sl.ptr[i]
+                if b == byte(37) or b == byte(43): # '%' or '+'
+                    has_pct = True
+                    break
+            if not has_pct:
+                return sl.to_str()
+            return url_decode_slice(sl)
         self._ensure_query_parsed()
         if name in self.query_params:
             return self.query_params[name]
         return default_val
 
     def query_param_int(self, name: str, default_val: int = 0) -> int:
+        sl = self.query_param_slice(name)
+        if sl.len > 0:
+            ok, val = sl.parse_int()
+            if ok:
+                return val
         s = self.query_param(name, "")
         if len(s) == 0:
             return default_val
-        val = 0
-        for i in range(len(s)):
-            b = ord(s[i])
-            if 48 <= b <= 57:
-                val = val * 10 + (b - 48)
-            else:
-                return default_val
-        return val
+        bs = ByteSlice(s.c_str().as_byte(), len(s))
+        ok2, val2 = bs.parse_int()
+        return val2 if ok2 else default_val
+
+    def get_query_params(self) -> dict[str, str]:
+        self._ensure_query_parsed()
+        return self.query_params
+
+    def header_slice(self, name: str) -> ByteSlice:
+        return self.headers.get(name)
 
     def header(self, name: str, default_val: str = "") -> str:
         val_slice = self.headers.get(name)
@@ -175,32 +253,66 @@ class Request:
         return val_slice.to_str()
 
     def bearer_token(self) -> str:
-        auth = self.header("Authorization")
-        if auth.startswith("Bearer ") and len(auth) > 7:
-            return auth[7:].strip()
+        auth = self.headers.get("Authorization")
+        if auth.len > 7 and auth.slice(0, 7).equals_case_insensitive("Bearer "):
+            return auth.slice(7, auth.len).trim().to_str()
         return ""
 
     def _ensure_cookies_parsed(self) -> None:
         if self.parsed_cookies:
             return
         self.parsed_cookies = True
-        raw = self.header("Cookie")
-        if len(raw) == 0:
+        raw_slice = self.headers.get("Cookie")
+        if raw_slice.len == 0:
             return
-        parts = raw.split(";")
-        for i in range(len(parts)):
-            item = parts[i].strip()
-            if len(item) == 0:
-                continue
-            eq = item.find("=")
-            if eq >= 0:
-                k = item[:eq].strip()
-                v = item[eq + 1:].strip()
-                self.cookies[k] = v
+        remaining = raw_slice
+        while remaining.len > 0:
+            item, rest, found_semi = remaining.split_once(byte(59)) # ';'
+            if found_semi:
+                remaining = rest
             else:
-                self.cookies[item] = ""
+                remaining = ByteSlice(Ptr[byte](0), 0)
+            item = item.trim()
+            if item.len == 0:
+                continue
+            k_slice, v_slice, found_eq = item.split_once(byte(61)) # '='
+            if found_eq:
+                self.cookies[k_slice.trim().to_str()] = v_slice.trim().to_str()
+            else:
+                self.cookies[item.to_str()] = ""
+
+    def cookie_slice(self, name: str) -> ByteSlice:
+        raw_slice = self.headers.get("Cookie")
+        if raw_slice.len == 0:
+            return ByteSlice(Ptr[byte](0), 0)
+        remaining = raw_slice
+        name_bs = ByteSlice(name.c_str().as_byte(), len(name))
+        while remaining.len > 0:
+            item, rest, found_semi = remaining.split_once(byte(59)) # ';'
+            if found_semi:
+                remaining = rest
+            else:
+                remaining = ByteSlice(Ptr[byte](0), 0)
+            item = item.trim()
+            if item.len == 0:
+                continue
+            k_slice, v_slice, found_eq = item.split_once(byte(61)) # '='
+            if found_eq:
+                if k_slice.trim().equals_slice(name_bs):
+                    return v_slice.trim()
+            else:
+                if item.equals_slice(name_bs):
+                    return ByteSlice(item.ptr + item.len, 0)
+        return ByteSlice(Ptr[byte](0), 0)
 
     def cookie(self, name: str, default_val: str = "") -> str:
+        if self.parsed_cookies:
+            if name in self.cookies:
+                return self.cookies[name]
+            return default_val
+        sl = self.cookie_slice(name)
+        if sl.len > 0:
+            return sl.to_str()
         self._ensure_cookies_parsed()
         if name in self.cookies:
             return self.cookies[name]
@@ -239,19 +351,24 @@ class Request:
             self._ensure_multipart_parsed()
             return
 
-        b = self.body_str()
-        if len(b) == 0:
+        if self.body.len == 0:
             return
-        pairs = b.split("&")
-        for i in range(len(pairs)):
-            p = pairs[i]
-            eq = p.find("=")
-            if eq >= 0:
-                k = url_decode(p[:eq])
-                v = url_decode(p[eq + 1:])
+        remaining = self.body
+        while remaining.len > 0:
+            pair, rest, found_pair = remaining.split_once(byte(38)) # '&'
+            if found_pair:
+                remaining = rest
+            else:
+                remaining = ByteSlice(Ptr[byte](0), 0)
+            if pair.len == 0:
+                continue
+            k_slice, v_slice, found_eq = pair.split_once(byte(61)) # '='
+            if found_eq:
+                k = url_decode_slice(k_slice)
+                v = url_decode_slice(v_slice)
                 self.form_params[k] = v
             else:
-                self.form_params[url_decode(p)] = ""
+                self.form_params[url_decode_slice(pair)] = ""
 
     def form_param(self, name: str, default_val: str = "") -> str:
         self._ensure_form_parsed()
@@ -263,25 +380,19 @@ class Request:
         s = self.form_param(name, "")
         if len(s) == 0:
             return default_val
-        val = 0
-        for i in range(len(s)):
-            b = ord(s[i])
-            if 48 <= b <= 57:
-                val = val * 10 + (b - 48)
-            else:
-                return default_val
-        return val
+        bs = ByteSlice(s.c_str().as_byte(), len(s))
+        ok, val = bs.parse_int()
+        return val if ok else default_val
 
     def json(self) -> dict[str, str]:
         if not self.parsed_json:
             self.parsed_json = True
-            raw = self.body_str()
-            self.json_data = FastJson.parse_to_dict(raw)
+            self.json_data = FastJson.parse_slice_to_dict(self.body)
         return self.json_data
 
     def json_doc(self) -> FastJsonDoc:
         if self.json_doc_cache is None:
-            self.json_doc_cache = FastJson.loads(self.body_str())
+            self.json_doc_cache = FastJson.loads_slice(self.body)
         return self.json_doc_cache
 
     def set_state(self, key: str, val: str) -> None:
@@ -337,17 +448,11 @@ class Request:
         return self.header("Content-Type")
 
     def content_length(self) -> int:
-        cl = self.header("Content-Length")
-        if len(cl) == 0:
+        cl_slice = self.headers.get("Content-Length")
+        if cl_slice.len == 0:
             return 0
-        val = 0
-        for i in range(len(cl)):
-            b = ord(cl[i])
-            if 48 <= b <= 57:
-                val = val * 10 + (b - 48)
-            else:
-                return 0
-        return val
+        ok, val = cl_slice.parse_int()
+        return val if ok else 0
 
     def reset(self) -> None:
         self.method = METHOD_UNKNOWN
@@ -357,23 +462,33 @@ class Request:
         self.headers.clear()
         self.body = ByteSlice(Ptr[byte](0), 0)
         self.keep_alive = True
-        self.path_params.clear()
-        self.query_params.clear()
+        if len(self.path_params) > 0:
+            self.path_params.clear()
+        if len(self.fast_params) > 0:
+            self.fast_params.clear()
+        if len(self.query_params) > 0:
+            self.query_params.clear()
         self.parsed_query = False
-        self.json_data.clear()
+        if len(self.json_data) > 0:
+            self.json_data.clear()
         self.parsed_json = False
         if self.json_doc_cache is not None:
             self.json_doc_cache.close()
             self.json_doc_cache = None
-        self.cookies.clear()
+        if len(self.cookies) > 0:
+            self.cookies.clear()
         self.parsed_cookies = False
-        self.form_params.clear()
+        if len(self.form_params) > 0:
+            self.form_params.clear()
         self.parsed_form = False
-        self.state.clear()
+        if len(self.state) > 0:
+            self.state.clear()
         self.background_tasks.clear()
-        self.multipart = MultipartFormData()
-        self.parsed_multipart = False
-        self.dep_cache_str.clear()
+        if self.parsed_multipart:
+            self.multipart = MultipartFormData()
+            self.parsed_multipart = False
+        if len(self.dep_cache_str) > 0:
+            self.dep_cache_str.clear()
         self.fd = i32(-1)
         self.async_resumer = None
         self.async_ctx = None

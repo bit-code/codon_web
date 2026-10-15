@@ -1,7 +1,6 @@
-# Native Asynchronous Context & Suspend/Resume Engine for CodonWeb
-
 import time
 from typing import Optional
+from asyncio import Task
 from src.http.response import Response
 
 class AsyncResumer:
@@ -14,6 +13,7 @@ class AsyncContext:
     is_completed: bool
     is_aborted: bool
     created_time: float
+    task: Optional[Task[NoneType]]
 
     def __init__(self, fd: i32, resumer: Optional[AsyncResumer] = None):
         self.fd = fd
@@ -21,6 +21,10 @@ class AsyncContext:
         self.is_completed = False
         self.is_aborted = False
         self.created_time = 0.0
+        self.task = None
+
+    def bind_task(self, task: Task[NoneType]) -> None:
+        self.task = task
 
     def send(self, resp: Response) -> bool:
         if self.is_completed or self.is_aborted:
@@ -32,7 +36,15 @@ class AsyncContext:
         return False
 
     def abort(self) -> None:
+        """Abort context so any late response is dropped cleanly without touching closed socket."""
+        if self.is_aborted:
+            return
         self.is_aborted = True
+        if self.task is not None:
+            t = self.task
+            if not t.done():
+                t.cancel()
 
     def is_alive(self) -> bool:
         return (not self.is_completed) and (not self.is_aborted)
+

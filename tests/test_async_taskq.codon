@@ -1,0 +1,204 @@
+# Comprehensive Test Suite for Async Tasks in TaskQ
+# Verifies non-blocking I/O concurrent execution, retry, and DLQ on 1 Worker instance
+
+import time
+from src.core.async import run, sleep
+from src.taskq import (
+    TaskMessage,
+    TaskResult,
+    TaskStatus,
+    MemoryBroker,
+    TaskClient,
+    AsyncTaskHandler,
+    AsyncTaskRegistry,
+    AsyncWorker,
+    AsyncWorkerConfig
+)
+
+print("=== Starting Test Suite: TaskQ Async Concurrent Worker ===")
+
+# ----------------- Task Definitions -----------------
+
+class AsyncWebCrawler(AsyncTaskHandler):
+    def __init__(self):
+        super().__init__("crawler:fetch", max_retries=3, default_queue="crawlers")
+
+    async def run(self, payload: str):
+        # Simulate non-blocking network I/O
+        await sleep(0.05)
+        return "HTML_OK:" + payload
+
+
+class FlakyAsyncService(AsyncTaskHandler):
+    attempt_map: list[int]
+
+    def __init__(self):
+        super().__init__("api:flaky", max_retries=3, default_queue="default")
+        self.attempt_map = [0]
+
+    async def run(self, payload: str):
+        self.attempt_map[0] += 1
+        await sleep(0.01)
+        if self.attempt_map[0] < 3:
+            raise OSError(f"HTTP 503 Gateway Unavailable (attempt {self.attempt_map[0]})")
+        return "API_SUCCESS_RECOVERED"
+
+
+class FatalAsyncService(AsyncTaskHandler):
+    def __init__(self):
+        super().__init__("api:fatal", max_retries=1, default_queue="default")
+
+    async def run(self, payload: str):
+        await sleep(0.01)
+        raise RuntimeError("Fatal remote 401 Unauthorized")
+
+
+# ----------------- Test Runner -----------------
+
+async def run_async_tests():
+    broker = MemoryBroker()
+    registry = AsyncTaskRegistry()
+
+    crawler = AsyncWebCrawler()
+    flaky = FlakyAsyncService()
+    fatal = FatalAsyncService()
+
+    registry.register(crawler)
+    registry.register(flaky)
+    registry.register(fatal)
+
+    client = TaskClient(broker=broker, default_queue="default")
+
+    # ----------------- Test 1: 20 Concurrent Web Crawlers on 1 Worker -----------------
+    print("\n--- Test 1: 20 Concurrent Web Crawlers on 1 Worker (Non-blocking I/O) ---")
+    worker = AsyncWorker(
+        broker=broker,
+        registry=registry,
+        config=AsyncWorkerConfig(queues=["crawlers", "default"], concurrency=20)
+    )
+
+    num_tasks = 20
+    task_ids: list[str] = []
+    for i in range(num_tasks):
+        t_id = client.delay("crawler:fetch", f"https://target.com/item_{i}", queue="crawlers")
+        task_ids.append(t_id)
+
+    t_start = time.time()
+
+    # Step worker until all 20 tasks complete
+    while worker.stats.total_succeeded < num_tasks:
+        await worker.step()
+        await sleep(0.005)
+
+    elapsed = time.time() - t_start
+    print(f" 20 async crawler tasks completed in: {elapsed:.3f}s on 1 Worker")
+    print(f" (Sequential execution would take at least {num_tasks * 0.05:.2f}s)")
+
+    # Assert that wall-clock time proves true concurrency (< 0.25s vs 1.0s sequential)
+    assert elapsed < 0.25, f"Expected < 0.25s for 20 concurrent tasks, took {elapsed}s"
+    assert worker.stats.total_succeeded == 20, "All 20 tasks must succeed"
+
+    # Verify each result
+    for i in range(num_tasks):
+        res = broker.get_result(task_ids[i])
+        assert res is not None
+        assert res.status == TaskStatus.SUCCESS
+        assert res.result == f"HTML_OK:https://target.com/item_{i}"
+    print(" Verified all 20 task results retrieved correctly")
+
+
+    # ----------------- Test 2: Async Retry with Exponential Backoff -----------------
+    print("\n--- Test 2: Async Retry with Exponential Backoff ---")
+    flaky_id = client.delay("api:flaky", "request_payload", queue="default")
+
+    # Step 1: First attempt fails -> schedules retry
+    await worker.step()
+    await sleep(0.02)
+    await worker.step()
+    assert worker.stats.total_retried == 1, f"Expected 1 retry, got {worker.stats.total_retried}"
+
+    # Force ready for fast testing
+    broker.delayed_queues["default"][0].eta = 0
+
+    # Step 2: Second attempt fails -> schedules retry
+    await worker.step()
+    await sleep(0.02)
+    await worker.step()
+    assert worker.stats.total_retried == 2, f"Expected 2 retries, got {worker.stats.total_retried}"
+
+    broker.delayed_queues["default"][0].eta = 0
+
+    # Step 3: Third attempt recovers and succeeds!
+    await worker.step()
+    await sleep(0.02)
+    await worker.step()
+    assert worker.stats.total_succeeded == 21, "Flaky task should now succeed"
+
+    flaky_res = broker.get_result(flaky_id)
+    assert flaky_res is not None
+    assert flaky_res.status == TaskStatus.SUCCESS
+    assert flaky_res.result == "API_SUCCESS_RECOVERED"
+    print(" Async retry with backoff and recovery verified")
+
+
+    # ----------------- Test 3: Async Dead-Letter Queue (DLQ) -----------------
+    print("\n--- Test 3: Async Dead-Letter Queue (DLQ) upon Max Retries ---")
+    fatal_handle = client.apply_async("api:fatal", "unauthorized_req", queue="default", max_retries=1)
+    fatal_id = fatal_handle.task_id
+
+    # Attempt 0 -> fails -> scheduled retry
+    await worker.step()
+    await sleep(0.03)
+    await worker.step()
+
+    # Fast forward retry
+    broker.delayed_queues["default"][0].eta = 0
+
+    # Attempt 1 -> max_retries (1) reached -> routes to DLQ
+    await worker.step()
+    await sleep(0.03)
+    await worker.step()
+
+    assert broker.get_dead_letter_count("default") == 1, f"Dead letter count should be 1, got {broker.get_dead_letter_count('default')}"
+    fatal_res = broker.get_result(fatal_id)
+    assert fatal_res is not None
+    assert fatal_res.status == TaskStatus.FAILURE
+    assert "Fatal remote 401 Unauthorized" in fatal_res.error
+    print(" Async Dead-Letter Queue (DLQ) routing verified")
+
+
+    # ----------------- Test 4: Concurrency Limit Throttling -----------------
+    print("\n--- Test 4: Concurrency Limit Throttling ---")
+    throttle_worker = AsyncWorker(
+        broker=broker,
+        registry=registry,
+        config=AsyncWorkerConfig(queues=["crawlers"], concurrency=3)
+    )
+
+    # Push 6 tasks
+    for i in range(6):
+        client.delay("crawler:fetch", f"throttle_{i}", queue="crawlers")
+
+    # Initial step should only dispatch up to concurrency (3)
+    throttle_worker.step_dispatch()
+    assert throttle_worker.stats.active_tasks <= 3, f"Active tasks ({throttle_worker.stats.active_tasks}) exceeded concurrency limit (3)"
+    print(f" Concurrency throttle verified: {throttle_worker.stats.active_tasks} active <= 3 concurrency limit")
+
+    # Drain remaining tasks
+    while throttle_worker.stats.total_succeeded < 6:
+        await throttle_worker.step()
+        await sleep(0.01)
+
+    assert throttle_worker.stats.total_succeeded == 6
+    print(" Concurrency throttling and drained execution verified")
+
+    print("\n==================================================================")
+    print(" ALL ASYNC TASKQ TESTS PASSED SUCCESSFULLY! ")
+    print("==================================================================")
+
+
+def run_all():
+    run(run_async_tests())
+
+if __name__ == "__main__":
+    run_all()

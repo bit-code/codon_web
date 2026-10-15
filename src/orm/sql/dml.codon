@@ -1,0 +1,407 @@
+# DML Expression Builders for Codon ORM: insert(), update(), delete()
+from typing import List, Dict, Tuple, Optional
+from src.orm.dialect import Dialect, MYSQL_DIALECT, POSTGRESQL_DIALECT
+from src.orm.engine import escape_sql_param
+from src.orm.sql.expression import (
+    CompileContext, ClauseElement, RawClause
+)
+from src.orm.sql.column import Column
+from src.orm.sql.table import Table
+from src.orm.sql.compiler import SQLCompiler
+
+# ==============================================================================
+# 1. Insert Statement Builder
+# ==============================================================================
+class Insert:
+    _table_name: str
+    _columns: List[str]
+    _rows: List[List[str]]
+    _pending_keys: List[str]
+    _pending_row: Dict[str, str]
+    _returning: List[Column]
+
+    def __init__(self, table_name: str):
+        self._table_name = table_name
+        self._columns = List[str]()
+        self._rows = List[List[str]]()
+        self._pending_keys = List[str]()
+        self._pending_row = Dict[str, str]()
+        self._returning = List[Column]()
+
+    def values(self, values: Dict[str, str]) -> Insert:
+        if len(self._columns) == 0:
+            for k in values.keys():
+                self._columns.append(k)
+        row = List[str]()
+        for col in self._columns:
+            if col in values:
+                row.append(values[col])
+            else:
+                row.append("")
+        self._rows.append(row)
+        return self
+
+    def values(self, rows: List[Dict[str, str]]) -> Insert:
+        for r in rows:
+            self.values(r)
+        return self
+
+    def set(self, col: Column, val: str) -> Insert:
+        return self.set(col.name, val)
+
+    def set(self, col: Column, val: float) -> Insert:
+        return self.set(col.name, str(val))
+
+    def set(self, col: Column, val: int) -> Insert:
+        return self.set(col.name, str(val))
+
+    def set(self, col: Column, val: bool) -> Insert:
+        return self.set(col.name, "1" if val else "0")
+
+    def set(self, col_name: str, val: str) -> Insert:
+        if col_name not in self._pending_row:
+            self._pending_keys.append(col_name)
+        self._pending_row[col_name] = val
+        return self
+
+    def set(self, col_name: str, val: float) -> Insert:
+        return self.set(col_name, str(val))
+
+    def set(self, col_name: str, val: int) -> Insert:
+        return self.set(col_name, str(val))
+
+    def set(self, col_name: str, val: bool) -> Insert:
+        return self.set(col_name, "1" if val else "0")
+
+    def returning(self, *cols) -> Insert:
+        for c in cols:
+            if isinstance(c, Column):
+                self._returning.append(c)
+            elif isinstance(c, str):
+                self._returning.append(Column(c))
+        return self
+
+    def to_sql(self, dialect: Dialect = MYSQL_DIALECT) -> Tuple[str, List[str]]:
+        compiler = SQLCompiler(dialect)
+        q_table = compiler.quote_identifier(self._table_name)
+
+        if len(self._rows) == 0 and len(self._pending_keys) > 0:
+            row = List[str]()
+            for k in self._pending_keys:
+                self._columns.append(k)
+                row.append(self._pending_row[k])
+            self._rows.append(row)
+
+        if len(self._columns) == 0 or len(self._rows) == 0:
+            return ("", compiler.params)
+
+        q_cols = List[str]()
+        for c in self._columns:
+            q_cols.append(compiler.quote_identifier(c))
+
+        sql = "INSERT INTO " + q_table + " (" + ", ".join(q_cols) + ") VALUES "
+
+        row_sqls = List[str]()
+        for row in self._rows:
+            phs = List[str]()
+            for v in row:
+                phs.append(compiler.next_placeholder())
+                compiler.params.append(v)
+            row_sqls.append("(" + ", ".join(phs) + ")")
+
+        sql += ", ".join(row_sqls)
+
+        if len(self._returning) > 0 and dialect.supports_returning():
+            ret_cols = List[str]()
+            for rc in self._returning:
+                q_name = compiler.quote_identifier(rc.get_qualified_name())
+                if len(rc.alias) > 0:
+                    ret_cols.append(q_name + " AS " + dialect.quote_identifier(rc.alias))
+                else:
+                    ret_cols.append(q_name)
+            sql += " RETURNING " + ", ".join(ret_cols)
+
+        return (sql, compiler.params)
+
+    def compile(self, dialect: Dialect = MYSQL_DIALECT) -> str:
+        sql, params = self.to_sql(dialect)
+        if len(params) == 0:
+            return sql
+        parts = List[str]()
+        param_idx = 0
+        i = 0
+        while i < len(sql):
+            c = sql[i]
+            if c == '?' or (dialect.name == "postgresql" and c == '$'):
+                if c == '$':
+                    i += 1
+                    while i < len(sql) and sql[i] >= '0' and sql[i] <= '9':
+                        i += 1
+                    if param_idx < len(params):
+                        parts.append(escape_sql_param(params[param_idx]))
+                        param_idx += 1
+                    continue
+                else:
+                    if param_idx < len(params):
+                        parts.append(escape_sql_param(params[param_idx]))
+                        param_idx += 1
+                    else:
+                        parts.append("?")
+                    i += 1
+            else:
+                parts.append(c)
+                i += 1
+        return "".join(parts)
+
+
+# ==============================================================================
+# 2. Update Statement Builder
+# ==============================================================================
+class Update:
+    _table_name: str
+    _values: Dict[str, str]
+    _ordered_keys: List[str]
+    _where_clauses: List[ClauseElement]
+    _returning: List[Column]
+
+    def __init__(self, table_name: str):
+        self._table_name = table_name
+        self._values = Dict[str, str]()
+        self._ordered_keys = List[str]()
+        self._where_clauses = List[ClauseElement]()
+        self._returning = List[Column]()
+
+    def values(self, values: Dict[str, str]) -> Update:
+        for k, v in values.items():
+            if k not in self._values:
+                self._ordered_keys.append(k)
+            self._values[k] = v
+        return self
+
+    def set(self, col: Column, val: str) -> Update:
+        if col.name not in self._values:
+            self._ordered_keys.append(col.name)
+        self._values[col.name] = val
+        return self
+
+    def set(self, col: Column, val: int) -> Update:
+        return self.set(col, str(val))
+
+    def set(self, col: Column, val: float) -> Update:
+        return self.set(col, str(val))
+
+    def set(self, col: Column, val: bool) -> Update:
+        return self.set(col, "1" if val else "0")
+
+    def set(self, col_name: str, val: str) -> Update:
+        if col_name not in self._values:
+            self._ordered_keys.append(col_name)
+        self._values[col_name] = val
+        return self
+
+    def set(self, col_name: str, val: int) -> Update:
+        return self.set(col_name, str(val))
+
+    def where(self, *args) -> Update:
+        for a in args:
+            if isinstance(a, ClauseElement):
+                self._where_clauses.append(a)
+            elif isinstance(a, str):
+                self._where_clauses.append(RawClause(a))
+            elif isinstance(a, list):
+                for item in a:
+                    if isinstance(item, ClauseElement):
+                        self._where_clauses.append(item)
+                    elif isinstance(item, str):
+                        self._where_clauses.append(RawClause(item))
+        return self
+
+    def returning(self, *cols) -> Update:
+        for c in cols:
+            if isinstance(c, Column):
+                self._returning.append(c)
+            elif isinstance(c, str):
+                self._returning.append(Column(c))
+        return self
+
+    def to_sql(self, dialect: Dialect = MYSQL_DIALECT) -> Tuple[str, List[str]]:
+        compiler = SQLCompiler(dialect)
+        q_table = compiler.quote_identifier(self._table_name)
+
+        set_parts = List[str]()
+        for k in self._ordered_keys:
+            v = self._values[k]
+            q_col = compiler.quote_identifier(k)
+            ph = compiler.next_placeholder()
+            compiler.params.append(v)
+            set_parts.append(q_col + " = " + ph)
+
+        sql = "UPDATE " + q_table + " SET " + ", ".join(set_parts)
+
+        if len(self._where_clauses) > 0:
+            where_parts = List[str]()
+            for w in self._where_clauses:
+                part = compiler.compile_clause(w)
+                if len(part) > 0:
+                    where_parts.append(part)
+            if len(where_parts) > 0:
+                sql += " WHERE " + " AND ".join(where_parts)
+
+        if len(self._returning) > 0 and dialect.supports_returning():
+            ret_cols = List[str]()
+            for rc in self._returning:
+                q_name = compiler.quote_identifier(rc.get_qualified_name())
+                if len(rc.alias) > 0:
+                    ret_cols.append(q_name + " AS " + dialect.quote_identifier(rc.alias))
+                else:
+                    ret_cols.append(q_name)
+            sql += " RETURNING " + ", ".join(ret_cols)
+
+        return (sql, compiler.params)
+
+    def compile(self, dialect: Dialect = MYSQL_DIALECT) -> str:
+        sql, params = self.to_sql(dialect)
+        if len(params) == 0:
+            return sql
+        parts = List[str]()
+        param_idx = 0
+        i = 0
+        while i < len(sql):
+            c = sql[i]
+            if c == '?' or (dialect.name == "postgresql" and c == '$'):
+                if c == '$':
+                    i += 1
+                    while i < len(sql) and sql[i] >= '0' and sql[i] <= '9':
+                        i += 1
+                    if param_idx < len(params):
+                        parts.append(escape_sql_param(params[param_idx]))
+                        param_idx += 1
+                    continue
+                else:
+                    if param_idx < len(params):
+                        parts.append(escape_sql_param(params[param_idx]))
+                        param_idx += 1
+                    else:
+                        parts.append("?")
+                    i += 1
+            else:
+                parts.append(c)
+                i += 1
+        return "".join(parts)
+
+
+# ==============================================================================
+# 3. Delete Statement Builder
+# ==============================================================================
+class Delete:
+    _table_name: str
+    _where_clauses: List[ClauseElement]
+    _returning: List[Column]
+
+    def __init__(self, table_name: str):
+        self._table_name = table_name
+        self._where_clauses = List[ClauseElement]()
+        self._returning = List[Column]()
+
+    def where(self, *args) -> Delete:
+        for a in args:
+            if isinstance(a, ClauseElement):
+                self._where_clauses.append(a)
+            elif isinstance(a, str):
+                self._where_clauses.append(RawClause(a))
+            elif isinstance(a, list):
+                for item in a:
+                    if isinstance(item, ClauseElement):
+                        self._where_clauses.append(item)
+                    elif isinstance(item, str):
+                        self._where_clauses.append(RawClause(item))
+        return self
+
+    def returning(self, *cols) -> Delete:
+        for c in cols:
+            if isinstance(c, Column):
+                self._returning.append(c)
+            elif isinstance(c, str):
+                self._returning.append(Column(c))
+        return self
+
+    def to_sql(self, dialect: Dialect = MYSQL_DIALECT) -> Tuple[str, List[str]]:
+        compiler = SQLCompiler(dialect)
+        q_table = compiler.quote_identifier(self._table_name)
+        sql = "DELETE FROM " + q_table
+
+        if len(self._where_clauses) > 0:
+            where_parts = List[str]()
+            for w in self._where_clauses:
+                part = compiler.compile_clause(w)
+                if len(part) > 0:
+                    where_parts.append(part)
+            if len(where_parts) > 0:
+                sql += " WHERE " + " AND ".join(where_parts)
+
+        if len(self._returning) > 0 and dialect.supports_returning():
+            ret_cols = List[str]()
+            for rc in self._returning:
+                q_name = compiler.quote_identifier(rc.get_qualified_name())
+                if len(rc.alias) > 0:
+                    ret_cols.append(q_name + " AS " + dialect.quote_identifier(rc.alias))
+                else:
+                    ret_cols.append(q_name)
+            sql += " RETURNING " + ", ".join(ret_cols)
+
+        return (sql, compiler.params)
+
+    def compile(self, dialect: Dialect = MYSQL_DIALECT) -> str:
+        sql, params = self.to_sql(dialect)
+        if len(params) == 0:
+            return sql
+        parts = List[str]()
+        param_idx = 0
+        i = 0
+        while i < len(sql):
+            c = sql[i]
+            if c == '?' or (dialect.name == "postgresql" and c == '$'):
+                if c == '$':
+                    i += 1
+                    while i < len(sql) and sql[i] >= '0' and sql[i] <= '9':
+                        i += 1
+                    if param_idx < len(params):
+                        parts.append(escape_sql_param(params[param_idx]))
+                        param_idx += 1
+                    continue
+                else:
+                    if param_idx < len(params):
+                        parts.append(escape_sql_param(params[param_idx]))
+                        param_idx += 1
+                    else:
+                        parts.append("?")
+                    i += 1
+            else:
+                parts.append(c)
+                i += 1
+        return "".join(parts)
+
+
+# ==============================================================================
+# Global Factory Functions: insert(), update(), delete()
+# ==============================================================================
+def insert(target) -> Insert:
+    if isinstance(target, Table):
+        return Insert(target.name)
+    elif isinstance(target, str):
+        return Insert(target)
+    return Insert("")
+
+def update(target) -> Update:
+    if isinstance(target, Table):
+        return Update(target.name)
+    elif isinstance(target, str):
+        return Update(target)
+    return Update("")
+
+def delete(target) -> Delete:
+    if isinstance(target, Table):
+        return Delete(target.name)
+    elif isinstance(target, str):
+        return Delete(target)
+    return Delete("")

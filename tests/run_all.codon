@@ -78,6 +78,29 @@ from test_middlewares_ext import *
 print("\n=== 26. Testing Request & Response Extensions (Client IP, Full URL, Delete Cookie) ===")
 from test_request_ext2 import *
 
+print("\n=== 27. Testing Industrial-Grade ORM Dialects & QueryBuilder (MySQL & PostgreSQL) ===")
+from test_orm_dialects import *
+
+print("\n=== 28. Testing Industrial-Grade ORM End-to-End CRUD & Session Lifecycle ===")
+from test_orm_crud import *
+
+print("\n=== 29. Testing Industrial-Grade Asynchronous PostgreSQL Driver Architecture ===")
+from test_async_postgres import *
+
+print("\n=== 30. Testing Unified Single EventLoop (USEL) & Task Cancellation ===")
+from test_unified_single_loop import *
+
+print("\n=== 31. Testing Industrial-Grade Architecture Improvements (Backpressure, 504 Timeout, Structured Concurrency) ===")
+from test_industrial_improvements import *
+
+print("\n=== 32. Testing Industrial-Grade Security Hardening (HMAC-SHA256, Traversal, SQL Injection, CRLF, Per-IP Limiter, WS) ===")
+from test_security_hardening import *
+
+print("\n=== 33. Testing SQLAlchemy-Style Fluent SQL Builder ===")
+from test_sql_builder import *
+
 print("\n=======================================================")
-print(">>> ALL 26 CODON_WEB UNIT & INTEGRATION TESTS PASSED! <<<")
+print(">>> ALL 33 CODON_WEB UNIT & INTEGRATION TESTS PASSED! <<<")
 print("=======================================================")
+
+

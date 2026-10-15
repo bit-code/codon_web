@@ -1,0 +1,94 @@
+# Enterprise-Grade Distributed Lock Implementation for Codon Web
+
+import time
+from asyncio import sleep
+from src.db.drivers.redis.async_connection import AsyncRedisConnection
+from src.db.drivers.redis.errors import RedisLockError
+
+class AsyncRedisLock:
+    conn: AsyncRedisConnection
+    key: str
+    token: str
+    ttl_ms: int
+    is_acquired: bool
+
+    def __init__(
+        self,
+        conn: AsyncRedisConnection,
+        name: str,
+        ttl_ms: int = 10000
+    ):
+        self.conn = conn
+        self.key = "lock:" + name
+        # High entropy unique ownership token
+        now_us = int(time.time() * 1000000.0)
+        self.token = f"tok_{now_us}_{id(self)}"
+        self.ttl_ms = ttl_ms
+        self.is_acquired = False
+
+    async def __aenter__(self):
+        ok = await self.acquire(5.0)
+        if not ok:
+            raise RedisLockError(f"Could not acquire lock for '{self.key}' within timeout")
+        return self
+
+    async def __aexit__(self):
+        await self.release()
+
+
+    async def acquire(self, timeout_sec: float = 5.0, retry_delay_sec: float = 0.01):
+        """
+        Attempts to acquire the lock with NX PX atomicity.
+        Retries with cooperative async sleep until timeout.
+        """
+        t0 = time.time()
+        while time.time() - t0 < timeout_sec:
+            res = await self.conn.execute([
+                "SET", self.key, self.token, "NX", "PX", str(self.ttl_ms)
+            ])
+            if res.as_str() == "OK":
+                self.is_acquired = True
+                return True
+            await sleep(retry_delay_sec)
+
+        return False
+
+    async def release(self):
+        """
+        Releases the lock safely using a Lua CAS script.
+        Prevents releasing locks that have expired and been re-acquired by another node.
+        """
+        if not self.is_acquired:
+            return False
+
+        lua_cas_release = (
+            "if redis.call('get', KEYS[1]) == ARGV[1] then\n"
+            "    return redis.call('del', KEYS[1])\n"
+            "else\n"
+            "    return 0\n"
+            "end"
+        )
+        res = await self.conn.execute([
+            "EVAL", lua_cas_release, "1", self.key, self.token
+        ])
+        self.is_acquired = False
+        return res.as_int() == 1
+
+    async def extend(self, additional_px: int):
+        """
+        Extends the lock TTL if and only if the current node still holds it.
+        """
+        if not self.is_acquired:
+            return False
+
+        lua_cas_extend = (
+            "if redis.call('get', KEYS[1]) == ARGV[1] then\n"
+            "    return redis.call('pexpire', KEYS[1], ARGV[2])\n"
+            "else\n"
+            "    return 0\n"
+            "end"
+        )
+        res = await self.conn.execute([
+            "EVAL", lua_cas_extend, "1", self.key, self.token, str(additional_px)
+        ])
+        return res.as_int() == 1

@@ -1,0 +1,452 @@
+# Industrial-Grade Single-Definition TableSchema and Column Builder Subsystem
+from typing import List, Dict, Optional
+from src.orm.fields import (
+    Field, IntegerField, BigIntegerField, SmallIntegerField, TinyIntegerField,
+    MediumIntegerField, FloatField, DoubleField, DecimalField, CharField,
+    TextField, MediumTextField, LongTextField, BooleanField, DateTimeField,
+    TimestampField, DateField, TimeField, YearField, JsonField, BlobField
+)
+from src.orm.model import ModelMeta
+from src.orm.lazy_model import LazyModel
+
+class TableSchema:
+    table_name: str
+    fields: List[Field]
+    _meta: Optional[ModelMeta]
+
+    def __init__(self, table_name: str):
+        self.table_name = table_name
+        self.fields = List[Field]()
+        self._meta = None
+
+    # --------------------------------------------------------------------------
+    # 整数类型族 (Integer Types)
+    # --------------------------------------------------------------------------
+    def int(
+        self,
+        name: str,
+        primary_key: bool = False,
+        auto_increment: bool = False,
+        nullable: bool = True,
+        default_val: str = "",
+        unique: bool = False,
+        index: bool = False,
+        comment: str = ""
+    ) -> int:
+        f = IntegerField(name=name, primary_key=primary_key, auto_increment=auto_increment,
+                         nullable=nullable, default_val=default_val, unique=unique, index=index, comment=comment)
+        self.fields.append(f)
+        return 0
+
+    def bigint(
+        self,
+        name: str,
+        primary_key: bool = False,
+        auto_increment: bool = False,
+        nullable: bool = True,
+        default_val: str = "",
+        unique: bool = False,
+        index: bool = False,
+        comment: str = ""
+    ) -> int:
+        f = BigIntegerField(name=name, primary_key=primary_key, auto_increment=auto_increment,
+                            nullable=nullable, default_val=default_val, unique=unique, index=index, comment=comment)
+        self.fields.append(f)
+        return 0
+
+    def smallint(
+        self,
+        name: str,
+        primary_key: bool = False,
+        auto_increment: bool = False,
+        nullable: bool = True,
+        default_val: str = "",
+        unique: bool = False,
+        index: bool = False,
+        comment: str = ""
+    ) -> int:
+        f = SmallIntegerField(name=name, primary_key=primary_key, auto_increment=auto_increment,
+                              nullable=nullable, default_val=default_val, unique=unique, index=index, comment=comment)
+        self.fields.append(f)
+        return 0
+
+    def tinyint(
+        self,
+        name: str,
+        primary_key: bool = False,
+        auto_increment: bool = False,
+        nullable: bool = True,
+        default_val: str = "",
+        unique: bool = False,
+        index: bool = False,
+        comment: str = ""
+    ) -> int:
+        f = TinyIntegerField(name=name, primary_key=primary_key, auto_increment=auto_increment,
+                             nullable=nullable, default_val=default_val, unique=unique, index=index, comment=comment)
+        self.fields.append(f)
+        return 0
+
+    def mediumint(
+        self,
+        name: str,
+        primary_key: bool = False,
+        auto_increment: bool = False,
+        nullable: bool = True,
+        default_val: str = "",
+        unique: bool = False,
+        index: bool = False,
+        comment: str = ""
+    ) -> int:
+        f = MediumIntegerField(name=name, primary_key=primary_key, auto_increment=auto_increment,
+                               nullable=nullable, default_val=default_val, unique=unique, index=index, comment=comment)
+        self.fields.append(f)
+        return 0
+
+    # --------------------------------------------------------------------------
+    # 浮点与定点数值族 (Floating & Fixed Decimal Types)
+    # --------------------------------------------------------------------------
+    def float(
+        self,
+        name: str,
+        nullable: bool = True,
+        default_val: str = "0.0",
+        comment: str = ""
+    ) -> float:
+        f = FloatField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return 0.0
+
+    def double(
+        self,
+        name: str,
+        nullable: bool = True,
+        default_val: str = "0.0",
+        comment: str = ""
+    ) -> float:
+        f = DoubleField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return 0.0
+
+    def decimal(
+        self,
+        name: str,
+        precision: int = 10,
+        scale: int = 2,
+        nullable: bool = True,
+        default_val: str = "0.00",
+        comment: str = ""
+    ) -> float:
+        f = DecimalField(name=name, precision=precision, scale=scale, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return 0.0
+
+    # --------------------------------------------------------------------------
+    # 字符与文本类型族 (String & Text Types)
+    # --------------------------------------------------------------------------
+    def str(
+        self,
+        name: str,
+        max_length: int = 255,
+        primary_key: bool = False,
+        nullable: bool = True,
+        default_val: str = "",
+        unique: bool = False,
+        index: bool = False,
+        comment: str = ""
+    ) -> str:
+        f = CharField(name=name, max_length=max_length, primary_key=primary_key,
+                      nullable=nullable, default_val=default_val, unique=unique, index=index, comment=comment)
+        self.fields.append(f)
+        return ""
+
+    def varchar(
+        self,
+        name: str,
+        max_length: int = 255,
+        primary_key: bool = False,
+        nullable: bool = True,
+        default_val: str = "",
+        unique: bool = False,
+        index: bool = False,
+        comment: str = ""
+    ) -> str:
+        return self.str(name=name, max_length=max_length, primary_key=primary_key,
+                        nullable=nullable, default_val=default_val, unique=unique, index=index, comment=comment)
+
+    def char(
+        self,
+        name: str,
+        max_length: int = 255,
+        primary_key: bool = False,
+        nullable: bool = True,
+        default_val: str = "",
+        unique: bool = False,
+        index: bool = False,
+        comment: str = ""
+    ) -> str:
+        f = Field(name=name, field_type="char", max_length=max_length, primary_key=primary_key,
+                  nullable=nullable, default_val=default_val, unique=unique, index=index, comment=comment)
+        self.fields.append(f)
+        return ""
+
+    def text(self, name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+        f = TextField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return ""
+
+    def mediumtext(self, name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+        f = MediumTextField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return ""
+
+    def longtext(self, name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+        f = LongTextField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return ""
+
+    # --------------------------------------------------------------------------
+    # 布尔类型族 (Boolean Types)
+    # --------------------------------------------------------------------------
+    def bool(self, name: str, nullable: bool = False, default_val: str = "false", comment: str = "") -> bool:
+        f = BooleanField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return False
+
+    # --------------------------------------------------------------------------
+    # 日期与时间类型族 (Date & Time Types)
+    # --------------------------------------------------------------------------
+    def datetime(self, name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+        f = DateTimeField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return ""
+
+    def timestamp(self, name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+        f = TimestampField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return ""
+
+    def date(self, name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+        f = DateField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return ""
+
+    def time(self, name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+        f = TimeField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return ""
+
+    def year(self, name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> int:
+        f = YearField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return 0
+
+    # --------------------------------------------------------------------------
+    # JSON 与二进制大对象族 (JSON & Blob Types)
+    # --------------------------------------------------------------------------
+    def json(self, name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+        f = JsonField(name=name, nullable=nullable, default_val=default_val, comment=comment)
+        self.fields.append(f)
+        return ""
+
+    def blob(self, name: str, nullable: bool = True, comment: str = "") -> str:
+        f = BlobField(name=name, nullable=nullable, comment=comment)
+        self.fields.append(f)
+        return ""
+
+    # --------------------------------------------------------------------------
+    # 获取编译后的 ModelMeta 元对象
+    # --------------------------------------------------------------------------
+    def meta(self) -> ModelMeta:
+        if self._meta is None:
+            m = ModelMeta(self.table_name, self.fields)
+            self._meta = Optional[ModelMeta](m)
+            return m
+        m_opt = self._meta
+        if m_opt is not None:
+            return m_opt
+        return ModelMeta(self.table_name, self.fields)
+
+
+# ==============================================================================
+# 全局活跃 Schema 上下文与注册表（支持 SQLAlchemy 声明式 Base 模型体系）
+# ==============================================================================
+_active_schema_holder = [TableSchema("")]
+_TABLE_REGISTRY = Dict[str, TableSchema]()
+
+def define_table(table_name: str) -> TableSchema:
+    s = TableSchema(table_name)
+    _active_schema_holder[0] = s
+    _TABLE_REGISTRY[table_name] = s
+    return s
+
+def tablename(name: str) -> str:
+    s = define_table(name)
+    return name
+
+def table_name(name: str) -> str:
+    return tablename(name)
+
+def get_table_schema(name: str) -> TableSchema:
+    if name in _TABLE_REGISTRY:
+        return _TABLE_REGISTRY[name]
+    raise KeyError("Table '" + name + "' is not registered in ORM schema registry. Ensure the model defines '__tablename__ = tablename(\"" + name + "\")' or is registered via define_table().")
+
+def table_args(
+    comment: str = "",
+    engine: str = "InnoDB",
+    charset: str = "utf8mb4",
+    collate: str = "utf8mb4_general_ci",
+    row_format: str = "Dynamic",
+    auto_increment: str = "1"
+) -> Dict[str, str]:
+    d = Dict[str, str]()
+    d["comment"] = comment
+    d["engine"] = engine
+    d["charset"] = charset
+    d["collate"] = collate
+    d["row_format"] = row_format
+    d["auto_increment"] = auto_increment
+    return d
+
+class Base(LazyModel):
+    # --------------------------------------------------------------------------
+    # 1. 字段与实体状态检测 (Field & State Inspection)
+    # --------------------------------------------------------------------------
+    def has(self, col: str) -> bool:
+        """检查字段是否存在于当前实体（含已持久化底层 Row 或未持久化脏字段）"""
+        if col in self._dirty:
+            return True
+        r = self._row
+        if r is not None:
+            return col in r
+        return False
+
+    def is_new(self, pk_name: str = "id") -> bool:
+        """检测当前记录是否为全新待插入记录（未关联 DB Row 或主键为空/0）"""
+        r = self._row
+        if r is None:
+            return True
+        val = self.get_str(pk_name)
+        return len(val) == 0 or val == "0"
+
+    def reset(self) -> None:
+        """内存状态回滚：放弃所有未保存的 dirty 变更，恢复到底层 Row 原始状态"""
+        self.clear_dirty()
+
+    # --------------------------------------------------------------------------
+    # 2. 批量数据导入与导出 (Bulk Data Exchange)
+    # --------------------------------------------------------------------------
+    def from_dict(self, data: Dict[str, str]) -> None:
+        """从字典批量装载数据（支持 Web 请求参数、表单或反序列化载荷注入）"""
+        for k, v in data.items():
+            self._dirty[k] = v
+
+    def to_dict(self, meta: ModelMeta) -> Dict[str, str]:
+        """按 Schema 元数据导出为标准强类型字典"""
+        res = Dict[str, str]()
+        for col in meta.columns:
+            res[col] = self.get_str(col)
+        return res
+
+    # --------------------------------------------------------------------------
+    # 3. 业务生命周期钩子 (Lifecycle Hooks & Validation)
+    # --------------------------------------------------------------------------
+    def before_save(self) -> None:
+        """持久化前置钩子（供业务子类覆写，如自动维护时间戳、密码哈希）"""
+        pass
+
+    def after_save(self) -> None:
+        """持久化后置钩子（供业务子类覆写，如派发事件、通知或更新缓存）"""
+        pass
+
+    def validate(self) -> bool:
+        """业务规则校验钩子（可由业务子类覆写执行领域校验逻辑）"""
+        return True
+
+def get_active_schema() -> TableSchema:
+    return _active_schema_holder[0]
+
+# 独立 Column 快捷定义函数（自动注册进最近一次 define_table 声明的表结构中）
+def IntegerColumn(name: str, primary_key: bool = False, auto_increment: bool = False, nullable: bool = True, default_val: str = "", comment: str = "") -> int:
+    return _active_schema_holder[0].int(name, primary_key=primary_key, auto_increment=auto_increment, nullable=nullable, default_val=default_val, comment=comment)
+
+def IntColumn(name: str, primary_key: bool = False, auto_increment: bool = False, nullable: bool = True, default_val: str = "", comment: str = "") -> int:
+    return _active_schema_holder[0].int(name, primary_key=primary_key, auto_increment=auto_increment, nullable=nullable, default_val=default_val, comment=comment)
+
+def BigIntegerColumn(name: str, primary_key: bool = False, auto_increment: bool = False, nullable: bool = True, default_val: str = "", comment: str = "") -> int:
+    return _active_schema_holder[0].bigint(name, primary_key=primary_key, auto_increment=auto_increment, nullable=nullable, default_val=default_val, comment=comment)
+
+def BigIntColumn(name: str, primary_key: bool = False, auto_increment: bool = False, nullable: bool = True, default_val: str = "", comment: str = "") -> int:
+    return _active_schema_holder[0].bigint(name, primary_key=primary_key, auto_increment=auto_increment, nullable=nullable, default_val=default_val, comment=comment)
+
+def SmallIntegerColumn(name: str, primary_key: bool = False, auto_increment: bool = False, nullable: bool = True, default_val: str = "", comment: str = "") -> int:
+    return _active_schema_holder[0].smallint(name, primary_key=primary_key, auto_increment=auto_increment, nullable=nullable, default_val=default_val, comment=comment)
+
+def SmallIntColumn(name: str, primary_key: bool = False, auto_increment: bool = False, nullable: bool = True, default_val: str = "", comment: str = "") -> int:
+    return _active_schema_holder[0].smallint(name, primary_key=primary_key, auto_increment=auto_increment, nullable=nullable, default_val=default_val, comment=comment)
+
+def TinyIntegerColumn(name: str, primary_key: bool = False, auto_increment: bool = False, nullable: bool = True, default_val: str = "", comment: str = "") -> int:
+    return _active_schema_holder[0].tinyint(name, primary_key=primary_key, auto_increment=auto_increment, nullable=nullable, default_val=default_val, comment=comment)
+
+def TinyIntColumn(name: str, primary_key: bool = False, auto_increment: bool = False, nullable: bool = True, default_val: str = "", comment: str = "") -> int:
+    return _active_schema_holder[0].tinyint(name, primary_key=primary_key, auto_increment=auto_increment, nullable=nullable, default_val=default_val, comment=comment)
+
+def FloatColumn(name: str, nullable: bool = True, default_val: str = "0.0", comment: str = "") -> float:
+    return _active_schema_holder[0].float(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def DoubleColumn(name: str, nullable: bool = True, default_val: str = "0.0", comment: str = "") -> float:
+    return _active_schema_holder[0].double(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def DecimalColumn(name: str, precision: int = 10, scale: int = 2, nullable: bool = True, default_val: str = "0.00", comment: str = "") -> float:
+    return _active_schema_holder[0].decimal(name, precision=precision, scale=scale, nullable=nullable, default_val=default_val, comment=comment)
+
+def NumericColumn(name: str, precision: int = 10, scale: int = 2, nullable: bool = True, default_val: str = "0.00", comment: str = "") -> float:
+    return _active_schema_holder[0].decimal(name, precision=precision, scale=scale, nullable=nullable, default_val=default_val, comment=comment)
+
+def StringColumn(name: str, max_length: int = 255, primary_key: bool = False, nullable: bool = True, default_val: str = "", unique: bool = False, index: bool = False, comment: str = "") -> str:
+    return _active_schema_holder[0].str(name, max_length=max_length, primary_key=primary_key, nullable=nullable, default_val=default_val, unique=unique, index=index, comment=comment)
+
+def VarCharColumn(name: str, max_length: int = 255, primary_key: bool = False, nullable: bool = True, default_val: str = "", unique: bool = False, index: bool = False, comment: str = "") -> str:
+    return _active_schema_holder[0].str(name, max_length=max_length, primary_key=primary_key, nullable=nullable, default_val=default_val, unique=unique, index=index, comment=comment)
+
+def CharColumn(name: str, max_length: int = 255, primary_key: bool = False, nullable: bool = True, default_val: str = "", unique: bool = False, index: bool = False, comment: str = "") -> str:
+    return _active_schema_holder[0].char(name, max_length=max_length, primary_key=primary_key, nullable=nullable, default_val=default_val, unique=unique, index=index, comment=comment)
+
+def TextColumn(name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+    return _active_schema_holder[0].text(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def MediumTextColumn(name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+    return _active_schema_holder[0].mediumtext(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def LongTextColumn(name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+    return _active_schema_holder[0].longtext(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def BooleanColumn(name: str, nullable: bool = False, default_val: str = "false", comment: str = "") -> bool:
+    return _active_schema_holder[0].bool(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def BoolColumn(name: str, nullable: bool = False, default_val: str = "false", comment: str = "") -> bool:
+    return _active_schema_holder[0].bool(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def DateTimeColumn(name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+    return _active_schema_holder[0].datetime(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def TimestampColumn(name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+    return _active_schema_holder[0].timestamp(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def DateColumn(name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+    return _active_schema_holder[0].date(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def TimeColumn(name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+    return _active_schema_holder[0].time(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def YearColumn(name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> int:
+    return _active_schema_holder[0].year(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def JsonColumn(name: str, nullable: bool = True, default_val: str = "", comment: str = "") -> str:
+    return _active_schema_holder[0].json(name, nullable=nullable, default_val=default_val, comment=comment)
+
+def BlobColumn(name: str, nullable: bool = True, comment: str = "") -> str:
+    return _active_schema_holder[0].blob(name, nullable=nullable, comment=comment)
+
+def BinaryColumn(name: str, nullable: bool = True, comment: str = "") -> str:
+    return _active_schema_holder[0].blob(name, nullable=nullable, comment=comment)

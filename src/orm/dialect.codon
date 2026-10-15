@@ -1,0 +1,247 @@
+# Dialect Abstraction Layer for MySQL and PostgreSQL
+from typing import List, Dict, Optional
+
+class Dialect:
+    name: str
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def quote_identifier(self, ident: str) -> str:
+        return ident
+
+    def placeholder(self, idx: int) -> str:
+        return "?"
+
+    def limit_offset(self, limit: int, offset: int) -> str:
+        return ""
+
+    def type_to_sql(
+        self,
+        type_name: str,
+        max_length: int = 255,
+        is_pk: bool = False,
+        auto_increment: bool = False,
+        nullable: bool = True
+    ) -> str:
+        return "TEXT"
+
+    def table_suffix(self) -> str:
+        return ""
+
+    def supports_returning(self) -> bool:
+        return False
+
+
+class MySQLDialect(Dialect):
+    def __init__(self):
+        super().__init__("mysql")
+
+    def quote_identifier(self, ident: str) -> str:
+        if "." in ident:
+            parts = ident.split(".")
+            quoted = list[str]()
+            for i in range(len(parts)):
+                p = parts[i].replace("`", "``")
+                quoted.append("`" + p + "`")
+            return ".".join(quoted)
+        return "`" + ident.replace("`", "``") + "`"
+
+    def placeholder(self, idx: int) -> str:
+        return "?"
+
+    def limit_offset(self, limit: int, offset: int) -> str:
+        if limit < 0:
+            return ""
+        if offset > 0:
+            return " LIMIT " + str(offset) + ", " + str(limit)
+        return " LIMIT " + str(limit)
+
+    def type_to_sql(
+        self,
+        type_name: str,
+        max_length: int = 255,
+        is_pk: bool = False,
+        auto_increment: bool = False,
+        nullable: bool = True
+    ) -> str:
+        t = type_name.lower()
+        sql = ""
+        if is_pk and auto_increment:
+            if t == "bigint":
+                return "BIGINT AUTO_INCREMENT PRIMARY KEY"
+            return "INT AUTO_INCREMENT PRIMARY KEY"
+        elif is_pk:
+            if t == "int":
+                sql = "INT PRIMARY KEY"
+            elif t == "bigint":
+                sql = "BIGINT PRIMARY KEY"
+            elif t == "varchar":
+                sql = "VARCHAR(" + str(max_length) + ") PRIMARY KEY"
+            else:
+                sql = "VARCHAR(255) PRIMARY KEY"
+            return sql
+
+        if t == "int" or t == "integer":
+            sql = "INT"
+        elif t == "bigint":
+            sql = "BIGINT"
+        elif t == "smallint":
+            sql = "SMALLINT"
+        elif t == "tinyint":
+            sql = "TINYINT"
+        elif t == "mediumint":
+            sql = "MEDIUMINT"
+        elif t == "varchar":
+            sql = "VARCHAR(" + str(max_length) + ")"
+        elif t == "char":
+            sql = "CHAR(" + str(max_length) + ")"
+        elif t == "text":
+            sql = "TEXT"
+        elif t == "mediumtext":
+            sql = "MEDIUMTEXT"
+        elif t == "longtext":
+            sql = "LONGTEXT"
+        elif t == "bool" or t == "boolean":
+            sql = "TINYINT(1)"
+        elif t == "float":
+            sql = "FLOAT"
+        elif t == "double":
+            sql = "DOUBLE"
+        elif t == "decimal" or t == "numeric":
+            sql = "DECIMAL(10, 2)"
+        elif t == "datetime":
+            sql = "DATETIME"
+        elif t == "timestamp":
+            sql = "TIMESTAMP"
+        elif t == "date":
+            sql = "DATE"
+        elif t == "time":
+            sql = "TIME"
+        elif t == "year":
+            sql = "YEAR"
+        elif t == "json":
+            sql = "JSON"
+        elif t == "blob":
+            sql = "BLOB"
+        else:
+            sql = "VARCHAR(" + str(max_length) + ")"
+
+        if not nullable:
+            sql += " NOT NULL"
+        return sql
+
+    def table_suffix(self) -> str:
+        return " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+    def supports_returning(self) -> bool:
+        return False
+
+
+class PostgreSQLDialect(Dialect):
+    def __init__(self):
+        super().__init__("postgresql")
+
+    def quote_identifier(self, ident: str) -> str:
+        if "." in ident:
+            parts = ident.split(".")
+            quoted = list[str]()
+            for i in range(len(parts)):
+                p = parts[i].replace('"', '""')
+                quoted.append('"' + p + '"')
+            return ".".join(quoted)
+        return '"' + ident.replace('"', '""') + '"'
+
+    def placeholder(self, idx: int) -> str:
+        # idx is 1-based index: $1, $2, $3...
+        return "$" + str(idx)
+
+    def limit_offset(self, limit: int, offset: int) -> str:
+        if limit < 0:
+            return ""
+        sql = " LIMIT " + str(limit)
+        if offset > 0:
+            sql += " OFFSET " + str(offset)
+        return sql
+
+    def type_to_sql(
+        self,
+        type_name: str,
+        max_length: int = 255,
+        is_pk: bool = False,
+        auto_increment: bool = False,
+        nullable: bool = True
+    ) -> str:
+        t = type_name.lower()
+        if is_pk and auto_increment:
+            if t == "bigint":
+                return "BIGSERIAL PRIMARY KEY"
+            return "SERIAL PRIMARY KEY"
+        elif is_pk:
+            if t == "int":
+                return "INTEGER PRIMARY KEY"
+            elif t == "bigint":
+                return "BIGINT PRIMARY KEY"
+            elif t == "varchar":
+                return "VARCHAR(" + str(max_length) + ") PRIMARY KEY"
+            else:
+                return "VARCHAR(255) PRIMARY KEY"
+
+        sql = ""
+        if t == "int" or t == "integer" or t == "mediumint":
+            sql = "INTEGER"
+        elif t == "bigint":
+            sql = "BIGINT"
+        elif t == "smallint" or t == "tinyint":
+            sql = "SMALLINT"
+        elif t == "varchar":
+            sql = "VARCHAR(" + str(max_length) + ")"
+        elif t == "char":
+            sql = "CHAR(" + str(max_length) + ")"
+        elif t == "text" or t == "mediumtext" or t == "longtext":
+            sql = "TEXT"
+        elif t == "bool" or t == "boolean":
+            sql = "BOOLEAN"
+        elif t == "float":
+            sql = "REAL"
+        elif t == "double":
+            sql = "DOUBLE PRECISION"
+        elif t == "decimal" or t == "numeric":
+            sql = "NUMERIC(10, 2)"
+        elif t == "datetime":
+            sql = "TIMESTAMP"
+        elif t == "timestamp":
+            sql = "TIMESTAMPTZ"
+        elif t == "date":
+            sql = "DATE"
+        elif t == "time":
+            sql = "TIME"
+        elif t == "year":
+            sql = "SMALLINT"
+        elif t == "json":
+            sql = "JSONB"
+        elif t == "blob":
+            sql = "BYTEA"
+        else:
+            sql = "VARCHAR(" + str(max_length) + ")"
+
+        if not nullable:
+            sql += " NOT NULL"
+        return sql
+
+    def table_suffix(self) -> str:
+        return ""
+
+    def supports_returning(self) -> bool:
+        return True
+
+
+# Singleton Dialect instances
+MYSQL_DIALECT = MySQLDialect()
+POSTGRESQL_DIALECT = PostgreSQLDialect()
+
+def get_dialect(name: str) -> Dialect:
+    n = name.lower()
+    if n == "postgres" or n == "postgresql" or n == "pg":
+        return POSTGRESQL_DIALECT
+    return MYSQL_DIALECT

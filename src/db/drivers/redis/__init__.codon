@@ -1,0 +1,115 @@
+# Pure Native High-Performance Redis Driver for Codon Web
+# Dual Engine: Synchronous Blocking + Epoll Asynchronous Streams
+
+from typing import Tuple
+from src.db.drivers.redis.errors import (
+    RedisError,
+    RedisConnectionError,
+    RedisCommandError,
+    RedisPoolError,
+    RedisTimeoutError,
+    RedisLockError
+)
+from src.db.drivers.redis.protocol import (
+    RedisValue,
+    encode_command,
+    SyncSocketReader,
+    parse_resp_sync,
+    parse_resp_async
+)
+from src.db.drivers.redis.connection import (
+    RedisConnection
+)
+from src.db.drivers.redis.async_connection import (
+    AsyncRedisConnection,
+    connect_redis_async
+)
+from src.db.drivers.redis.pool import (
+    RedisPool,
+    PooledRedisConnection
+)
+from src.db.drivers.redis.async_pool import (
+    AsyncRedisPool,
+    AsyncPooledRedisConnection
+)
+from src.db.drivers.redis.pipeline import (
+    RedisPipeline,
+    AsyncRedisPipeline
+)
+from src.db.drivers.redis.lock import (
+    AsyncRedisLock
+)
+
+# Ergonomic aliases
+Redis = RedisConnection
+AsyncRedis = AsyncRedisConnection
+
+def parse_redis_url(url: str) -> Tuple[str, int, str, int]:
+    """
+    Parses a Redis connection string in the format: redis://[:password@]host[:port][/db]
+    Returns (host, port, password, db) tuple.
+    """
+    clean_url = url
+    if clean_url.startswith("redis://"):
+        clean_url = clean_url[8:]
+    elif clean_url.startswith("rediss://"):
+        clean_url = clean_url[9:]
+
+    db = 0
+    slash_idx = clean_url.rfind("/")
+    if slash_idx >= 0:
+        db_str = clean_url[slash_idx + 1:]
+        if len(db_str) > 0:
+            db = int(db_str)
+        clean_url = clean_url[:slash_idx]
+
+    password = ""
+    at_idx = clean_url.find("@")
+    if at_idx >= 0:
+        auth_part = clean_url[:at_idx]
+        clean_url = clean_url[at_idx + 1:]
+        colon_idx = auth_part.find(":")
+        if colon_idx >= 0:
+            password = auth_part[colon_idx + 1:]
+        else:
+            password = auth_part
+
+    host = "127.0.0.1"
+    port = 6379
+    colon_idx = clean_url.find(":")
+    if colon_idx >= 0:
+        host = clean_url[:colon_idx]
+        p_str = clean_url[colon_idx + 1:]
+        if len(p_str) > 0:
+            port = int(p_str)
+    else:
+        if len(clean_url) > 0:
+            host = clean_url
+
+    return (host, port, password, db)
+
+
+def connect_redis(
+    host: str = "127.0.0.1",
+    port: int = 6379,
+    password: str = "",
+    db: int = 0,
+    timeout_sec: float = 5.0
+) -> RedisConnection:
+    """Synchronously creates and connects a RedisConnection."""
+    conn = RedisConnection(host=host, port=port, password=password, db=db, timeout_sec=timeout_sec)
+    if not conn.connect():
+        raise RedisConnectionError(f"Could not connect to Redis at {host}:{port}")
+    return conn
+
+
+def connect_redis_from_url(url: str, timeout_sec: float = 5.0) -> RedisConnection:
+    """Connects to Redis using a standard redis:// URL."""
+    host, port, password, db = parse_redis_url(url)
+    return connect_redis(host=host, port=port, password=password, db=db, timeout_sec=timeout_sec)
+
+
+async def connect_redis_async_from_url(url: str, timeout_sec: float = 5.0):
+    """Connects asynchronously to Redis using a standard redis:// URL."""
+    host, port, password, db = parse_redis_url(url)
+    return await connect_redis_async(host=host, port=port, password=password, db=db, timeout_sec=timeout_sec)

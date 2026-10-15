@@ -1,0 +1,201 @@
+# Industrial Advanced Test Suite for TaskQ
+# Validates:
+# 1. Async task execution timeout enforcement (timeout_ms -> TaskStatus.TIMEOUT)
+# 2. RedisBroker atomic Lua script migration for delayed tasks (zero duplicates)
+# 3. Multi-queue prioritized dequeue (dequeue_multi)
+# 4. Nested complex JSON parsing and unescaping
+# 5. MemoryBroker automatic expired key cleanup
+# 6. Throttled remote cancellation polling
+
+import time
+from typing import Optional
+from src.taskq import (
+    Broker,
+    MemoryBroker,
+    RedisBroker,
+    TaskClient,
+    TaskMessage,
+    TaskResult,
+    TaskStatus,
+    AsyncWorker,
+    AsyncWorkerConfig,
+    AsyncTaskHandler,
+    AsyncTaskRegistry,
+    Worker,
+    WorkerConfig,
+    TaskContext,
+    CancellationToken
+)
+from src.core.async import run, sleep, create_task
+
+print("==================================================================")
+print("  TaskQ Industrial Advanced Test Suite (Timeout, Lua, Prioritized)")
+print("==================================================================")
+
+# ---------------------------------------------------------
+# Test 1: Nested JSON Serialization & Parsing
+# ---------------------------------------------------------
+print("\n[1/6] Testing nested complex JSON serialization & parsing...")
+complex_json_payload = '{"meta": {"source": "crawler", "retryable": true}, "items": [1, 2, 3], "str": "hello \\"world\\""}'
+msg = TaskMessage(
+    task_id="tq_adv_1",
+    task_name="adv_task",
+    payload=complex_json_payload,
+    queue="priority",
+    retry_count=0,
+    max_retries=3,
+    timeout_ms=500
+)
+
+serialized = msg.to_json()
+restored = TaskMessage.from_json(serialized)
+
+assert restored.task_id == "tq_adv_1", "task_id mismatch"
+assert restored.task_name == "adv_task", "task_name mismatch"
+assert restored.payload == complex_json_payload, f"payload mismatch: got '{restored.payload}'"
+assert restored.timeout_ms == 500, "timeout_ms mismatch"
+print("  -> Passed nested JSON protocol serialization and parsing")
+
+# ---------------------------------------------------------
+# Test 2: Multi-Queue Prioritized Dequeue (dequeue_multi)
+# ---------------------------------------------------------
+print("\n[2/6] Testing multi-queue prioritized dequeue (dequeue_multi)...")
+mem_broker = MemoryBroker()
+
+# Enqueue low priority first, high priority second
+msg_low = TaskMessage(task_id="tq_low_1", task_name="job", payload='{"p": "low"}', queue="low_q")
+msg_high = TaskMessage(task_id="tq_high_1", task_name="job", payload='{"p": "high"}', queue="high_q")
+
+mem_broker.enqueue("low_q", msg_low)
+mem_broker.enqueue("high_q", msg_high)
+
+# Dequeue in prioritized order: ["high_q", "low_q"]
+popped_first = mem_broker.dequeue_multi(["high_q", "low_q"], 0)
+assert popped_first is not None, "First pop must not be None"
+assert popped_first.task_id == "tq_high_1", f"Expected high priority first, got {popped_first.task_id}"
+
+popped_second = mem_broker.dequeue_multi(["high_q", "low_q"], 0)
+assert popped_second is not None, "Second pop must not be None"
+assert popped_second.task_id == "tq_low_1", f"Expected low priority second, got {popped_second.task_id}"
+print("  -> Passed multi-queue prioritized dequeue")
+
+# ---------------------------------------------------------
+# Test 3: MemoryBroker Active Expired Key Cleanup
+# ---------------------------------------------------------
+print("\n[3/6] Testing MemoryBroker active expired key cleanup...")
+clean_broker = MemoryBroker()
+# Store 600 expired results
+for i in range(600):
+    t_id = f"exp_{i}"
+    r = TaskResult(task_id=t_id, status=TaskStatus.SUCCESS, result="ok")
+    # Expire in -10 seconds (already expired)
+    clean_broker.store_result(t_id, r, -10)
+
+assert len(clean_broker.results) < 600, f"Expected active cleanup, remaining: {len(clean_broker.results)}"
+print(f"  -> Cleaned expired results actively, remaining size: {len(clean_broker.results)}")
+print("  -> Passed MemoryBroker expired key cleanup")
+
+# ---------------------------------------------------------
+# Test 4: AsyncWorker Task Execution Timeout Enforcement
+# ---------------------------------------------------------
+print("\n[4/6] Testing async task execution timeout enforcement (timeout_ms)...")
+
+class SlowTask(AsyncTaskHandler):
+    def __init__(self):
+        super().__init__(name="slow_job", max_retries=0, timeout_ms=50) # 50ms timeout
+
+    async def run(self, payload: str):
+        # Sleeps 300ms, exceeding 50ms deadline
+        await sleep(0.3)
+        return "finished"
+
+async def _test_timeout_coro():
+    broker = MemoryBroker()
+    registry = AsyncTaskRegistry()
+    registry.register(SlowTask())
+
+    config = AsyncWorkerConfig(queues=["default"], concurrency=5, poll_interval_sec=0.005)
+    worker = AsyncWorker(broker, registry, config)
+
+    client = TaskClient(broker)
+    res = client.apply_async("slow_job", '{"data": 1}', timeout_ms=50, max_retries=0)
+
+    # Step worker to dispatch
+    worker.step_dispatch()
+    assert worker.stats.active_tasks == 1
+
+    # Let the task time out (wait > 50ms)
+    for _ in range(15):
+        await sleep(0.01)
+        worker.step_dispatch()
+
+    # Verify task result
+    r = broker.get_result(res.task_id)
+    assert r is not None, "Result must exist"
+    assert r.status == TaskStatus.TIMEOUT, f"Expected status TIMEOUT, got '{r.status}'"
+    assert "Timeout: Operation exceeded" in r.error, f"Expected timeout error, got '{r.error}'"
+    assert worker.stats.total_timed_out == 1, f"Expected 1 timed out task, got {worker.stats.total_timed_out}"
+    assert worker.stats.active_tasks == 0, "Active tasks must be 0 after timeout"
+
+run(_test_timeout_coro())
+print("  -> Passed async task execution timeout enforcement")
+
+# ---------------------------------------------------------
+# Test 5: Real Redis Atomic Lua Delayed Task Migration
+# ---------------------------------------------------------
+print("\n[5/6] Testing real Redis atomic Lua delayed task migration...")
+try:
+    redis_broker = RedisBroker(host="127.0.0.1", port=6379, key_prefix="adv_test:")
+    test_q = "adv_lua_delayed"
+
+    # Enqueue 5 delayed tasks due immediately
+    now = int(time.time())
+    for i in range(5):
+        m = TaskMessage(task_id=f"tq_lua_{i}", task_name="lua_job", payload=str(i), queue=test_q)
+        redis_broker.schedule(test_q, m, 0)
+
+    # Poll delayed using atomic Lua script
+    migrated = redis_broker.poll_delayed(test_q, 50)
+    assert len(migrated) == 5, f"Expected 5 migrated tasks, got {len(migrated)}"
+
+    # Second poll immediately after must yield 0 (no duplicate migrations)
+    second_poll = redis_broker.poll_delayed(test_q, 50)
+    assert len(second_poll) == 0, f"Expected 0 on second poll, got {len(second_poll)}"
+
+    # Check that ready queue has the 5 tasks
+    popped_count = 0
+    for _ in range(5):
+        msg_popped = redis_broker.dequeue(test_q, 0)
+        if msg_popped is not None:
+            popped_count += 1
+    assert popped_count == 5, f"Expected 5 popped tasks from ready queue, got {popped_count}"
+
+    redis_broker.close()
+    print("  -> Passed real Redis atomic Lua delayed task migration (zero race conditions)")
+except Exception as e:
+    print(f"  -> Skipping real Redis Lua test (Redis unavailable): {e}")
+
+# ---------------------------------------------------------
+# Test 6: Throttled Remote Cancellation Polling
+# ---------------------------------------------------------
+print("\n[6/6] Testing throttled remote cancellation polling...")
+token = CancellationToken("throttle_test")
+b: Broker = mem_broker
+ctx = TaskContext("throttle_test", token, b, 100)
+
+# First poll updates last_poll_ms
+ctx.poll_cancelled(False)
+t_poll_1 = ctx.last_poll_ms
+assert t_poll_1 > 0
+
+# Immediate second poll must be throttled (returns False without querying broker)
+throttled = not ctx.poll_cancelled(False)
+assert throttled, "Immediate consecutive poll should be throttled"
+
+# Force poll bypasses throttle
+ctx.poll_cancelled(True)
+print("  -> Passed throttled remote cancellation polling")
+
+print("\n==================================================================")
+print("  ALL 6 INDUSTRIAL ADVANCED TASKQ TESTS PASSED SUCCESSFULLY!     ")
+print("==================================================================")

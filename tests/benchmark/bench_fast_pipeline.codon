@@ -1,0 +1,99 @@
+import time
+from src.memory.buffer import ByteBuffer
+from src.http.response import Response
+from src.framework.radix import RadixRouter
+from src.framework.route import SimpleHandler
+from src.http.request import Request
+from src.http.method import METHOD_GET
+
+def bench_response_serialization():
+    print("=== Benchmark 1: Response Serialization (100,000 ops) ===")
+    resp = Response.text("Hello, CodonWeb World!")
+    buf = ByteBuffer(4096)
+    
+    # Warmup
+    for _ in range(5000):
+        buf.reset()
+        resp.serialize(buf, keep_alive=True)
+    
+    start = time.time()
+    iters = 100000
+    for _ in range(iters):
+        buf.reset()
+        resp.serialize(buf, keep_alive=True)
+    cost = time.time() - start
+    ops = float(iters) / cost
+    print("  Time: " + str(cost * 1000.0) + " ms | Throughput: " + str(int(ops)) + " ops/sec")
+    # Verify content
+    s = buf.to_str()
+    assert "HTTP/1.1 200 OK\r\n" in s
+    assert "Date:" in s
+    assert "Content-Length: 22\r\n" in s
+
+def bench_router_dispatch():
+    print("=== Benchmark 2: Static Route Fast-Path Dispatch (500,000 ops) ===")
+    router = RadixRouter()
+    
+    def hello_handler(req: Request) -> Response:
+        return Response.text("OK")
+    
+    router.add_route(METHOD_GET, "/api/v1/health", SimpleHandler(hello_handler))
+    
+    req = Request()
+    req.method = METHOD_GET
+    raw_path = "/api/v1/health"
+    req.path = ByteBuffer(64).readable_slice() # mock
+    buf = ByteBuffer(64)
+    buf.append_str(raw_path)
+    req.path = buf.readable_slice()
+    
+    # Warmup
+    for _ in range(10000):
+        res = router.dispatch(req)
+    
+    start = time.time()
+    iters = 500000
+    for _ in range(iters):
+        res = router.dispatch(req)
+    cost = time.time() - start
+    ops = float(iters) / cost
+    print("  Time: " + str(cost * 1000.0) + " ms | Throughput: " + str(int(ops)) + " ops/sec")
+
+from src.http.parser import HttpParser, PARSE_OK
+
+def bench_http_parser():
+    print("=== Benchmark 3: picohttpparser SIMD HTTP Parsing (200,000 ops) ===")
+    raw_req = "GET /api/v1/resource?id=123&sort=desc HTTP/1.1\r\nHost: example.com\r\nUser-Agent: codon-bench\r\nAccept: application/json\r\nConnection: keep-alive\r\n\r\n"
+    buf = ByteBuffer(512)
+    buf.append_str(raw_req)
+    req_slice = buf.readable_slice()
+
+    parser = HttpParser()
+    req = Request()
+
+    # Warmup
+    for _ in range(10000):
+        req.reset()
+        res, consumed = parser.parse(req_slice, req)
+
+    start = time.time()
+    iters = 200000
+    for _ in range(iters):
+        req.reset()
+        res, consumed = parser.parse(req_slice, req)
+    cost = time.time() - start
+    ops = float(iters) / cost
+    print("  Time: " + str(cost * 1000.0) + " ms | Throughput: " + str(int(ops)) + " ops/sec")
+    assert res == PARSE_OK
+    assert req.path.equals_ascii("/api/v1/resource")
+    assert req.query.equals_ascii("id=123&sort=desc")
+    assert req.keep_alive == True
+
+def main():
+    bench_response_serialization()
+    bench_router_dispatch()
+    bench_http_parser()
+    print("All Pipeline Benchmarks Completed Successfully!")
+
+main()
+

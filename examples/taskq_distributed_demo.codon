@@ -1,0 +1,110 @@
+# TaskQ Distributed Background Task Queue - Real-World Example
+# Demonstrates:
+# 1. Defining tasks with @task
+# 2. Producer dispatching async tasks & delayed tasks
+# 3. Consumer Worker engine processing with automatic retries
+
+import time
+from src.taskq import (
+    task,
+    TaskClient,
+    Worker,
+    WorkerConfig,
+    MemoryBroker,
+    RedisBroker,
+    GLOBAL_TASK_REGISTRY
+)
+
+# ----------------- 1. Define Background Tasks -----------------
+
+@task("email:send_welcome", queue="notifications", max_retries=3)
+def send_welcome_email(payload: str) -> str:
+    print(f" [Email Service] Sending welcome email with payload: {payload}")
+    # Simulate processing
+    return '{"status": "delivered", "provider": "smtp"}'
+
+@task("order:auto_cancel", queue="orders", max_retries=2)
+def auto_cancel_unpaid_order(payload: str) -> str:
+    print(f"⏰ [Order Service] Checking unpaid order status for: {payload}")
+    return '{"order_status": "cancelled", "released_inventory": true}'
+
+@task("report:generate_pdf", queue="compute", max_retries=1)
+def generate_pdf_report(payload: str) -> str:
+    print(f" [Report Service] Generating PDF report for: {payload}")
+    return '{"download_url": "https://cdn.example.com/reports/2026-q3.pdf"}'
+
+
+# ----------------- 2. Producer Workflow -----------------
+
+def run_demo():
+    print("================================================================")
+    print("        Codon TaskQ - Distributed Background Task Engine        ")
+    print("================================================================")
+
+    # In production, use RedisBroker(host="127.0.0.1", port=6379)
+    # Here we use MemoryBroker for standalone demonstration
+    broker = MemoryBroker()
+    client = TaskClient(broker=broker, default_queue="notifications")
+
+    print("\n--- [Producer] Submitting Asynchronous Tasks ---")
+
+    # A. Fire-and-forget task
+    task_id1 = client.delay("email:send_welcome", '{"user_id": 1001, "email": "alice@example.com"}')
+    print(f"-> Submitted Task 1 (ID: {task_id1})")
+
+    # B. Task requiring execution result
+    async_res = client.apply_async(
+        "report:generate_pdf",
+        '{"report_id": 888, "year": 2026}',
+        queue="compute"
+    )
+    print(f"-> Submitted Task 2 with Result Handle (ID: {async_res.task_id})")
+
+    # C. Delayed execution task (ETA 2 seconds)
+    delayed_res = client.apply_async(
+        "order:auto_cancel",
+        '{"order_id": 99999}',
+        queue="orders",
+        eta_sec=2
+    )
+    print(f"-> Submitted Task 3 Scheduled with ETA 2s (ID: {delayed_res.task_id})")
+
+
+    # ----------------- 3. Consumer Worker Workflow -----------------
+
+    print("\n--- [Worker] Initializing Consumer Engine ---")
+    worker = Worker(
+        broker=broker,
+        registry=GLOBAL_TASK_REGISTRY,
+        config=WorkerConfig(queues=["compute", "notifications", "orders"])
+    )
+
+    print("-> Worker processing active tasks...")
+    # Step 1: Process immediate tasks
+    while worker.step():
+        pass
+
+    # Verify task 2 result
+    res2 = async_res.get(timeout_sec=0.1)
+    if res2 is not None:
+        print(f" [Result Backend] Task 2 result received: {res2.result}")
+
+    print("\n-> Waiting 2 seconds for scheduled delayed task (Task 3)...")
+    time.sleep(2.05)
+
+    # Step 2: Process scheduled task once ETA elapses
+    worker.step()
+    res3 = delayed_res.get(timeout_sec=0.1)
+    if res3 is not None:
+        print(f"⏰ [Result Backend] Task 3 result received: {res3.result}")
+
+    print("\n--- [Worker Stats] ---")
+    print(f"Total Received:        {worker.stats.total_received}")
+    print(f"Total Succeeded:       {worker.stats.total_succeeded}")
+    print(f"Total Failed:          {worker.stats.total_failed}")
+    print(f"Total Retried:         {worker.stats.total_retried}")
+    print(f"Total Dead-Lettered:   {worker.stats.total_dead_lettered}")
+    print("\n Demo completed successfully!")
+
+if __name__ == "__main__":
+    run_demo()

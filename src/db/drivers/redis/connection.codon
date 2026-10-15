@@ -1,0 +1,392 @@
+# Synchronous POSIX Socket Redis Client for Codon
+
+import time
+from typing import Optional, List, Tuple
+from src.os.socket import Socket
+from src.memory.buffer import ByteBuffer
+from src.db.drivers.redis.errors import RedisConnectionError, RedisCommandError
+from src.db.drivers.redis.protocol import (
+    RedisValue,
+    encode_command,
+    encode_command_to_buf,
+    SyncSocketReader,
+    parse_resp_sync
+)
+
+class RedisConnection:
+    host: str
+    port: int
+    password: str
+    db: int
+    timeout_sec: float
+    sock: Socket
+    reader: Optional[SyncSocketReader]
+    is_connected: bool
+    last_active_time: float
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 6379,
+        password: str = "",
+        db: int = 0,
+        timeout_sec: float = 5.0
+    ):
+        self.host = host
+        self.port = port
+        self.password = password
+        self.db = db
+        self.timeout_sec = timeout_sec
+        self.sock = Socket(i32(-1))
+        self.reader = None
+        self.is_connected = False
+        self.last_active_time = 0.0
+
+    def connect(self) -> bool:
+        self.close()
+        try:
+            self.sock = Socket.create_tcp_client(blocking=True)
+            self.sock.set_tcp_nodelay(True)
+            if not self.sock.connect(self.host, self.port):
+                self.close()
+                return False
+
+            self.reader = SyncSocketReader(self.sock)
+            self.is_connected = True
+            self.last_active_time = time.time()
+
+            # AUTH if password provided
+            if len(self.password) > 0:
+                res = self.execute(["AUTH", self.password], raise_on_error=False)
+                if res.val_type == "error":
+                    self.close()
+                    raise RedisCommandError(f"AUTH failed: {res.str_val}")
+
+            # SELECT DB if non-zero
+            if self.db != 0:
+                res = self.execute(["SELECT", str(self.db)], raise_on_error=False)
+                if res.val_type == "error":
+                    self.close()
+                    raise RedisCommandError(f"SELECT DB {self.db} failed: {res.str_val}")
+
+            return True
+        except RedisCommandError:
+            self.close()
+            raise
+        except Exception:
+            self.close()
+            return False
+
+    def ensure_connected(self) -> bool:
+        if not self.is_connected or self.sock.is_closed:
+            return self.connect()
+        return True
+
+    def close(self) -> None:
+        if self.is_connected:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.is_connected = False
+        self.sock = Socket(i32(-1))
+        self.reader = None
+
+    def _execute_once(self, cmd_args: List[str]) -> RedisValue:
+        if not self.ensure_connected() or self.reader is None:
+            raise RedisConnectionError(f"Failed to connect to Redis server at {self.host}:{self.port}")
+
+        buf = ByteBuffer(512)
+        encode_command_to_buf(cmd_args, buf)
+        rslice = buf.readable_slice()
+        sent = self.sock.send_raw(rslice.ptr, rslice.len)
+        if sent < 0:
+            self.close()
+            raise RedisConnectionError("Failed to transmit command frame to socket")
+
+        val = parse_resp_sync(self.reader)
+        self.last_active_time = time.time()
+        return val
+
+    def execute(self, cmd_args: List[str], raise_on_error: bool = True) -> RedisValue:
+        """Executes a command with automatic retry upon broken connection."""
+        val = RedisValue("nil")
+        try:
+            val = self._execute_once(cmd_args)
+        except RedisConnectionError:
+            # Reconnect once on broken pipe or server idle timeout
+            self.close()
+            if self.connect():
+                val = self._execute_once(cmd_args)
+            else:
+                raise
+        if raise_on_error:
+            val.raise_if_error()
+        return val
+
+    # -------------------------------------------------------------
+    # High-Level Core Commands
+    # -------------------------------------------------------------
+    def ping(self) -> bool:
+        res = self.execute(["PING"])
+        return res.as_str() == "PONG"
+
+    def get(self, key: str) -> Optional[str]:
+        res = self.execute(["GET", key])
+        if res.is_nil():
+            return None
+        return res.as_str()
+
+    def set(self, key: str, val: str, ex: int = 0, px: int = 0, nx: bool = False, xx: bool = False) -> bool:
+        cmd: List[str] = ["SET", key, val]
+        if ex > 0:
+            cmd.append("EX")
+            cmd.append(str(ex))
+        elif px > 0:
+            cmd.append("PX")
+            cmd.append(str(px))
+        if nx:
+            cmd.append("NX")
+        elif xx:
+            cmd.append("XX")
+
+        res = self.execute(cmd)
+        return res.as_str() == "OK"
+
+    def setex(self, key: str, sec: int, val: str) -> bool:
+        res = self.execute(["SETEX", key, str(sec), val])
+        return res.as_str() == "OK"
+
+    def setnx(self, key: str, val: str) -> bool:
+        res = self.execute(["SETNX", key, val])
+        return res.as_int() == 1
+
+    def del_key(self, key: str) -> int:
+        return self.del_keys([key])
+
+    def del_keys(self, keys: List[str]) -> int:
+        if len(keys) == 0:
+            return 0
+        cmd: List[str] = ["DEL"]
+        for i in range(len(keys)):
+            cmd.append(keys[i])
+        res = self.execute(cmd)
+        return res.as_int()
+
+    def exists(self, key: str) -> bool:
+        res = self.execute(["EXISTS", key])
+        return res.as_int() > 0
+
+    def incr(self, key: str) -> int:
+        res = self.execute(["INCR", key])
+        return res.as_int()
+
+    def decr(self, key: str) -> int:
+        res = self.execute(["DECR", key])
+        return res.as_int()
+
+    def expire(self, key: str, sec: int) -> bool:
+        res = self.execute(["EXPIRE", key, str(sec)])
+        return res.as_int() == 1
+
+    def ttl(self, key: str) -> int:
+        res = self.execute(["TTL", key])
+        return res.as_int()
+
+    # ----------------- Hashes -----------------
+    def hget(self, name: str, key: str) -> Optional[str]:
+        res = self.execute(["HGET", name, key])
+        if res.is_nil():
+            return None
+        return res.as_str()
+
+    def hset(self, name: str, key: str, val: str) -> int:
+        res = self.execute(["HSET", name, key, val])
+        return res.as_int()
+
+    def hgetall(self, name: str) -> dict[str, str]:
+        res = self.execute(["HGETALL", name])
+        return res.as_dict()
+
+    def hdel(self, name: str, keys: List[str]) -> int:
+        if len(keys) == 0:
+            return 0
+        cmd: List[str] = ["HDEL", name]
+        for i in range(len(keys)):
+            cmd.append(keys[i])
+        res = self.execute(cmd)
+        return res.as_int()
+
+    def hexists(self, name: str, key: str) -> bool:
+        res = self.execute(["HEXISTS", name, key])
+        return res.as_int() == 1
+
+    # ----------------- Lists -----------------
+    def lpush(self, name: str, values: List[str]) -> int:
+        if len(values) == 0:
+            return 0
+        cmd: List[str] = ["LPUSH", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        res = self.execute(cmd)
+        return res.as_int()
+
+    def rpush(self, name: str, values: List[str]) -> int:
+        if len(values) == 0:
+            return 0
+        cmd: List[str] = ["RPUSH", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        res = self.execute(cmd)
+        return res.as_int()
+
+    def lpop(self, name: str) -> Optional[str]:
+        res = self.execute(["LPOP", name])
+        if res.is_nil():
+            return None
+        return res.as_str()
+
+    def rpop(self, name: str) -> Optional[str]:
+        res = self.execute(["RPOP", name])
+        if res.is_nil():
+            return None
+        return res.as_str()
+
+    def brpop(self, keys: List[str], timeout_sec: int = 1) -> Optional[Tuple[str, str]]:
+        if len(keys) == 0:
+            return None
+        cmd: List[str] = ["BRPOP"]
+        for i in range(len(keys)):
+            cmd.append(keys[i])
+        cmd.append(str(timeout_sec))
+
+        res = self.execute(cmd)
+        if res.is_nil() or len(res.arr_val) < 2:
+            return None
+        return (res.arr_val[0].as_str(), res.arr_val[1].as_str())
+
+    def llen(self, name: str) -> int:
+        res = self.execute(["LLEN", name])
+        return res.as_int()
+
+    def lrange(self, name: str, start: int, stop: int) -> List[str]:
+        res = self.execute(["LRANGE", name, str(start), str(stop)])
+        return res.as_list()
+
+    # ----------------- Sets -----------------
+    def sadd(self, name: str, values: List[str]) -> int:
+        if len(values) == 0:
+            return 0
+        cmd: List[str] = ["SADD", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        res = self.execute(cmd)
+        return res.as_int()
+
+    def srem(self, name: str, values: List[str]) -> int:
+        if len(values) == 0:
+            return 0
+        cmd: List[str] = ["SREM", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        res = self.execute(cmd)
+        return res.as_int()
+
+    def smembers(self, name: str) -> List[str]:
+        res = self.execute(["SMEMBERS", name])
+        return res.as_list()
+
+    def sismember(self, name: str, val: str) -> bool:
+        res = self.execute(["SISMEMBER", name, val])
+        return res.as_int() == 1
+
+    def scard(self, name: str) -> int:
+        res = self.execute(["SCARD", name])
+        return res.as_int()
+
+    # ----------------- Sorted Sets (ZSets) -----------------
+    def zadd(self, name: str, score: float, member: str) -> int:
+        res = self.execute(["ZADD", name, str(score), member])
+        return res.as_int()
+
+    def zrem(self, name: str, members: List[str]) -> int:
+        if len(members) == 0:
+            return 0
+        cmd: List[str] = ["ZREM", name]
+        for i in range(len(members)):
+            cmd.append(members[i])
+        res = self.execute(cmd)
+        return res.as_int()
+
+    def zcard(self, name: str) -> int:
+        res = self.execute(["ZCARD", name])
+        return res.as_int()
+
+    def zrange(self, name: str, start: int, stop: int) -> List[str]:
+        res = self.execute(["ZRANGE", name, str(start), str(stop)])
+        return res.as_list()
+
+    def zrangebyscore(self, name: str, min_score: float, max_score: float, offset: int = -1, count: int = -1) -> List[str]:
+        cmd: List[str] = ["ZRANGEBYSCORE", name, str(min_score), str(max_score)]
+        if offset >= 0 and count > 0:
+            cmd.append("LIMIT")
+            cmd.append(str(offset))
+            cmd.append(str(count))
+        res = self.execute(cmd)
+        return res.as_list()
+
+    # ----------------- Scripting & Server -----------------
+    def eval_script(self, script: str, keys: List[str], args: List[str]) -> RedisValue:
+        cmd: List[str] = ["EVAL", script, str(len(keys))]
+        for i in range(len(keys)):
+            cmd.append(keys[i])
+        for i in range(len(args)):
+            cmd.append(args[i])
+        return self.execute(cmd)
+
+    def select(self, db_idx: int) -> bool:
+        res = self.execute(["SELECT", str(db_idx)])
+        if res.as_str() == "OK":
+            self.db = db_idx
+            return True
+        return False
+
+    def dbsize(self) -> int:
+        res = self.execute(["DBSIZE"])
+        return res.as_int()
+
+    def flushdb(self) -> bool:
+        res = self.execute(["FLUSHDB"])
+        return res.as_str() == "OK"
+
+    def keys(self, pattern: str = "*") -> List[str]:
+        res = self.execute(["KEYS", pattern])
+        return res.as_list()
+
+    def mget(self, keys: List[str]) -> List[Optional[str]]:
+        if len(keys) == 0:
+            return List[Optional[str]]()
+        cmd: List[str] = ["MGET"]
+        for i in range(len(keys)):
+            cmd.append(keys[i])
+        res = self.execute(cmd)
+        out: List[Optional[str]] = List[Optional[str]]()
+        for i in range(len(res.arr_val)):
+            item = res.arr_val[i]
+            if item.is_nil():
+                out.append(None)
+            else:
+                out.append(item.as_str())
+        return out
+
+    def lrange(self, name: str, start: int, stop: int) -> List[str]:
+        res = self.execute(["LRANGE", name, str(start), str(stop)])
+        return res.as_list()
+
+    def llen(self, name: str) -> int:
+        res = self.execute(["LLEN", name])
+        return res.as_int()
+
+    def sismember(self, name: str, value: str) -> bool:
+        res = self.execute(["SISMEMBER", name, value])
+        return res.as_int() == 1

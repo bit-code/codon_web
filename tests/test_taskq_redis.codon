@@ -1,0 +1,325 @@
+# Full-Lifecycle Production Test Suite for TaskQ with REAL Redis Server
+# Tests native Socket RESP2 protocol, sync/async tasks, delayed ETA, retries, DLQ, and automatic cancellation
+
+import time
+from src.taskq import (
+    RedisBroker,
+    TaskClient,
+    AsyncResult,
+    TaskMessage,
+    Worker,
+    WorkerConfig,
+    AsyncWorker,
+    AsyncWorkerConfig,
+    AsyncTaskHandler,
+    AsyncTaskRegistry,
+    TaskStatus,
+    TaskCancelledError,
+    TaskContext,
+    task,
+    GLOBAL_TASK_REGISTRY
+)
+from src.taskq.broker.redis import RedisConnection
+from src.core.async import run, sleep
+
+# ---------------------------------------------------------
+# Synchronous Tasks
+# ---------------------------------------------------------
+@task(name="redis_sync_add")
+def handle_add(payload: str) -> str:
+    # payload: '{"a": 100, "b": 250}'
+    return '{"sum": 350}'
+
+@task(name="redis_fail_op")
+def handle_fail(payload: str) -> str:
+    raise ValueError("Database connection failed")
+
+# ---------------------------------------------------------
+# Asynchronous Tasks
+# ---------------------------------------------------------
+class RedisAsyncCrawler(AsyncTaskHandler):
+    def __init__(self):
+        super().__init__(name="redis_crawler", max_retries=1)
+
+    async def run(self, payload: str):
+        # Non-blocking simulated network fetch
+        await sleep(0.05)
+        return '{"status": 200, "body": "crawled"}'
+
+class RedisLongRunningJob(AsyncTaskHandler):
+    stage2_executed: bool
+
+    def __init__(self):
+        super().__init__(name="redis_long_job", max_retries=1)
+        self.stage2_executed = False
+
+    async def run(self, payload: str):
+        # Phase 1: Wait for cancellation
+        await sleep(1.0)
+        # Phase 2: If cancelled automatically, this must NEVER execute!
+        self.stage2_executed = True
+        return '{"finished": true}'
+
+# ---------------------------------------------------------
+# Test Cases
+# ---------------------------------------------------------
+def test_1_redis_connectivity():
+    print("[1/6] Testing real Redis socket connection and RESP2 protocol...")
+    conn = RedisConnection(host="127.0.0.1", port=6379)
+    assert conn.connect(), "Failed to connect to real Redis at 127.0.0.1:6379"
+
+    pong = conn.execute(["PING"])
+    assert pong == "PONG", f"Expected PONG, got '{pong}'"
+
+    set_res = conn.execute(["SET", "taskq_test_ping", "hello_redis"])
+    assert set_res == "OK", f"Expected OK, got '{set_res}'"
+
+    get_val = conn.execute(["GET", "taskq_test_ping"])
+    assert get_val == "hello_redis", f"Expected hello_redis, got '{get_val}'"
+
+    conn.execute(["DEL", "taskq_test_ping"])
+    conn.close()
+    print("  -> Passed real Redis connectivity & RESP2 protocol")
+
+def test_2_sync_task_full_lifecycle():
+    print("[2/6] Testing sync task dispatch, Redis queueing, and result backend...")
+    prefix = "test_tq_sync:"
+    broker = RedisBroker(host="127.0.0.1", port=6379, key_prefix=prefix)
+    client = TaskClient(broker)
+    worker = Worker(broker, GLOBAL_TASK_REGISTRY, WorkerConfig(queues=["default"]))
+
+    # Dispatch sync task
+    res = client.apply_async("redis_sync_add", '{"a": 100, "b": 250}')
+    assert res.status() == TaskStatus.PENDING
+
+    # Verify queue length directly in Redis
+    conn = RedisConnection(host="127.0.0.1", port=6379)
+    q_len = conn.execute(["LLEN", prefix + "queue:default"])
+    assert int(q_len) >= 1
+
+    # Worker executes task from Redis
+    processed = worker.step()
+    assert processed
+    assert worker.stats.total_succeeded == 1
+
+    # Retrieve result from Redis backend
+    result = res.get(timeout_sec=1.0)
+    assert result is not None
+    assert result.status == TaskStatus.SUCCESS
+    assert result.result == '{"sum": 350}'
+    assert res.is_ready()
+
+    # Clean up Redis keys
+    conn.execute(["DEL", prefix + "queue:default", prefix + "result:" + res.task_id])
+    conn.close()
+    broker.close()
+    print("  -> Passed sync task full lifecycle with real Redis")
+
+def test_3_delayed_eta_scheduling():
+    print("[3/6] Testing delayed ETA task with real Redis ZSet...")
+    prefix = "test_tq_delay:"
+    broker = RedisBroker(host="127.0.0.1", port=6379, key_prefix=prefix)
+    client = TaskClient(broker)
+    worker = Worker(broker, GLOBAL_TASK_REGISTRY, WorkerConfig(queues=["default"]))
+
+    # Schedule task with 1-second delay
+    t_start = time.time()
+    res = client.apply_async("redis_sync_add", "{}", eta_sec=1)
+
+    # Immediately poll: task not ready yet
+    ready_tasks = broker.poll_delayed("default")
+    assert len(ready_tasks) == 0
+
+    # Sleep 1.2s to exceed ETA
+    time.sleep(1.2)
+
+    # Now poll: task should be moved from ZSet to queue
+    ready_tasks = broker.poll_delayed("default")
+    assert len(ready_tasks) == 1
+
+    # Worker executes the migrated task
+    processed = worker.step()
+    assert processed
+    result = res.get(timeout_sec=1.0)
+    assert result is not None
+    assert result.status == TaskStatus.SUCCESS
+
+    # Clean up
+    conn = RedisConnection(host="127.0.0.1", port=6379)
+    conn.execute(["DEL", prefix + "delayed:default", prefix + "result:" + res.task_id])
+    conn.close()
+    broker.close()
+    print("  -> Passed delayed ETA task with real Redis ZSet")
+
+def test_4_retry_and_dead_letter_queue():
+    print("[4/6] Testing retries and Dead-Letter Queue (DLQ) in real Redis...")
+    prefix = "test_tq_dlq:"
+    broker = RedisBroker(host="127.0.0.1", port=6379, key_prefix=prefix)
+    client = TaskClient(broker)
+    # retry_backoff_base_sec=1 for fast test execution
+    worker = Worker(
+        broker,
+        GLOBAL_TASK_REGISTRY,
+        WorkerConfig(queues=["default"], retry_backoff_base_sec=1)
+    )
+
+    # Enqueue failing task with max_retries=1
+    res = client.apply_async("redis_fail_op", "{}", max_retries=1)
+
+    # First attempt: fails and schedules retry
+    worker.step()
+    assert worker.stats.total_retried == 1
+
+    # Wait for retry delay (1s)
+    time.sleep(1.2)
+    broker.poll_delayed("default")
+
+    # Second attempt: retries exhausted -> routes to DLQ
+    worker.step()
+    assert worker.stats.total_failed == 1
+    assert worker.stats.total_dead_lettered == 1
+
+    # Verify message in Redis DLQ list
+    conn = RedisConnection(host="127.0.0.1", port=6379)
+    dlq_len = conn.execute(["LLEN", prefix + "dead:default"])
+    assert int(dlq_len) == 1
+
+    result = res.get(timeout_sec=0.5)
+    assert result is not None
+    assert result.status == TaskStatus.FAILURE
+
+    conn.execute(["DEL", prefix + "dead:default", prefix + "result:" + res.task_id])
+    conn.close()
+    broker.close()
+    print("  -> Passed retries and Dead-Letter Queue (DLQ) in real Redis")
+
+async def _test_5_concurrent_async_crawlers_coro():
+    print("[5/6] Testing 20 concurrent async crawlers over real Redis...")
+    prefix = "test_tq_async:"
+    broker = RedisBroker(host="127.0.0.1", port=6379, key_prefix=prefix)
+    client = TaskClient(broker)
+    registry = AsyncTaskRegistry()
+    crawler = RedisAsyncCrawler()
+    registry.register(crawler)
+    worker = AsyncWorker(
+        broker,
+        registry,
+        AsyncWorkerConfig(queues=["default"], concurrency=20)
+    )
+
+    # Concurrently enqueue 20 crawler tasks to real Redis
+    results: list[AsyncResult] = []
+    for i in range(20):
+        r = client.apply_async("redis_crawler", f'{{"url": "https://site_{i}.com"}}')
+        results.append(r)
+
+    # Verify Redis queue has 20 tasks
+    conn = RedisConnection(host="127.0.0.1", port=6379)
+    q_len = conn.execute(["LLEN", prefix + "queue:default"])
+    assert int(q_len) == 20
+
+    # Dispatch tasks into non-blocking coroutines
+    t0 = time.time()
+    for _ in range(50):
+        worker.step_dispatch()
+        await sleep(0.01)
+        if worker.stats.total_succeeded == 20:
+            break
+
+    elapsed = time.time() - t0
+    assert worker.stats.total_succeeded == 20
+    print(f"  -> 20 async tasks completed in {elapsed:.3f}s via real Redis")
+
+    # Verify all results stored in Redis
+    for i in range(20):
+        res = results[i].get(timeout_sec=0.1)
+        assert res is not None
+        assert res.status == TaskStatus.SUCCESS
+        conn.execute(["DEL", prefix + "result:" + results[i].task_id])
+
+    conn.close()
+    broker.close()
+    print("  -> Passed concurrent async crawlers over real Redis")
+
+async def _test_6_cancellation_real_redis_coro():
+    print("[6/6] Testing pre-execution and automatic in-flight cancellation with real Redis...")
+    prefix = "test_tq_cancel:"
+    broker = RedisBroker(host="127.0.0.1", port=6379, key_prefix=prefix)
+    client = TaskClient(broker)
+    registry = AsyncTaskRegistry()
+    long_job = RedisLongRunningJob()
+    registry.register(long_job)
+    worker = AsyncWorker(broker, registry, AsyncWorkerConfig(queues=["default"]))
+
+    # -------------------------------------------------------------
+    # Part A: Pre-execution Cancellation
+    # -------------------------------------------------------------
+    res_pre = client.apply_async("redis_long_job", "{}")
+    # Cancel before worker processes it
+    ok = res_pre.cancel()
+    assert ok
+    # Verify Redis revoked key exists
+    conn = RedisConnection(host="127.0.0.1", port=6379)
+    rev_exists = conn.execute(["EXISTS", prefix + "revoked:" + res_pre.task_id])
+    assert rev_exists == "1" or rev_exists == ":1"
+
+    # Worker dispatch intercepts the task and rejects it before execution
+    worker.step_dispatch()
+    assert worker.stats.total_cancelled == 1
+    assert worker.stats.active_tasks == 0
+
+    result_pre = res_pre.get(timeout_sec=0.1)
+    assert result_pre is not None
+    assert result_pre.status == TaskStatus.CANCELLED
+
+    # -------------------------------------------------------------
+    # Part B: In-Flight Automatic Runtime Cancellation
+    # -------------------------------------------------------------
+    res_flight = client.apply_async("redis_long_job", "{}")
+    worker.step_dispatch()
+    assert worker.stats.active_tasks == 1
+
+    # Let task start and enter await sleep(1.0)
+    for _ in range(3):
+        worker.step_dispatch()
+        await sleep(0.01)
+
+    # Remotely issue cancel via client -> writes to Redis
+    print("  -> Sending cancellation command to real Redis...")
+    res_flight.cancel()
+
+    # Step worker: detects Redis revocation and automatically cancels the coroutine
+    for _ in range(15):
+        worker.step_dispatch()
+        await sleep(0.01)
+
+    # Verify task was automatically aborted in-flight
+    assert not long_job.stage2_executed, "Stage 2 must NEVER run after automatic cancellation"
+    assert worker.stats.active_tasks == 0, "Active concurrency slot must be released"
+    assert worker.stats.total_cancelled >= 2
+
+    result_flight = res_flight.get(timeout_sec=0.1)
+    assert result_flight is not None
+    assert result_flight.status == TaskStatus.CANCELLED
+
+    # Clean up Redis keys
+    conn.execute(["DEL", prefix + "queue:default", prefix + "result:" + res_pre.task_id, prefix + "result:" + res_flight.task_id])
+    conn.close()
+    broker.close()
+    print("  -> Passed pre-execution and automatic cancellation with real Redis")
+
+def main():
+    print("==================================================================")
+    print("  TaskQ Full-Lifecycle Production Test Suite with Real Redis")
+    print("==================================================================")
+    test_1_redis_connectivity()
+    test_2_sync_task_full_lifecycle()
+    test_3_delayed_eta_scheduling()
+    test_4_retry_and_dead_letter_queue()
+    run(_test_5_concurrent_async_crawlers_coro())
+    run(_test_6_cancellation_real_redis_coro())
+    print("==================================================================")
+    print("  ALL 6 REAL REDIS FULL-LIFECYCLE TESTS PASSED SUCCESSFULLY!    ")
+    print("==================================================================")
+
+main()

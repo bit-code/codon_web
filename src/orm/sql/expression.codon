@@ -1,0 +1,191 @@
+# SQL Expression AST Nodes and CompileContext for Codon ORM
+from typing import List, Optional
+from src.orm.dialect import Dialect, MYSQL_DIALECT
+
+class CompileContext:
+    dialect: Dialect
+    param_index: int
+    params: List[str]
+
+    def __init__(self, dialect: Dialect = MYSQL_DIALECT):
+        self.dialect = dialect
+        self.param_index = 1
+        self.params = List[str]()
+
+    def reset(self) -> None:
+        self.param_index = 1
+        self.params = List[str]()
+
+    def quote_identifier(self, ident: str) -> str:
+        s = ident.strip()
+        if "(" in s or ")" in s or " " in s or s == "*":
+            return s
+        if "." in s:
+            parts = s.split(".")
+            quoted = List[str]()
+            for p in parts:
+                quoted.append(self.dialect.quote_identifier(p))
+            return ".".join(quoted)
+        return self.dialect.quote_identifier(s)
+
+    def next_placeholder(self) -> str:
+        ph = self.dialect.placeholder(self.param_index)
+        self.param_index += 1
+        return ph
+
+    def compile_clause(self, clause) -> str:
+        return clause.compile(self)
+
+
+class ClauseElement:
+    def __init__(self):
+        pass
+
+    def compile(self, ctx: CompileContext) -> str:
+        return ""
+
+    def __and__(self, other: ClauseElement) -> ClauseElement:
+        clauses = List[ClauseElement]()
+        clauses.append(self)
+        clauses.append(other)
+        return CompoundClause("AND", clauses)
+
+    def __or__(self, other: ClauseElement) -> ClauseElement:
+        clauses = List[ClauseElement]()
+        clauses.append(self)
+        clauses.append(other)
+        return CompoundClause("OR", clauses)
+
+    def __invert__(self) -> ClauseElement:
+        return NotClause(self)
+
+
+class RawClause(ClauseElement):
+    sql_text: str
+    params: List[str]
+
+    def __init__(self, sql_text: str, params: Optional[List[str]] = None):
+        self.sql_text = sql_text
+        if params is not None:
+            self.params = params
+        else:
+            self.params = List[str]()
+
+    def compile(self, ctx: CompileContext) -> str:
+        for p in self.params:
+            ctx.params.append(p)
+            ctx.param_index += 1
+        return self.sql_text
+
+
+class BinaryClause(ClauseElement):
+    left: str
+    op: str
+    val: str
+    is_column_comparison: bool
+
+    def __init__(self, left: str, op: str, val: str, is_column_comparison: bool = False):
+        self.left = left
+        self.op = op.strip().upper()
+        self.val = val
+        self.is_column_comparison = is_column_comparison
+
+    def compile(self, ctx: CompileContext) -> str:
+        left_str = ctx.quote_identifier(self.left)
+        if self.is_column_comparison:
+            right_str = ctx.quote_identifier(self.val)
+            return left_str + " " + self.op + " " + right_str
+        else:
+            ph = ctx.next_placeholder()
+            ctx.params.append(self.val)
+            return left_str + " " + self.op + " " + ph
+
+
+class UnaryClause(ClauseElement):
+    expr: str
+    op: str # "IS NULL" or "IS NOT NULL"
+
+    def __init__(self, expr: str, op: str):
+        self.expr = expr
+        self.op = op.strip().upper()
+
+    def compile(self, ctx: CompileContext) -> str:
+        left_str = ctx.quote_identifier(self.expr)
+        return left_str + " " + self.op
+
+
+class NotClause(ClauseElement):
+    child: ClauseElement
+
+    def __init__(self, child: ClauseElement):
+        self.child = child
+
+    def compile(self, ctx: CompileContext) -> str:
+        child_sql = self.child.compile(ctx)
+        return "NOT (" + child_sql + ")"
+
+
+class InClause(ClauseElement):
+    column_name: str
+    values: List[str]
+    is_not: bool
+
+    def __init__(self, column_name: str, values: List[str], is_not: bool = False):
+        self.column_name = column_name
+        self.values = values
+        self.is_not = is_not
+
+    def compile(self, ctx: CompileContext) -> str:
+        left_str = ctx.quote_identifier(self.column_name)
+        if len(self.values) == 0:
+            return "1=1" if self.is_not else "1=0"
+        phs = List[str]()
+        for v in self.values:
+            phs.append(ctx.next_placeholder())
+            ctx.params.append(v)
+        in_kw = "NOT IN" if self.is_not else "IN"
+        return left_str + " " + in_kw + " (" + ", ".join(phs) + ")"
+
+
+class BetweenClause(ClauseElement):
+    column_name: str
+    low: str
+    high: str
+
+    def __init__(self, column_name: str, low: str, high: str):
+        self.column_name = column_name
+        self.low = low
+        self.high = high
+
+    def compile(self, ctx: CompileContext) -> str:
+        left_str = ctx.quote_identifier(self.column_name)
+        ph1 = ctx.next_placeholder()
+        ctx.params.append(self.low)
+        ph2 = ctx.next_placeholder()
+        ctx.params.append(self.high)
+        return left_str + " BETWEEN " + ph1 + " AND " + ph2
+
+
+class CompoundClause(ClauseElement):
+    op: str # "AND" or "OR"
+    clauses: List[ClauseElement]
+
+    def __init__(self, op: str, clauses: List[ClauseElement]):
+        self.op = op.strip().upper()
+        self.clauses = clauses
+
+    def add(self, clause: ClauseElement) -> None:
+        self.clauses.append(clause)
+
+    def compile(self, ctx: CompileContext) -> str:
+        if len(self.clauses) == 0:
+            return ""
+        if len(self.clauses) == 1:
+            return self.clauses[0].compile(ctx)
+        sub_sqls = List[str]()
+        for sub in self.clauses:
+            sub_sql = sub.compile(ctx)
+            if len(sub_sql) > 0:
+                sub_sqls.append(sub_sql)
+        joined = (" " + self.op + " ").join(sub_sqls)
+        return "(" + joined + ")"

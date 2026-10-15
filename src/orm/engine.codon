@@ -1,0 +1,251 @@
+# DatabaseEngine: Connection & Dialect Management
+from typing import List, Tuple, Optional, Dict
+from src.orm.dialect import Dialect, MYSQL_DIALECT, POSTGRESQL_DIALECT, get_dialect
+from src.db.types import Row
+from src.db.pool import MySQLPool
+from src.db.drivers.postgres.pool import PostgresPool
+from src.db.errors import OperationalError
+
+def escape_sql_param(val: str) -> str:
+    if len(val) == 0:
+        return "''"
+    is_num = True
+    has_dot = False
+    start = 1 if val[0] == '-' else 0
+    if start >= len(val):
+        is_num = False
+    for i in range(start, len(val)):
+        c = val[i]
+        if c >= '0' and c <= '9':
+            continue
+        elif c == '.' and not has_dot:
+            has_dot = True
+        else:
+            is_num = False
+            break
+    if is_num:
+        return val
+
+    res = ["'"]
+    for i in range(len(val)):
+        c = val[i]
+        if c == "'":
+            res.append("\\'")
+        elif c == "\\":
+            res.append("\\\\")
+        elif c == "\0":
+            res.append("\\0")
+        elif c == "\n":
+            res.append("\\n")
+        elif c == "\r":
+            res.append("\\r")
+        else:
+            res.append(c)
+    res.append("'")
+    return "".join(res)
+
+def interpolate_params(sql: str, params: List[str]) -> str:
+    if len(params) == 0:
+        return sql
+
+    # 单参数快速通道（点查高频场景，利用 libc memchr 实现 SIMD 级极速定位）
+    if len(params) == 1 and sql.find("'") < 0:
+        idx = sql.find("?")
+        if idx >= 0:
+            return sql[:idx] + escape_sql_param(params[0]) + sql[idx + 1:]
+
+    parts = List[str]()
+    param_idx = 0
+    start = 0
+    in_single_quote = False
+    in_double_quote = False
+
+    i = 0
+    while i < len(sql):
+        c = sql[i]
+        if c == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+        elif c == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+        elif c == '?' and not in_single_quote and not in_double_quote:
+            parts.append(sql[start:i])
+            if param_idx < len(params):
+                parts.append(escape_sql_param(params[param_idx]))
+                param_idx += 1
+            else:
+                parts.append("?")
+            start = i + 1
+        i += 1
+
+    parts.append(sql[start:])
+    return "".join(parts)
+
+class DatabaseEngine:
+    db_type: str
+    dialect: Dialect
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+    mysql_pool: Optional[MySQLPool]
+    pg_pool: Optional[PostgresPool]
+
+    def __init__(
+        self,
+        db_type: str = "mysql",
+        host: str = "127.0.0.1",
+        port: int = 3306,
+        user: str = "root",
+        password: str = "",
+        database: str = "test",
+        min_pool_size: int = 2,
+        max_pool_size: int = 10
+    ):
+        self.db_type = db_type.lower()
+        self.dialect = get_dialect(self.db_type)
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.database = database
+        self.mysql_pool = None
+        self.pg_pool = None
+
+        if self.db_type == "mysql":
+            self.mysql_pool = MySQLPool(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                min_size=min_pool_size,
+                max_size=max_pool_size
+            )
+        elif self.db_type == "postgresql" or self.db_type == "postgres":
+            self.pg_pool = PostgresPool(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                min_size=min_pool_size,
+                max_size=max_pool_size
+            )
+
+    @staticmethod
+    def from_url(url: str, min_pool_size: int = 2, max_pool_size: int = 10) -> DatabaseEngine:
+        # Example: mysql://user:pass@host:3306/dbname
+        # Example: postgresql://user:pass@host:5432/dbname
+        db_type = "mysql"
+        remainder = url
+        if url.startswith("mysql://"):
+            db_type = "mysql"
+            remainder = url[len("mysql://"):]
+        elif url.startswith("postgresql://"):
+            db_type = "postgresql"
+            remainder = url[len("postgresql://"):]
+        elif url.startswith("postgres://"):
+            db_type = "postgresql"
+            remainder = url[len("postgres://"):]
+
+        user = "root"
+        password = ""
+        host = "127.0.0.1"
+        port = 3306 if db_type == "mysql" else 5432
+        database = "test"
+
+        # Split user:pass and host:port/db
+        auth_sep = remainder.find("@")
+        if auth_sep >= 0:
+            auth_part = remainder[:auth_sep]
+            host_part = remainder[auth_sep + 1:]
+
+            colon_idx = auth_part.find(":")
+            if colon_idx >= 0:
+                user = auth_part[:colon_idx]
+                password = auth_part[colon_idx + 1:]
+            else:
+                user = auth_part
+        else:
+            host_part = remainder
+
+        # Split host:port and /db
+        slash_idx = host_part.find("/")
+        if slash_idx >= 0:
+            database = host_part[slash_idx + 1:]
+            hp = host_part[:slash_idx]
+        else:
+            hp = host_part
+
+        colon_hp = hp.find(":")
+        if colon_hp >= 0:
+            host = hp[:colon_hp]
+            port = int(hp[colon_hp + 1:])
+        else:
+            host = hp
+
+        return DatabaseEngine(
+            db_type=db_type,
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            min_pool_size=min_pool_size,
+            max_pool_size=max_pool_size
+        )
+
+    def execute_insert(self, sql: str, params: List[str] = List[str]()) -> Tuple[int, int, List[Row]]:
+        if self.db_type == "mysql" and self.mysql_pool is not None:
+            final_sql = interpolate_params(sql, params)
+            conn = self.mysql_pool.acquire()
+            cur = conn.cursor()
+            cnt = cur.execute(final_sql)
+            last_id = cur.lastrowid
+            conn.commit()
+            rows = cur.fetchall()
+            cur.close()
+            conn.release()
+            return (cnt, last_id, rows)
+        elif self.pg_pool is not None:
+            conn_pg = self.pg_pool.acquire()
+            cnt, rows = conn_pg.execute(sql, params)
+            conn_pg.commit()
+            conn_pg.release()
+            last_id = 0
+            if len(rows) > 0 and len(rows[0]) > 0:
+                last_id = rows[0].get_int(0, 0)
+            return (cnt, last_id, rows)
+        else:
+            raise OperationalError("No active connection pool for database: " + self.db_type)
+
+    def execute_raw(self, sql: str, params: List[str] = List[str]()) -> Tuple[int, List[Row]]:
+        if self.db_type == "mysql" and self.mysql_pool is not None:
+            final_sql = interpolate_params(sql, params)
+            conn = self.mysql_pool.acquire()
+            cur = conn.cursor()
+            cnt = cur.execute(final_sql)
+            rows = cur.fetchall()
+            trimmed = final_sql.lstrip().upper()
+            if not (trimmed.startswith("SELECT") or trimmed.startswith("SHOW") or trimmed.startswith("DESC")):
+                conn.commit()
+            cur.close()
+            conn.release()
+            return (cnt, rows)
+        elif self.pg_pool is not None:
+            conn_pg = self.pg_pool.acquire()
+            cnt, rows = conn_pg.execute(sql, params)
+            trimmed_pg = sql.lstrip().upper()
+            if not (trimmed_pg.startswith("SELECT") or trimmed_pg.startswith("SHOW") or trimmed_pg.startswith("DESC")):
+                conn_pg.commit()
+            conn_pg.release()
+            return (cnt, rows)
+        else:
+            raise OperationalError("No active connection pool for database: " + self.db_type)
+
+    def close(self) -> None:
+        if self.mysql_pool is not None:
+            self.mysql_pool.close()
+        if self.pg_pool is not None:
+            self.pg_pool.close()

@@ -1,0 +1,205 @@
+# ==============================================================================
+# Enterprise-Grade CodonWeb API with Code-First AOT Schema Validation
+# Demonstrates SIMD zero-copy deserialization, RFC 7807 422 errors, and static typing
+# ==============================================================================
+
+from codon_web import (
+    App, Request, Response,
+    CORSMiddleware, RequestIdMiddleware, TimingMiddleware,
+    ValidationError
+)
+from examples.schemas.user import UserCreate
+from examples.schemas.order import OrderCreate
+from src.testing.test_client import TestClient
+
+# -----------------------------------------------------------------------------
+# 1. Initialize High-Performance Application
+# -----------------------------------------------------------------------------
+app = App(
+    host="0.0.0.0",
+    port=8080,
+    title="Enterprise CodonWeb REST API",
+    version="1.0.0",
+    description="High-throughput API powered by Code-First AOT Schema Validation and LLVM"
+)
+
+app.use(CORSMiddleware(allow_origin="*"))
+app.use(RequestIdMiddleware())
+app.use(TimingMiddleware())
+
+
+# -----------------------------------------------------------------------------
+# 2. Endpoint: User Registration (POST /api/users)
+# Demonstrates FastJson zero-copy validation, field constraints & cross-field rules
+# -----------------------------------------------------------------------------
+@app.post("/api/users", summary="Register User", tags=["Users"])
+def register_user(req: Request) -> Response:
+    # 2.1 零拷贝 SIMD 反序列化与边界/类型校验
+    res = UserCreate.from_json_doc(req.json_doc())
+    if not res.is_ok():
+        # 2.2 校验不通过，直接一行返回标准 RFC 7807 / 422 结构化错误响应
+        return res.to_response(422)
+
+    # 2.3 校验通过，直接获得 100% 静态编译的强类型实体对象
+    user = res.unwrap()
+
+    # 2.4 纯原生强类型点语法访问（具备 LLVM 深度内联优化与类型安全性）
+    username = user.username
+    age = user.age
+    email = user.email
+    balance = user.balance
+    role = user.role
+    is_active = user.is_active
+
+    # 模拟持久化或业务处理逻辑
+    print(f"[UserService] Registered user='{username}', age={age}, role='{role}', balance={balance}")
+
+    resp_body = (
+        '{"status":"success","code":201,"data":{'
+        + '"username":"' + username + '",'
+        + '"age":' + str(age) + ','
+        + '"email":"' + email + '",'
+        + '"role":"' + role + '",'
+        + '"balance":' + str(balance) + ','
+        + '"is_active":' + ("true" if is_active else "false")
+        + '}}'
+    )
+    return Response.json(resp_body, 201)
+
+
+# -----------------------------------------------------------------------------
+# 3. Endpoint: E-commerce Order Submission (POST /api/orders)
+# Demonstrates numeric bounds, payment gateways & business risk control rules
+# -----------------------------------------------------------------------------
+@app.post("/api/orders", summary="Create Order", tags=["Orders"])
+def create_order(req: Request) -> Response:
+    # 3.1 零拷贝解析与风控校验
+    res = OrderCreate.from_json_doc(req.json_doc())
+    if not res.is_ok():
+        return res.to_response(422)
+
+    order = res.unwrap()
+
+    # 3.2 业务计算：享受浮点数和整数的原生指令加速
+    discount = 0.95 if order.quantity >= 5 else 1.0
+    final_amount = order.amount * discount
+
+    resp_body = (
+        '{"status":"success","code":201,"data":{'
+        + '"order_sn":"' + order.order_sn + '",'
+        + '"quantity":' + str(order.quantity) + ','
+        + '"original_amount":' + str(order.amount) + ','
+        + '"final_amount":' + str(final_amount) + ','
+        + '"pay_method":"' + order.pay_method + '",'
+        + '"invoice_issued":' + ("true" if order.need_invoice else "false")
+        + '}}'
+    )
+    return Response.json(resp_body, 201)
+
+
+# -----------------------------------------------------------------------------
+# 4. Endpoint: URL Query/Form 批量过滤 (GET /api/users/validate-query)
+# Demonstrates safe string dictionary parsing and automatic type coercion
+# -----------------------------------------------------------------------------
+@app.get("/api/users/validate-query", summary="Validate Query Params", tags=["Users"])
+def validate_query(req: Request) -> Response:
+    # 从 URL Query 构造字典并做安全反序列化
+    query_dict = dict[str, str]()
+    query_dict["username"] = req.query_param("username", "")
+    query_dict["age"] = req.query_param("age", "")
+    query_dict["email"] = req.query_param("email", "")
+
+    res = UserCreate.from_dict(query_dict)
+    if not res.is_ok():
+        return res.to_response(422)
+
+    user = res.unwrap()
+    return Response.json('{"status":"valid","username":"' + user.username + '","age":' + str(user.age) + '}', 200)
+
+
+# -----------------------------------------------------------------------------
+# 5. Endpoint: OpenAPI 3.0 Schema Inspection (GET /api/schemas/user)
+# Demonstrates automated OpenAPI schema export for Swagger / ReDoc
+# -----------------------------------------------------------------------------
+@app.get("/api/schemas/user", summary="User Schema Spec", tags=["Meta"])
+def get_user_schema_spec(req: Request) -> Response:
+    return Response.json(UserCreate.openapi_schema_json(), 200)
+
+
+# -----------------------------------------------------------------------------
+# 6. Self-Contained Verification Runner (TestClient Execution)
+# -----------------------------------------------------------------------------
+def run_verification():
+    print("================================================================================")
+    print("[Demo Runner] Verifying Enterprise AOT Schema API Handlers via TestClient")
+    print("================================================================================")
+    client = TestClient(app)
+
+    # Case 1: 正常注册合法用户
+    payload_valid = (
+        '{"username":"alice_admin","age":28,"email":"alice@corp.io",'
+        + '"balance":5000.0,"role":"admin","is_active":true}'
+    )
+    r1 = client.post("/api/users", json=payload_valid)
+    assert r1.status_code == 201, f"Expected 201, got {r1.status_code}: {r1.text}"
+    assert '"alice_admin"' in r1.text
+    print("[OK] Case 1 (Valid User Registration -> 201 Created): PASSED")
+
+    # Case 2: 字段约束失败 (username 长度不足, age 超出 150)
+    payload_invalid_bounds = '{"username":"al","age":200,"email":"alice@corp.io"}'
+    r2 = client.post("/api/users", json=payload_invalid_bounds)
+    assert r2.status_code == 422, f"Expected 422, got {r2.status_code}"
+    assert '"value_error.length.min"' in r2.text
+    assert '"value_error.number.le"' in r2.text
+    print("[OK] Case 2 (Field Constraints Failure -> 422 Unprocessable Entity): PASSED")
+
+    # Case 3: 业务领域风控规则失败 (角色为 admin 但年龄 < 21)
+    payload_underage_admin = (
+        '{"username":"junior_admin","age":19,"email":"junior@corp.io",'
+        + '"role":"admin"}'
+    )
+    r3 = client.post("/api/users", json=payload_underage_admin)
+    assert r3.status_code == 422, f"Expected 422, got {r3.status_code}"
+    assert '"value_error.business"' in r3.text
+    assert "Administrator accounts must be at least 21 years old" in r3.text
+    print("[OK] Case 3 (Domain Risk Hook Failure -> 422 with Domain Details): PASSED")
+
+    # Case 4: 正常创建订单
+    order_valid = (
+        '{"order_sn":"ORD_20261008_99812","quantity":5,"amount":120.0,'
+        + '"pay_method":"alipay","need_invoice":true}'
+    )
+    r4 = client.post("/api/orders", json=order_valid)
+    assert r4.status_code == 201
+    assert '"final_amount":114.0' in r4.text # 5 items trigger 5% discount
+    print("[OK] Case 4 (Valid Order Creation & Price Computation -> 201 Created): PASSED")
+
+    # Case 5: 订单风控失败 (信用卡支付金额必须 >= 50.0)
+    order_risk_fail = (
+        '{"order_sn":"ORD_20261008_00012","quantity":1,"amount":25.0,'
+        + '"pay_method":"credit_card"}'
+    )
+    r5 = client.post("/api/orders", json=order_risk_fail)
+    assert r5.status_code == 422
+    assert '"value_error.risk"' in r5.text
+    assert "Credit card payment requires minimum order amount" in r5.text
+    print("[OK] Case 5 (Payment Method Risk Control -> 422 Validation Error): PASSED")
+
+    # Case 6: OpenAPI Schema 元数据获取
+    r6 = client.get("/api/schemas/user")
+    assert r6.status_code == 200
+    assert '"title":"UserCreate"' in r6.text
+    assert '"minLength":3' in r6.text
+    print("[OK] Case 6 (OpenAPI 3.0 Schema Metadata Endpoint -> 200 OK): PASSED")
+
+    print("================================================================================")
+    print("ALL API End-to-End AOT Schema Scenarios Verified Successfully!")
+    print("================================================================================")
+
+
+if __name__ == "__main__":
+    # 执行自动化测试验证
+    run_verification()
+    
+    # 生产部署时，启动网络事件循环监听流量:
+    # app.run()

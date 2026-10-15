@@ -1,0 +1,191 @@
+# Industrial-Grade Worker Execution Engine for TaskQ
+# Consumer loop with multi-queue support, exponential backoff retries, and DLQ routing
+
+import time
+from typing import Optional
+from src.taskq.protocol import TaskMessage, TaskResult, TaskStatus
+from src.taskq.broker.base import Broker
+from src.taskq.registry import TaskRegistry, TaskDefinition, GLOBAL_TASK_REGISTRY
+
+class WorkerConfig:
+    queues: list[str]
+    poll_timeout_sec: int
+    result_expire_sec: int
+    retry_backoff_base_sec: int
+
+    def __init__(
+        self,
+        queues: list[str] = ["default"],
+        poll_timeout_sec: int = 1,
+        result_expire_sec: int = 3600,
+        retry_backoff_base_sec: int = 2
+    ):
+        self.queues = queues
+        self.poll_timeout_sec = poll_timeout_sec
+        self.result_expire_sec = result_expire_sec
+        self.retry_backoff_base_sec = retry_backoff_base_sec
+
+
+class WorkerStats:
+    total_received: int
+    total_succeeded: int
+    total_failed: int
+    total_retried: int
+    total_dead_lettered: int
+    total_cancelled: int
+    total_timed_out: int
+
+    def __init__(self):
+        self.total_received = 0
+        self.total_succeeded = 0
+        self.total_failed = 0
+        self.total_retried = 0
+        self.total_dead_lettered = 0
+        self.total_cancelled = 0
+        self.total_timed_out = 0
+
+
+class Worker:
+    broker: Broker
+    registry: TaskRegistry
+    config: WorkerConfig
+    stats: WorkerStats
+    is_running: bool
+
+    def __init__(
+        self,
+        broker: Broker,
+        registry: TaskRegistry = GLOBAL_TASK_REGISTRY,
+        config: Optional[WorkerConfig] = None
+    ):
+        self.broker = broker
+        self.registry = registry
+        self.config = config if config is not None else WorkerConfig()
+        self.stats = WorkerStats()
+        self.is_running = False
+
+    def _execute_task(self, task_def: TaskDefinition, msg: TaskMessage) -> None:
+        if self.broker.is_cancelled(msg.task_id):
+            self.stats.total_cancelled += 1
+            cancel_res = TaskResult(
+                task_id=msg.task_id,
+                status=TaskStatus.CANCELLED,
+                result="",
+                error="Task was cancelled before execution"
+            )
+            self.broker.store_result(msg.task_id, cancel_res, self.config.result_expire_sec)
+            return
+
+        t0 = time.time()
+        try:
+            # Mark started status
+            start_res = TaskResult(
+                task_id=msg.task_id,
+                status=TaskStatus.STARTED
+            )
+            self.broker.store_result(msg.task_id, start_res, self.config.result_expire_sec)
+
+            # Execute compiled task handler
+            out_payload = task_def.handler(msg.payload)
+            exec_ms = int((time.time() - t0) * 1000.0)
+
+            self.stats.total_succeeded += 1
+            success_res = TaskResult(
+                task_id=msg.task_id,
+                status=TaskStatus.SUCCESS,
+                result=out_payload,
+                error="",
+                execution_time_ms=exec_ms
+            )
+            self.broker.store_result(msg.task_id, success_res, self.config.result_expire_sec)
+
+        except Exception as e:
+            err_msg = str(e)
+            exec_ms = int((time.time() - t0) * 1000.0)
+
+            if msg.retry_count < msg.max_retries:
+                # Exponential backoff retry
+                msg.retry_count += 1
+                backoff_pow = msg.retry_count - 1
+                if backoff_pow > 6:
+                    backoff_pow = 6
+                delay_sec = self.config.retry_backoff_base_sec ** backoff_pow
+
+                self.stats.total_retried += 1
+                self.broker.schedule(msg.queue, msg, delay_sec)
+
+                retry_res = TaskResult(
+                    task_id=msg.task_id,
+                    status=TaskStatus.RETRY,
+                    result="",
+                    error=f"Attempt {msg.retry_count} failed: {err_msg}",
+                    execution_time_ms=exec_ms
+                )
+                self.broker.store_result(msg.task_id, retry_res, self.config.result_expire_sec)
+            else:
+                # Retries exhausted -> route to Dead Letter Queue (DLQ)
+                self.stats.total_failed += 1
+                self.stats.total_dead_lettered += 1
+                self.broker.enqueue_dead_letter(msg.queue, msg, err_msg)
+
+                fail_res = TaskResult(
+                    task_id=msg.task_id,
+                    status=TaskStatus.FAILURE,
+                    result="",
+                    error=f"Max retries ({msg.max_retries}) exceeded: {err_msg}",
+                    execution_time_ms=exec_ms
+                )
+                self.broker.store_result(msg.task_id, fail_res, self.config.result_expire_sec)
+
+    def _dispatch_msg(self, msg: TaskMessage) -> None:
+        self.stats.total_received += 1
+        if self.broker.is_cancelled(msg.task_id):
+            self.stats.total_cancelled += 1
+            cancel_res = TaskResult(
+                task_id=msg.task_id,
+                status=TaskStatus.CANCELLED,
+                result="",
+                error="Task was cancelled before execution"
+            )
+            self.broker.store_result(msg.task_id, cancel_res, self.config.result_expire_sec)
+            return
+
+        task_def = self.registry.get(msg.task_name)
+        if task_def is None:
+            # Unrecognized task -> DLQ
+            self.stats.total_failed += 1
+            self.stats.total_dead_lettered += 1
+            err = f"Unrecognized task '{msg.task_name}' (not registered in TaskRegistry)"
+            self.broker.enqueue_dead_letter(msg.queue, msg, err)
+            fail_res = TaskResult(
+                task_id=msg.task_id,
+                status=TaskStatus.FAILURE,
+                error=err
+            )
+            self.broker.store_result(msg.task_id, fail_res, self.config.result_expire_sec)
+        else:
+            self._execute_task(task_def, msg)
+
+    def step(self, timeout_sec: int = 0) -> bool:
+        # 1. Poll delayed/scheduled ETA queues across all listening queues
+        for i in range(len(self.config.queues)):
+            q_name = self.config.queues[i]
+            self.broker.poll_delayed(q_name)
+
+        # 2. Dequeue from queues in prioritized order using multi-queue dequeue
+        msg = self.broker.dequeue_multi(self.config.queues, timeout_sec)
+        if msg is not None:
+            self._dispatch_msg(msg)
+            return True
+
+        return False
+
+    def start(self) -> None:
+        self.is_running = True
+        while self.is_running:
+            processed = self.step(self.config.poll_timeout_sec)
+            if not processed:
+                time.sleep(0.01)
+
+    def stop(self) -> None:
+        self.is_running = False

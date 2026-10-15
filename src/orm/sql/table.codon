@@ -1,0 +1,123 @@
+from typing import List, Dict, Optional
+from src.orm.sql.column import Column
+from src.orm.model import ModelMeta
+
+class ColumnCollection:
+    _cols: Dict[str, Column]
+    _ordered_cols: List[Column]
+
+    def __init__(self):
+        self._cols = Dict[str, Column]()
+        self._ordered_cols = List[Column]()
+
+    def add(self, col: Column) -> None:
+        self._cols[col.name] = col
+        self._ordered_cols.append(col)
+
+    def get(self, name: str) -> Column:
+        if name in self._cols:
+            return self._cols[name]
+        # Return fallback dynamic column
+        fallback = Column(name)
+        self._cols[name] = fallback
+        return fallback
+
+    def __getitem__(self, name: str) -> Column:
+        return self.get(name)
+
+    def all(self) -> List[Column]:
+        return self._ordered_cols
+
+    def names(self) -> List[str]:
+        res = List[str]()
+        for c in self._ordered_cols:
+            res.append(c.name)
+        return res
+
+
+class Table:
+    name: str
+    schema: str
+    alias: str
+    c: ColumnCollection
+    columns: List[Column]
+
+    # Frequently used column shortcuts for direct access like table.ID
+    ID: Column
+    NAME: Column
+    STATUS: Column
+    CREATED_AT: Column
+    UPDATED_AT: Column
+
+    def __init__(
+        self,
+        name: str,
+        columns: Optional[List[Column]] = None,
+        schema: str = "",
+        alias: str = ""
+    ):
+        self.name = name
+        self.schema = schema
+        self.alias = alias
+        self.c = ColumnCollection()
+        self.columns = List[Column]()
+
+        t_name = alias if len(alias) > 0 else name
+        self.ID = Column("id", table_name=t_name)
+        self.NAME = Column("name", table_name=t_name)
+        self.STATUS = Column("status", table_name=t_name)
+        self.CREATED_AT = Column("created_at", table_name=t_name)
+        self.UPDATED_AT = Column("updated_at", table_name=t_name)
+
+        if columns is not None:
+            for col in columns:
+                if len(col.table_name) == 0:
+                    col.table_name = t_name
+                self.add_column(col)
+
+    def add_column(self, col: Column) -> None:
+        self.columns.append(col)
+        self.c.add(col)
+        norm_name = col.name.upper()
+        if norm_name == "ID":
+            self.ID = col
+        elif norm_name == "NAME":
+            self.NAME = col
+        elif norm_name == "STATUS":
+            self.STATUS = col
+        elif norm_name == "CREATED_AT":
+            self.CREATED_AT = col
+        elif norm_name == "UPDATED_AT":
+            self.UPDATED_AT = col
+
+    def column(self, name: str) -> Column:
+        col = self.c.get(name)
+        if len(col.table_name) == 0:
+            col.table_name = self.alias if len(self.alias) > 0 else self.name
+        return col
+
+    def __getitem__(self, name: str) -> Column:
+        return self.column(name)
+
+    def as_(self, alias: str) -> Table:
+        new_cols = List[Column]()
+        for c in self.columns:
+            new_cols.append(Column(name=c.name, table_name=alias, alias=c.alias, data_type=c.data_type))
+        return Table(name=self.name, columns=new_cols, schema=self.schema, alias=alias)
+
+    def get_table_reference(self) -> str:
+        ref = ""
+        if len(self.schema) > 0:
+            ref = self.schema + "." + self.name
+        else:
+            ref = self.name
+        if len(self.alias) > 0:
+            ref += " AS " + self.alias
+        return ref
+
+    @staticmethod
+    def from_meta(meta: ModelMeta) -> Table:
+        cols = List[Column]()
+        for f in meta.fields:
+            cols.append(Column(name=f.get_column_name(), table_name=meta.table_name, data_type=f.field_type))
+        return Table(name=meta.table_name, columns=cols)

@@ -8,13 +8,27 @@ app = App(enable_openapi=False)
 
 pool = AsyncMySQLPool(
     host="172.23.176.1",
-    port=13306,
+    port=3306,
     user="root",
     password="hujinlong",
     database="test",
     min_size=10,
     max_size=64
 )
+
+d = {
+        "status": "success",
+        "message": "User query processed successfully",
+        "user_id": "1022578",
+        "username": "antigravity_admin",
+        "email": "developer@codon-web.io",
+        "role": "system_administrator",
+        "region": "ap-east-1",
+        "tier": "enterprise_gold",
+        "server": "CodonWeb/0.1-Release",
+        "language": "Codon-Native-LLVM",
+        "active": "true"
+    }
 
 @app.get("/api/plaintext")
 def plaintext_handler(req: Request) -> Response:
@@ -27,37 +41,13 @@ def plaintext_handler(req: Request) -> Response:
 # 接口 A（未使用 fast_json）：采用 Codon 官方标准库 json.dumps(d) 序列化
 @app.get("/api/json-std")
 def json_std_handler(req: Request) -> Response:
-    d = {
-        "status": "success",
-        "message": "User query processed successfully",
-        "user_id": "1022578",
-        "username": "antigravity_admin",
-        "email": "developer@codon-web.io",
-        "role": "system_administrator",
-        "region": "ap-east-1",
-        "tier": "enterprise_gold",
-        "server": "CodonWeb/0.1-Release",
-        "language": "Codon-Native-LLVM",
-        "active": "true"
-    }
+    
     return Response.json(json.dumps(d), 200)
 
 # 接口 B（使用 fast_json）：直接传入 dict 调用 FastJson yyjson 原生 SIMD 序列化
 @app.get("/api/json-fast")
 def json_fast_handler(req: Request) -> Response:
-    d = {
-        "status": "success",
-        "message": "User query processed successfully",
-        "user_id": "1022578",
-        "username": "antigravity_admin",
-        "email": "developer@codon-web.io",
-        "role": "system_administrator",
-        "region": "ap-east-1",
-        "tier": "enterprise_gold",
-        "server": "CodonWeb/0.1-Release",
-        "language": "Codon-Native-LLVM",
-        "active": "true"
-    }
+    
     return Response.json(d, 200)
 
 # ==============================================================================
@@ -99,11 +89,164 @@ async def db_real_fast_handler(req: Request):
             return Response.json(row.to_dict(), 200)
         return Response.json("{}", 200)
 
+# 接口 E（工业级零拷贝直出）：直接传入 Row 对象，无中间字典与无用分配
+@app.async_get("/api/db-real-zerocopy")
+async def db_real_zerocopy_handler(req: Request):
+    async with pool.connection() as conn:
+        cur = conn.cursor()
+        await cur.execute("SELECT * FROM mass_data where id=1022578")
+        row = cur.fetchone()
+        cur.close()
+        if row is not None:
+            return Response.json(row, 200)
+        return Response.json("{}", 200)
+
+# 接口 F（工业级增量修饰视图）：支持业务字段改写、脱敏，底层零拷贝直出
+from src.db.types import RowView
+
+@app.async_get("/api/db-real-view")
+async def db_real_view_handler(req: Request):
+    async with pool.connection() as conn:
+        cur = conn.cursor()
+        await cur.execute("SELECT * FROM mass_data where id=1022578")
+        row = cur.fetchone()
+        cur.close()
+        if row is not None:
+            view = row.create_view()
+            view.set_str("user_name", "VERIFIED")
+            view.set_int("age", 1)
+            view.set_bool("is_active", True)
+            return Response.json(view, 200)
+        return Response.json("{}", 200)
+
+# ==============================================================================
+# 接口 G（工业级异步 ORM 示例）：Base 声明式规范 + Fluent QueryBuilder + 纯隐式访问
+# ==============================================================================
+from src.orm import (
+    Base, tablename, table_args, get_table_schema,
+    IntegerColumn, StringColumn, FloatColumn, BooleanColumn,
+    ModelMeta, Model, LazyModel, AsyncSession
+)
+from src.db.types import Row
+
+class MassDataTable(Base):
+    __tablename__ = tablename('mass_data')
+    __table_args__ = {
+        'mysql_engine': 'InnoDB',
+        'mysql_charset': 'utf8mb4',
+        'mysql_collate': 'utf8mb4_general_ci',
+        'mysql_row_format': 'Dynamic',
+        'mysql_auto_increment': '1',
+        'comment': '',
+    }
+
+    id = IntegerColumn("id", primary_key=True, auto_increment=True)
+    user_name = StringColumn("user_name", max_length=50)
+    age = IntegerColumn("age")
+    gender = StringColumn("gender", max_length=10)
+    email = StringColumn("email", max_length=100)
+    address = StringColumn("address", max_length=255)
+    created_at = StringColumn("created_at", max_length=50)
+    is_active = BooleanColumn("is_active")
+    salary = FloatColumn("salary")
+    department = StringColumn("department", max_length=50)
+
+orm_session = AsyncSession(pool)
+
+
+# ------------------------------------------------------------------------------
+# 接口 G1: 方案三原生零拷贝直出（通过 MassDataTable 隐式获取 Meta 并构建 Query）
+# ------------------------------------------------------------------------------
+@app.async_get("/api/orm-user")
+async def orm_user_handler(req: Request):
+    query = orm_session.query(MassDataTable).where_eq("id", "1022578")
+    row = await orm_session.first(query)
+    if row is not None:
+        return Response.json(row, 200) # 方案三：直接零拷贝直出强类型 JSON
+    return Response.json("{}", 200)
+
+# ------------------------------------------------------------------------------
+# 接口 G2: 纯隐式懒加载实体访问（方案 A：零预解析开销，极致性能直通 API + 字典式语法糖）
+# ------------------------------------------------------------------------------
+@app.async_get("/api/orm-lazy")
+async def orm_lazy_handler(req: Request):
+    query = orm_session.query(MassDataTable).where_eq("id", "1022578")
+    row = await orm_session.first(query)
+    if row is not None:
+        # 1. 封装为纯隐式懒加载实体（0 字段预解析开销）
+        obj = MassDataTable(Optional[Row](row))
+
+        # 2. 方案 A 极速直通访问（零解析、零拷贝，直接按需提取）
+        fast_user_name = obj.get_str("user_name")
+        fast_age = obj.get_int("age")
+        fast_salary = obj.get_float("salary")
+
+        # 3. 语法糖访问方式：支持下标字典语法 obj["department"]
+        dept = obj["department"]
+
+        # 4. 纯隐式基类序列化输出：未被修改时直接穿透到底层 Row SIMD 序列化！
+        return Response.json(obj.to_json(get_table_schema("mass_data").meta()), 200)
+    return Response.json("{}", 200)
+
+# ------------------------------------------------------------------------------
+# 接口 G3: 纯隐式修改 + 工业级自动脏追踪写回 (方案 A：无需任何手动快照对比代码)
+# ------------------------------------------------------------------------------
+@app.async_get("/api/orm-lazy-update")
+async def orm_lazy_update_handler(req: Request):
+    query = orm_session.query(MassDataTable).where_eq("id", "1022578")
+    row = await orm_session.first(query)
+    if row is not None:
+        obj = MassDataTable(Optional[Row](row))
+
+        # 1. 方案 A 纯隐式修改：支持类型安全的 set_int / set_float 或下标语法 obj["age"] = ...
+        # 基类 LazyModel 内部自动标记 dirty 字段
+        obj.set_int("age", obj.get_int("age") + 1)
+        obj.set_float("salary", obj.get_float("salary") + 100.5)
+
+        # 2. 纯隐式异步持久化写回数据库（通过 obj 隐式获取 __tablename__，且只对修改列生成 UPDATE）
+        await orm_session.save(obj)
+
+        return Response.json(obj.to_json(get_table_schema("mass_data").meta()), 200)
+    return Response.json("{}", 200)
+
+# ------------------------------------------------------------------------------
+# 接口 G4: 传统 Model 模型兼容接口
+# ------------------------------------------------------------------------------
+@app.async_get("/api/orm-model")
+async def orm_model_handler(req: Request):
+    query = orm_session.query(MassDataTable).where_eq("id", "1022578")
+    row = await orm_session.first(query)
+    if row is not None:
+        # model = Model()
+        # model.from_row(row)
+        # return Response.json(obj.to_json(get_table_schema("mass_data").meta()), 200)
+        return Response.json(row, 200)
+    return Response.json("{}", 200)
+
+# ------------------------------------------------------------------------------
+# 接口 G5: 工业级主键极速通道 (零动态抽象点查加速器)
+# ------------------------------------------------------------------------------
+@app.async_get("/api/orm-get")
+async def orm_get_handler(req: Request):
+    row = await orm_session.get(MassDataTable, "1022578")
+    if row is not None:
+        return Response.json(row, 200)
+    return Response.json("{}", 200)
+
+
+
+
+def parse_bool_arg(val: str) -> bool:
+    v = val.lower()
+    return v == "1" or v == "true" or v == "yes" or v == "on" or v == "enable"
+
 if __name__ == "__main__":
     import sys
 
     workers = 4
     port = 18080
+    driver = "epoll"
+    bind_cpu = True
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
@@ -131,6 +274,35 @@ if __name__ == "__main__":
             except:
                 pass
             i += 2
+        elif arg.startswith("--driver="):
+            driver = arg[9:]
+            i += 1
+        elif (arg == "-d" or arg == "--driver") and i + 1 < len(sys.argv):
+            driver = sys.argv[i + 1]
+            i += 2
+        elif arg == "--no-bind-cpu" or arg == "--no-cpu-affinity" or arg == "--disable-cpu-affinity":
+            bind_cpu = False
+            i += 1
+        elif arg.startswith("--bind-cpu="):
+            bind_cpu = parse_bool_arg(arg[11:])
+            i += 1
+        elif arg.startswith("--cpu-affinity="):
+            bind_cpu = parse_bool_arg(arg[15:])
+            i += 1
+        elif arg == "--bind-cpu" or arg == "--cpu-affinity":
+            if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+                bind_cpu = parse_bool_arg(sys.argv[i + 1])
+                i += 2
+            else:
+                bind_cpu = True
+                i += 1
+        elif arg == "-c":
+            if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+                bind_cpu = parse_bool_arg(sys.argv[i + 1])
+                i += 2
+            else:
+                bind_cpu = True
+                i += 1
         else:
             try:
                 val = int(arg)
@@ -143,14 +315,26 @@ if __name__ == "__main__":
     if workers <= 0:
         workers = 1
 
-    print("[CodonWeb] Dynamic workers configured: " + str(workers) + ", port: " + str(port))
-    app.run(host="0.0.0.0", port=port, workers=workers)
+    if driver != "":
+        app.config.driver = driver
+
+    app.config.cpu_affinity = bind_cpu
+    affinity_str = "enabled" if bind_cpu else "disabled"
+
+    print("[CodonWeb] Dynamic workers configured: " + str(workers) + ", port: " + str(port) + ", driver: " + app.config.driver + ", cpu_affinity: " + affinity_str)
+    app.run(host="0.0.0.0", port=port, workers=workers, cpu_affinity=bind_cpu)
 
 
     # 编译：CODON_PATH=. codon build -release --linker-flags 'src/native/libcfastjson.a' -o bench_mysql_server examples/bench_mysql_server.codon
-    # 运行：./bench_mysql_server --workers=4 --port=18080
+    # 运行（默认开启 CPU 亲和性绑核）：
+    #   ./bench_mysql_server --workers=4 --port=18080
+    # 运行（显式关闭绑核）：
+    #   ./bench_mysql_server --workers=4 --port=18080 --no-bind-cpu
+    # 运行（参数动态控制）：
+    #   ./bench_mysql_server --workers=4 --port=18080 --bind-cpu=true (或 --bind-cpu=false)
 
     #Wrk 压测脚本 (Wrk benchmarking script)wrk -t4 -c100 -d10s http://localhost:18080/api/json-std1
     #Wrk 压测脚本 (Wrk benchmarking script)wrk -t4 -c100 -d10s http://localhost:18080/api/json-fast1
     #Wrk 压测脚本 (Wrk benchmarking script)wrk -t4 -c100 -d10s http://localhost:18080/api/db-real1
     #Wrk 压测脚本 (Wrk benchmarking script)wrk -t4 -c100 -d10s http://localhost:18080/api/db-real-fast
+    # wrk -t4 -c100 -d10s --latency http://localhost:18080/api/db-real-fast

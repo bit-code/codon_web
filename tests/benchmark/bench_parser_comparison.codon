@@ -1,0 +1,213 @@
+import time
+from src.memory.slice import ByteSlice
+from src.memory.buffer import ByteBuffer
+from src.http.method import HttpMethod, METHOD_UNKNOWN
+from src.http.request import Request
+from src.http.parser import HttpParser as PicoHttpParser, PARSE_OK
+
+# ----------------- Original Pure-Codon HttpParser -----------------
+class PureCodonHttpParser:
+    max_header_size: int
+
+    def __init__(self, max_header_size: int = 8192):
+        self.max_header_size = max_header_size
+
+    def parse(self, src: ByteSlice, req: Request) -> Tuple[i32, int]:
+        if src.len == 0:
+            return (i32(1), 0)
+
+        header_end = -1
+        delim_len = 4
+        limit = src.len - 3
+        idx = 0
+        while idx < limit:
+            if src.ptr[idx] == byte(13) and src.ptr[idx + 1] == byte(10):
+                if src.ptr[idx + 2] == byte(13) and src.ptr[idx + 3] == byte(10):
+                    header_end = idx
+                    delim_len = 4
+                    break
+            idx += 1
+
+        if header_end < 0:
+            idx = 0
+            limit_lf = src.len - 1
+            while idx < limit_lf:
+                if src.ptr[idx] == byte(10) and src.ptr[idx + 1] == byte(10):
+                    header_end = idx
+                    delim_len = 2
+                    break
+                idx += 1
+
+        if header_end < 0:
+            if src.len > self.max_header_size:
+                return (i32(2), 0)
+            return (i32(1), 0)
+
+        total_headers_len = header_end + delim_len
+
+        line_end = -1
+        for i in range(header_end):
+            if src.ptr[i] == byte(10):
+                line_end = i if i == 0 or src.ptr[i - 1] != byte(13) else i - 1
+                break
+        if line_end <= 0:
+            return (i32(2), 0)
+
+        cur = 0
+        while cur < line_end and src.ptr[cur] == byte(32):
+            cur += 1
+        m_start = cur
+        while cur < line_end and src.ptr[cur] != byte(32):
+            cur += 1
+        m_slice = src.slice(m_start, cur)
+        method = HttpMethod.from_slice(m_slice)
+        if method == METHOD_UNKNOWN:
+            return (i32(2), 0)
+        req.method = method
+
+        while cur < line_end and src.ptr[cur] == byte(32):
+            cur += 1
+        target_start = cur
+        while cur < line_end and src.ptr[cur] != byte(32):
+            cur += 1
+        target_end = cur
+        if target_end <= target_start:
+            return (i32(2), 0)
+
+        q_pos = -1
+        for i in range(target_start, target_end):
+            if src.ptr[i] == byte(63):
+                q_pos = i
+                break
+        if q_pos >= 0:
+            req.path = src.slice(target_start, q_pos)
+            req.query = src.slice(q_pos + 1, target_end)
+        else:
+            req.path = src.slice(target_start, target_end)
+            req.query = ByteSlice(Ptr[byte](0), 0)
+
+        while cur < line_end and src.ptr[cur] == byte(32):
+            cur += 1
+        req.version = src.slice(cur, line_end)
+
+        cur = line_end + (2 if src.ptr[line_end] == byte(13) else 1)
+        content_length = 0
+
+        while cur < header_end:
+            h_line_end = header_end
+            for i in range(cur, header_end):
+                if src.ptr[i] == byte(10):
+                    h_line_end = i if i == cur or src.ptr[i - 1] != byte(13) else i - 1
+                    break
+            
+            if h_line_end > cur:
+                colon_pos = -1
+                for i in range(cur, h_line_end):
+                    if src.ptr[i] == byte(58):
+                        colon_pos = i
+                        break
+                if colon_pos > cur:
+                    name_slice = src.slice(cur, colon_pos)
+                    val_start = colon_pos + 1
+                    while val_start < h_line_end and (src.ptr[val_start] == byte(32) or src.ptr[val_start] == byte(9)):
+                        val_start += 1
+                    val_slice = src.slice(val_start, h_line_end)
+                    req.headers.add(name_slice, val_slice)
+
+                    if name_slice.equals_case_insensitive("content-length"):
+                        ok, cl = val_slice.parse_int()
+                        if ok and cl >= 0:
+                            content_length = cl
+                    elif name_slice.equals_case_insensitive("connection"):
+                        if val_slice.equals_case_insensitive("close"):
+                            req.keep_alive = False
+                        elif val_slice.equals_case_insensitive("keep-alive"):
+                            req.keep_alive = True
+
+            next_cur = h_line_end
+            if next_cur < header_end and src.ptr[next_cur] == byte(13):
+                next_cur += 1
+            if next_cur < header_end and src.ptr[next_cur] == byte(10):
+                next_cur += 1
+            if next_cur <= cur:
+                break
+            cur = next_cur
+
+        body_available = src.len - total_headers_len
+        if body_available < content_length:
+            return (i32(1), 0)
+
+        if content_length > 0:
+            req.body = src.slice(total_headers_len, total_headers_len + content_length)
+        else:
+            req.body = ByteSlice(Ptr[byte](0), 0)
+
+        consumed = total_headers_len + content_length
+        return (i32(0), consumed)
+
+# ----------------- Head-to-Head Comparison -----------------
+def run_comparison():
+    raw_req = (
+        "GET /api/v1/users/profile?uid=998822&tab=overview HTTP/1.1\r\n"
+        "Host: api.service.internal\r\n"
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
+        "Accept: application/json, text/plain, */*\r\n"
+        "Accept-Language: en-US,en;q=0.9\r\n"
+        "Accept-Encoding: gzip, deflate, br\r\n"
+        "Connection: keep-alive\r\n"
+        "Cookie: session_id=abcdef123456; theme=dark\r\n"
+        "\r\n"
+    )
+    buf = ByteBuffer(1024)
+    buf.append_str(raw_req)
+    req_slice = buf.readable_slice()
+
+    iters = 300000
+
+    pure_parser = PureCodonHttpParser()
+    pico_parser = PicoHttpParser()
+    req = Request()
+
+    # 1. Warmup
+    for _ in range(10000):
+        req.reset()
+        pure_parser.parse(req_slice, req)
+        req.reset()
+        pico_parser.parse(req_slice, req)
+
+    # 2. Bench Pure Codon
+    start_pure = time.time()
+    for _ in range(iters):
+        req.reset()
+        pure_parser.parse(req_slice, req)
+    cost_pure = time.time() - start_pure
+    qps_pure = float(iters) / cost_pure
+
+    # 3. Bench picohttpparser
+    start_pico = time.time()
+    for _ in range(iters):
+        req.reset()
+        pico_parser.parse(req_slice, req)
+    cost_pico = time.time() - start_pico
+    qps_pico = float(iters) / cost_pico
+
+    print("=============================================================")
+    print("           HTTP PARSER HEAD-TO-HEAD BENCHMARK                ")
+    print("=============================================================")
+    print("Iterations: " + str(iters))
+    print("Request: 7 headers with query string (290 bytes)")
+    print("-------------------------------------------------------------")
+    print("1. 原生 Pure Codon 解析器 (纯标量循环扫描):")
+    print("   耗时: " + str(cost_pure * 1000.0) + " ms")
+    print("   吞吐: " + str(int(qps_pure)) + " ops/sec (" + str(round(qps_pure / 1000000.0, 2)) + " M ops/s)")
+    print("-------------------------------------------------------------")
+    print("2. 引入 picohttpparser (SSE4.2/SWAR 向量化加速):")
+    print("   耗时: " + str(cost_pico * 1000.0) + " ms")
+    print("   吞吐: " + str(int(qps_pico)) + " ops/sec (" + str(round(qps_pico / 1000000.0, 2)) + " M ops/s)")
+    print("-------------------------------------------------------------")
+    speedup = qps_pico / qps_pure
+    pct = (speedup - 1.0) * 100.0
+    print("性能提升倍数: " + str(round(speedup, 2)) + "x (吞吐提升 " + str(round(pct, 1)) + "%)")
+    print("=============================================================")
+
+run_comparison()

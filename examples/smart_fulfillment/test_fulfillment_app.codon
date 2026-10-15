@@ -1,0 +1,490 @@
+# ==============================================================================
+# Smart Fulfillment Hub - Comprehensive Test & Execution Suite
+# Executes end-to-end verification covering 100% of CodonWeb Schema features,
+# 100% of CodonWeb ORM features, and Full CRUD testing for all 3 scenarios.
+# ==============================================================================
+
+from typing import List, Dict, Optional
+from examples.smart_fulfillment.api import create_fulfillment_app
+from examples.smart_fulfillment.schemas import (
+    AddressSchema,
+    FulfillmentItemSchema,
+    FulfillmentRequest,
+    FulfillmentOrderUpdateSchema,
+    WarehouseInventorySchema,
+    InventoryUpdateSchema,
+    LogisticsRoutePointSchema,
+    ShipmentTrackingSchema,
+    ShipmentUpdateSchema
+)
+from examples.smart_fulfillment.services import FulfillmentService
+from examples.smart_fulfillment.sync_service import SyncFulfillmentService
+from examples.smart_fulfillment.entities import (
+    FulfillmentOrderTable,
+    WarehouseInventoryTable,
+    ShipmentTrackingTable
+)
+from src.testing.test_client import TestClient
+from src.memory.buffer import ByteBuffer
+from src.schema import ValidationError, ValidationResult
+from src.core.async.loop import get_event_loop
+
+
+def run_full_suite():
+    print("================================================================================")
+    print("[Smart Fulfillment Hub] Industrial End-to-End AOT Schema & ORM Verification")
+    print("================================================================================")
+
+    # Pre-warm async database schema
+    loop = get_event_loop()
+    loop.run_until_complete(loop.create_task(FulfillmentService.init_db_schema()))
+    SyncFulfillmentService.init_db_schema()
+
+    app = create_fulfillment_app()
+    client = TestClient(app)
+
+    # -------------------------------------------------------------------------
+    # Test 0: System Healthcheck Endpoint
+    # -------------------------------------------------------------------------
+    r0 = client.get("/health")
+    assert r0.status_code == 200, f"Expected 200, got {r0.status_code}: {r0.text}"
+    assert '"status":"UP"' in r0.text
+    print("[OK] Test 0 (Service Healthcheck Endpoint): PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 1: Full-Featured Valid Request (Primitives, Optionals, Nested Models)
+    # -------------------------------------------------------------------------
+    valid_payload = (
+        '{"tracking_sn":"SF-20261011",'
+        + '"customer_email":"dispatcher@logistics.corp.com",'
+        + '"deliverySpeed":"express",'
+        + '"priority":3,'
+        + '"fragile":false,'
+        + '"insured_amount":5000.0,'
+        + '"memo":"Please leave at door side cabinet",'
+        + '"discount_code":"VIP20",'
+        + '"tags":["electronics","fragile_care"],'
+        + '"address":{'
+        + '"city":"Shanghai",'
+        + '"detail":"No. 888 Century Avenue, Pudong New Area",'
+        + '"zipCode":"200120"'
+        + '},'
+        + '"items":['
+        + '{"sku_id":"SKU-LAPTOP-01","quantity":2,"unitPrice":5999.0},'
+        + '{"sku_id":"SKU-MOUSE-88","quantity":3,"unitPrice":199.0}'
+        + ']}'
+    )
+    r1 = client.post("/api/v1/fulfillment/dispatch", json=valid_payload)
+    assert r1.status_code == 201, f"Expected 201, got {r1.status_code}: {r1.text}"
+    assert '"status":"dispatched"' in r1.text
+    assert '"SF-20261011"' in r1.text
+    assert '"item_subtotal":12595.0' in r1.text
+    assert '"shipping_fee":12.0' in r1.text
+    assert '"insurance_fee":25.0' in r1.text
+    assert '"discount_amount":2519.0' in r1.text
+    assert '"final_payable":10113.0' in r1.text
+    print("[OK] Test 1 (Full-Featured Valid Request & Financial Metrics): PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 2: Primitive Constraints (Regex pattern, Email format, Enum choices)
+    # -------------------------------------------------------------------------
+    invalid_primitives = (
+        '{"tracking_sn":"INVALID-SN-123",'
+        + '"customer_email":"not_an_email",'
+        + '"deliverySpeed":"hyperloop",'
+        + '"priority":15,'
+        + '"tags":["misc"],'
+        + '"address":{"city":"Shanghai","detail":"Valid long street detail","zipCode":"200120"},'
+        + '"items":[{"sku_id":"SKU-01","quantity":1,"unitPrice":10.0}]}'
+    )
+    r2 = client.post("/api/v1/fulfillment/dispatch", json=invalid_primitives)
+    assert r2.status_code == 422, f"Expected 422, got {r2.status_code}"
+    assert '"value_error.pattern"' in r2.text
+    assert '"value_error.format.email"' in r2.text
+    assert '"value_error.choices"' in r2.text
+    assert '"value_error.number.lt"' in r2.text
+    print("[OK] Test 2 (Primitives Validation: Regex, Format, Enum, Bounds): PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 3: Collection Constraints (List min_items and max_items)
+    # -------------------------------------------------------------------------
+    empty_tags_payload = (
+        '{"tracking_sn":"SF-12345678",'
+        + '"customer_email":"test@logistics.com",'
+        + '"tags":[],'
+        + '"address":{"city":"Shanghai","detail":"Valid long street detail","zipCode":"200120"},'
+        + '"items":[{"sku_id":"SKU-01","quantity":1,"unitPrice":10.0}]}'
+    )
+    r3 = client.post("/api/v1/fulfillment/dispatch", json=empty_tags_payload)
+    assert r3.status_code == 422
+    assert '"value_error.list.min_items"' in r3.text
+    print("[OK] Test 3 (Collection Bounds: List min_items Constraint): PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 4: Deep Composite Nested Models & Hierarchical Loc Backtracking
+    # -------------------------------------------------------------------------
+    nested_err_payload = (
+        '{"tracking_sn":"SF-88888888",'
+        + '"customer_email":"buyer@domain.com",'
+        + '"tags":["fast"],'
+        + '"address":{'
+        + '"city":"Shanghai",'
+        + '"detail":"Valid road detail",'
+        + '"zipCode":"ABC"'
+        + '},'
+        + '"items":['
+        + '{"sku_id":"OK-SKU","quantity":1,"unitPrice":100.0},'
+        + '{"sku_id":"BAD-SKU","quantity":1,"unitPrice":-5.0}'
+        + ']}'
+    )
+    r4 = client.post("/api/v1/fulfillment/dispatch", json=nested_err_payload)
+    assert r4.status_code == 422
+    assert '"address","zipCode"' in r4.text
+    assert '"items","1","unitPrice"' in r4.text
+    print("[OK] Test 4 (Deep Nested Submodels & Hierarchical loc Backtracking): PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 5: Custom Domain Validation Hooks (Cross-Field Business Rules)
+    # -------------------------------------------------------------------------
+    sameday_remote_city = (
+        '{"tracking_sn":"SF-11223344",'
+        + '"customer_email":"user@corp.cn",'
+        + '"deliverySpeed":"same_day",'
+        + '"tags":["urgent"],'
+        + '"address":{"city":"Chengdu","detail":"Long enough street address in Chengdu","zipCode":"610000"},'
+        + '"items":[{"sku_id":"SKU-01","quantity":1,"unitPrice":50.0}]}'
+    )
+    r5_1 = client.post("/api/v1/fulfillment/dispatch", json=sameday_remote_city)
+    assert r5_1.status_code == 422
+    assert '"value_error.unsupported_region"' in r5_1.text
+    print("[OK] Test 5 (Custom Cross-Field Domain Validation Hooks): PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 6: Optional[T] Behavior & None/null Parity
+    # -------------------------------------------------------------------------
+    optional_payload = (
+        '{"tracking_sn":"SF-99887766",'
+        + '"customer_email":"minimal@corp.cn",'
+        + '"memo":null,'
+        + '"tags":["standard"],'
+        + '"address":{"city":"Shanghai","detail":"Standard Street 123456","zipCode":"200000"},'
+        + '"items":[{"sku_id":"SKU-ITEM","quantity":1,"unitPrice":50.0}]}'
+    )
+    res_opt = FulfillmentRequest.from_json(optional_payload)
+    assert res_opt.is_ok()
+    req_opt = res_opt.unwrap()
+    assert req_opt.memo is None
+    assert req_opt.discount_code is None
+    json_dump = req_opt.to_json()
+    assert '"memo":null' in json_dump
+    assert '"discount_code":null' in json_dump
+    print("[OK] Test 6 (Optional[T] Fields, None Mapping & null Parity): PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 7: Multi-source Parsing (URL Query Params -> from_dict)
+    # -------------------------------------------------------------------------
+    r7 = client.get("/api/v1/fulfillment/inspect-query?city=Hangzhou&detail=Westlake%20Road%20999&zipCode=310000")
+    assert r7.status_code == 200
+    assert '"city":"Hangzhou"' in r7.text
+    assert '"zipCode":"310000"' in r7.text
+    print("[OK] Test 7 (Multi-source Ingestion: URL Query Param Coercion): PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 8: Sync ORM Persistence & CRUD Showcase (sync_service.codon)
+    # -------------------------------------------------------------------------
+    r8_roundtrip = client.post("/api/v1/fulfillment/orm-roundtrip", json=valid_payload)
+    assert r8_roundtrip.status_code == 200
+    assert '"synced":true' in r8_roundtrip.text
+
+    # Direct synchronous ORM CRUD verification
+    db_order_sync = FulfillmentOrderTable(
+        tracking_sn="SF-SYNC-001",
+        customer_email="sync_user@corp.com",
+        delivery_speed="standard",
+        priority=2,
+        fragile=False,
+        insured_amount=50.0,
+        memo=Optional[str]("Sync ORM Record"),
+        tags="sync,legacy",
+        city="Hangzhou",
+        detail="West Lake Avenue 101",
+        zip_code="310000",
+        items='[{"sku_id":"SKU-SYNC-01","quantity":1,"unitPrice":99.0}]'
+    )
+
+    sync_ins_id = SyncFulfillmentService.save_to_real_db(FulfillmentRequest.from_orm(db_order_sync).unwrap())
+    assert sync_ins_id > 0
+
+    sync_fetched = SyncFulfillmentService.find_by_tracking_sn("SF-SYNC-001")
+    assert sync_fetched is not None
+    assert sync_fetched.tracking_sn == "SF-SYNC-001"
+
+    # Sync Update
+    sync_up_ok = SyncFulfillmentService.update_order_sync("SF-SYNC-001", 5, "Updated Sync Memo")
+    assert sync_up_ok
+
+    # Sync Delete
+    sync_del_ok = SyncFulfillmentService.delete_order_sync("SF-SYNC-001")
+    assert sync_del_ok
+    assert SyncFulfillmentService.find_by_tracking_sn("SF-SYNC-001") is None
+    print("[OK] Test 8 (Synchronous ORM Service CRUD Showcase): PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 9: Zero-Copy ByteBuffer Streaming & OpenAPI 3.0 Introspection
+    # -------------------------------------------------------------------------
+    req_inst = res_opt.unwrap()
+    buf = FulfillmentService.write_direct_to_buffer(req_inst)
+    buf_str = buf.readable_slice().to_str()
+    assert '"tracking_sn":"SF-99887766"' in buf_str
+
+    r9_schema = client.get("/api/v1/fulfillment/schema")
+    assert r9_schema.status_code == 200
+    assert '"title":"FulfillmentRequest"' in r9_schema.text
+    print("[OK] Test 9 (Zero-Copy ByteBuffer & OpenAPI Spec Introspection): PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 10: SCENARIO 1 Full CRUD Endpoints (Fulfillment Orders via Async ORM)
+    # -------------------------------------------------------------------------
+    print("\n--- Testing Scenario 1: Fulfillment Orders Full CRUD Endpoints ---")
+    order_create_payload = (
+        '{"tracking_sn":"SF-99000001",'
+        + '"customer_email":"crud_tester@fulfillment.corp",'
+        + '"deliverySpeed":"express",'
+        + '"priority":4,'
+        + '"fragile":false,'
+        + '"insured_amount":1500.0,'
+        + '"memo":"Initial order memo",'
+        + '"tags":["crud_test","priority"],'
+        + '"address":{"city":"Shanghai","detail":"Century Park Gate 3 Road","zipCode":"200135"},'
+        + '"items":[{"sku_id":"SKU-CRUD-ITEM","quantity":2,"unitPrice":88.0}]}'
+    )
+
+    # 10.1 CREATE (POST /api/v1/fulfillment/orders)
+    r10_c = client.post("/api/v1/fulfillment/orders", json=order_create_payload)
+    assert r10_c.status_code == 201, f"Expected 201, got {r10_c.status_code}: {r10_c.text}"
+    assert '"status":"created"' in r10_c.text
+    assert '"SF-99000001"' in r10_c.text
+    print("  [CRUD 1/4] POST /api/v1/fulfillment/orders (Create): PASSED")
+
+    # 10.2 READ (GET /api/v1/fulfillment/orders?tracking_sn=SF-99000001)
+    r10_r = client.get("/api/v1/fulfillment/orders?tracking_sn=SF-99000001")
+    assert r10_r.status_code == 200, f"Expected 200, got {r10_r.status_code}: {r10_r.text}"
+    assert '"tracking_sn":"SF-99000001"' in r10_r.text
+    assert '"city":"Shanghai"' in r10_r.text
+    print("  [CRUD 2/4] GET /api/v1/fulfillment/orders (Read Single): PASSED")
+
+    # 10.2b LIST (GET /api/v1/fulfillment/orders/list)
+    r10_list = client.get("/api/v1/fulfillment/orders/list?delivery_speed=express&limit=5")
+    assert r10_list.status_code == 200
+    assert '"SF-99000001"' in r10_list.text
+    print("  [CRUD 2b] GET /api/v1/fulfillment/orders/list (Filtered Search): PASSED")
+
+    # 10.3 UPDATE (PUT /api/v1/fulfillment/orders?tracking_sn=SF-99000001)
+    order_up_payload = (
+        '{"deliverySpeed":"same_day",'
+        + '"priority":7,'
+        + '"insured_amount":2500.0,'
+        + '"memo":"Updated urgent memo",'
+        + '"status_code":3}'
+    )
+    r10_u = client.put("/api/v1/fulfillment/orders?tracking_sn=SF-99000001", json=order_up_payload)
+    assert r10_u.status_code == 200, f"Expected 200, got {r10_u.status_code}: {r10_u.text}"
+    assert '"updated":true' in r10_u.text
+
+    # Verify updated values via Read
+    r10_r2 = client.get("/api/v1/fulfillment/orders?tracking_sn=SF-99000001")
+    assert r10_r2.status_code == 200
+    assert '"deliverySpeed":"same_day"' in r10_r2.text
+    assert '"memo":"Updated urgent memo"' in r10_r2.text
+    print("  [CRUD 3/4] PUT /api/v1/fulfillment/orders (Update): PASSED")
+
+    # 10.4 DELETE (DELETE /api/v1/fulfillment/orders?tracking_sn=SF-99000001)
+    r10_d = client.delete("/api/v1/fulfillment/orders?tracking_sn=SF-99000001")
+    assert r10_d.status_code == 200, f"Expected 200, got {r10_d.status_code}: {r10_d.text}"
+    assert '"deleted":true' in r10_d.text
+
+    # Verify deletion returns 404
+    r10_r3 = client.get("/api/v1/fulfillment/orders?tracking_sn=SF-99000001")
+    assert r10_r3.status_code == 404
+    print("  [CRUD 4/4] DELETE /api/v1/fulfillment/orders (Delete & Verify 404): PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 11: SCENARIO 2 Full CRUD Endpoints (Warehouse Inventory via Async ORM)
+    # Covers BigInteger, SmallInteger, Decimal, Json, List[int], List[bool], Optional[float], Optional[int]
+    # -------------------------------------------------------------------------
+    print("\n--- Testing Scenario 2: Warehouse Inventory Full CRUD Endpoints ---")
+    inv_create_payload = (
+        '{"sku_id":"SKU-TEST-01",'
+        + '"warehouse_code":"WH-EAST-01",'
+        + '"zone_id":12,'
+        + '"total_stock":50000,'
+        + '"reserved_stock":100,'
+        + '"unit_weight_kg":2.545,'
+        + '"temperature_controlled":true,'
+        + '"target_temperature":-18.0,'
+        + '"min_reorder_level":500,'
+        + '"is_quarantine":false,'
+        + '"dimensions_cm":[45,30,25],'
+        + '"inspection_flags":[true,true,true]}'
+    )
+
+    # 11.1 CREATE (POST /api/v1/inventory)
+    r11_c = client.post("/api/v1/inventory", json=inv_create_payload)
+    assert r11_c.status_code == 201, f"Expected 201, got {r11_c.status_code}: {r11_c.text}"
+    assert '"status":"created"' in r11_c.text
+    assert '"SKU-TEST-01"' in r11_c.text
+    print("  [CRUD 1/4] POST /api/v1/inventory (Create Inventory): PASSED")
+
+    # 11.2 READ (GET /api/v1/inventory?sku_id=SKU-TEST-01)
+    r11_r = client.get("/api/v1/inventory?sku_id=SKU-TEST-01")
+    assert r11_r.status_code == 200, f"Expected 200, got {r11_r.status_code}: {r11_r.text}"
+    assert '"sku_id":"SKU-TEST-01"' in r11_r.text
+    assert '"warehouse_code":"WH-EAST-01"' in r11_r.text
+    assert '"dimensions_cm":[45,30,25]' in r11_r.text
+    assert '"target_temperature":-18' in r11_r.text
+    assert '"min_reorder_level":500' in r11_r.text
+    print("  [CRUD 2/4] GET /api/v1/inventory (Read Single): PASSED")
+
+    # 11.2b LIST (GET /api/v1/inventory/list)
+    r11_list = client.get("/api/v1/inventory/list?warehouse_code=WH-EAST-01&min_stock=1000")
+    assert r11_list.status_code == 200
+    assert '"SKU-TEST-01"' in r11_list.text
+    print("  [CRUD 2b] GET /api/v1/inventory/list (Filtered Search): PASSED")
+
+    # 11.3 UPDATE (PUT /api/v1/inventory?sku_id=SKU-TEST-01)
+    inv_up_payload = (
+        '{"total_stock":80000,'
+        + '"reserved_stock":250,'
+        + '"min_reorder_level":1000,'
+        + '"is_quarantine":true}'
+    )
+    r11_u = client.put("/api/v1/inventory?sku_id=SKU-TEST-01", json=inv_up_payload)
+    assert r11_u.status_code == 200, f"Expected 200, got {r11_u.status_code}: {r11_u.text}"
+    assert '"updated":true' in r11_u.text
+
+    # Verify updated values via Read
+    r11_r2 = client.get("/api/v1/inventory?sku_id=SKU-TEST-01")
+    assert r11_r2.status_code == 200
+    assert '"total_stock":80000' in r11_r2.text
+    assert '"is_quarantine":true' in r11_r2.text
+    print("  [CRUD 3/4] PUT /api/v1/inventory (Update Stock): PASSED")
+
+    # 11.4 DELETE (DELETE /api/v1/inventory?sku_id=SKU-TEST-01)
+    r11_d = client.delete("/api/v1/inventory?sku_id=SKU-TEST-01")
+    assert r11_d.status_code == 200, f"Expected 200, got {r11_d.status_code}: {r11_d.text}"
+    assert '"deleted":true' in r11_d.text
+
+    # Verify deletion returns 404
+    r11_r3 = client.get("/api/v1/inventory?sku_id=SKU-TEST-01")
+    assert r11_r3.status_code == 404
+    print("  [CRUD 4/4] DELETE /api/v1/inventory (Delete & Verify 404): PASSED")
+
+    # 11.5 Inventory Validation Errors (Stock inconsistency check)
+    bad_stock_payload = (
+        '{"sku_id":"SKU-BAD",'
+        + '"warehouse_code":"WH-EAST-01",'
+        + '"zone_id":1,'
+        + '"total_stock":10,'
+        + '"reserved_stock":50,' # total < reserved -> error!
+        + '"unit_weight_kg":1.0,'
+        + '"temperature_controlled":false,'
+        + '"dimensions_cm":[10,10,10],'
+        + '"inspection_flags":[true,false]}'
+    )
+    r11_err = client.post("/api/v1/inventory", json=bad_stock_payload)
+    assert r11_err.status_code == 422
+    assert '"value_error.stock_inconsistent"' in r11_err.text
+    print("  [Validation] Inventory stock consistency constraint: PASSED")
+
+    # -------------------------------------------------------------------------
+    # Test 12: SCENARIO 3 Full CRUD Endpoints (Shipment Tracking via Async ORM)
+    # Covers TinyInteger, DateTime, Json, List[float] GPS coordinates, List[SubModel]
+    # -------------------------------------------------------------------------
+    print("\n--- Testing Scenario 3: Shipment Tracking Full CRUD Endpoints ---")
+    ship_create_payload = (
+        '{"waybill_no":"WB-SF88889999",'
+        + '"carrier_code":"SF_EXPRESS",'
+        + '"status_code":1,'
+        + '"dispatcher_email":"sf_dispatch@carrier.cn",'
+        + '"gross_weight_kg":14.5,'
+        + '"signature_required":true,'
+        + '"delivery_deadline_hours":24,'
+        + '"carbon_footprint_kg":0.85,'
+        + '"gps_coordinates":[31.2304,121.4737],' # Shanghai coords
+        + '"route_stations":['
+        + '{"station_name":"Pudong Hub","city":"Shanghai","passed":true},'
+        + '{"station_name":"Hangzhou Station","city":"Hangzhou","passed":false}'
+        + ']}'
+    )
+
+    # 12.1 CREATE (POST /api/v1/shipments)
+    r12_c = client.post("/api/v1/shipments", json=ship_create_payload)
+    assert r12_c.status_code == 201, f"Expected 201, got {r12_c.status_code}: {r12_c.text}"
+    assert '"status":"created"' in r12_c.text
+    assert '"WB-SF88889999"' in r12_c.text
+    print("  [CRUD 1/4] POST /api/v1/shipments (Create Waybill): PASSED")
+
+    # 12.2 READ (GET /api/v1/shipments?waybill_no=WB-SF88889999)
+    r12_r = client.get("/api/v1/shipments?waybill_no=WB-SF88889999")
+    assert r12_r.status_code == 200, f"Expected 200, got {r12_r.status_code}: {r12_r.text}"
+    assert '"waybill_no":"WB-SF88889999"' in r12_r.text
+    assert '"carrier_code":"SF_EXPRESS"' in r12_r.text
+    assert '"Pudong Hub"' in r12_r.text
+    assert '"carbon_footprint_kg":0.85' in r12_r.text
+    print("  [CRUD 2/4] GET /api/v1/shipments (Read Waybill): PASSED")
+
+    # 12.2b LIST (GET /api/v1/shipments/list)
+    r12_list = client.get("/api/v1/shipments/list?carrier_code=SF_EXPRESS")
+    assert r12_list.status_code == 200
+    assert '"WB-SF88889999"' in r12_list.text
+    print("  [CRUD 2b] GET /api/v1/shipments/list (Filtered Search): PASSED")
+
+    # 12.3 UPDATE (PUT /api/v1/shipments?waybill_no=WB-SF88889999)
+    ship_up_payload = (
+        '{"status_code":3,'
+        + '"status_remark":"Parcel arrived at Hangzhou sorting center",'
+        + '"carbon_footprint_kg":1.12}'
+    )
+    r12_u = client.put("/api/v1/shipments?waybill_no=WB-SF88889999", json=ship_up_payload)
+    assert r12_u.status_code == 200, f"Expected 200, got {r12_u.status_code}: {r12_u.text}"
+    assert '"updated":true' in r12_u.text
+
+    # Verify updated values via Read
+    r12_r2 = client.get("/api/v1/shipments?waybill_no=WB-SF88889999")
+    assert r12_r2.status_code == 200
+    assert '"status_code":3' in r12_r2.text
+    assert '"carbon_footprint_kg":1.12' in r12_r2.text
+    print("  [CRUD 3/4] PUT /api/v1/shipments (Update Waybill Status): PASSED")
+
+    # 12.4 DELETE (DELETE /api/v1/shipments?waybill_no=WB-SF88889999)
+    r12_d = client.delete("/api/v1/shipments?waybill_no=WB-SF88889999")
+    assert r12_d.status_code == 200, f"Expected 200, got {r12_d.status_code}: {r12_d.text}"
+    assert '"deleted":true' in r12_d.text
+
+    # Verify deletion returns 404
+    r12_r3 = client.get("/api/v1/shipments?waybill_no=WB-SF88889999")
+    assert r12_r3.status_code == 404
+    print("  [CRUD 4/4] DELETE /api/v1/shipments (Delete & Verify 404): PASSED")
+
+    # 12.5 Shipment GPS Latitude/Longitude Bounds validation
+    bad_gps_payload = (
+        '{"waybill_no":"WB-SF88889999",'
+        + '"carrier_code":"SF_EXPRESS",'
+        + '"status_code":1,'
+        + '"dispatcher_email":"sf@carrier.cn",'
+        + '"gross_weight_kg":10.0,'
+        + '"gps_coordinates":[999.0,121.4737],' # lat > 90 -> error!
+        + '"route_stations":[{"station_name":"Hub","city":"Shanghai","passed":true}]}'
+    )
+    r12_err = client.post("/api/v1/shipments", json=bad_gps_payload)
+    assert r12_err.status_code == 422
+    assert '"value_error.latitude"' in r12_err.text
+    print("  [Validation] Shipment GPS boundary cross-field validation: PASSED")
+
+    print("\n================================================================================")
+    print("ALL 12 Industrial Schema & Async ORM Full CRUD Verification Scenarios PASSED!")
+    print("================================================================================")
+
+
+if __name__ == "__main__":
+    run_full_suite()

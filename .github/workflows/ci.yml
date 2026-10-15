@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-and-test:
-    name: Build & Test (Ubuntu)
+    name: Build & Test Suite (Ubuntu 22.04)
     runs-on: ubuntu-latest
 
     steps:
@@ -18,7 +18,15 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential gcc make curl
+          sudo apt-get install -y \
+            build-essential \
+            gcc \
+            make \
+            curl \
+            libpq-dev \
+            liburing-dev \
+            python3 \
+            python3-jinja2
 
       - name: Install Codon Compiler
         run: |
@@ -28,16 +36,30 @@ jobs:
       - name: Verify Environment
         run: |
           gcc --version
-          codon --version
+          $HOME/.codon/bin/codon --version
 
-      - name: Build Native C Extensions (FastJson/yyjson)
+      - name: Build Native C Extensions
         run: |
           make native
+
+      - name: Verify Code-First AOT Schema Pipeline
+        run: |
+          make codegen
 
       - name: Run Core Integration Tests
         run: |
           make test
 
-      - name: Run All CodonWeb Test Suites
+      - name: Run Schema Tests
         run: |
-          CODON_PATH=. codon run --linker-flags 'src/native/libcfastjson.a' tests/run_all.codon
+          make test-schema
+
+      - name: Run Distributed TaskQ Tests
+        run: |
+          make test-taskq
+          make test-async-taskq
+          make test-cancellation
+
+      - name: Run Full CodonWeb 33-Test Suite
+        run: |
+          make test-all

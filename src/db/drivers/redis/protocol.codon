@@ -1,0 +1,307 @@
+# RESP2 / RESP3 Industrial Protocol Parser and Formatter for Codon Redis Driver
+
+from typing import Optional, List
+from src.os.socket import Socket
+from src.core.async.stream import AsyncStreamReader, _decode_stream_bytes
+from src.memory.buffer import ByteBuffer
+from src.db.drivers.redis.errors import RedisCommandError, RedisConnectionError
+from src.os.linux import recv as c_recv
+
+class RedisValue:
+    val_type: str  # 'str', 'int', 'error', 'nil', 'array', 'bool', 'float'
+    str_val: str
+    int_val: int
+    arr_val: List[RedisValue]
+
+    def __init__(
+        self,
+        val_type: str,
+        str_val: str = "",
+        int_val: int = 0,
+        arr_val: Optional[List[RedisValue]] = None
+    ):
+        self.val_type = val_type
+        self.str_val = str_val
+        self.int_val = int_val
+        self.arr_val = arr_val if arr_val is not None else List[RedisValue]()
+
+    def is_nil(self) -> bool:
+        return self.val_type == "nil"
+
+    def is_error(self) -> bool:
+        return self.val_type == "error"
+
+    def raise_if_error(self) -> None:
+        if self.val_type == "error":
+            raise RedisCommandError(self.str_val)
+
+    def as_str(self) -> str:
+        self.raise_if_error()
+        if self.val_type == "nil":
+            return ""
+        return self.str_val
+
+    def as_int(self) -> int:
+        self.raise_if_error()
+        if self.val_type == "int" or self.val_type == "bool":
+            return self.int_val
+        if len(self.str_val) > 0:
+            return int(self.str_val)
+        return 0
+
+    def as_bool(self) -> bool:
+        self.raise_if_error()
+        if self.val_type == "bool" or self.val_type == "int":
+            return self.int_val != 0
+        return self.str_val == "OK" or self.str_val == "1" or self.str_val == "true"
+
+    def as_float(self) -> float:
+        self.raise_if_error()
+        if self.val_type == "int":
+            return float(self.int_val)
+        if len(self.str_val) > 0:
+            return float(self.str_val)
+        return 0.0
+
+    def as_list(self) -> List[str]:
+        self.raise_if_error()
+        res: List[str] = List[str]()
+        if self.val_type == "array":
+            for i in range(len(self.arr_val)):
+                res.append(self.arr_val[i].as_str())
+        elif self.val_type == "str":
+            res.append(self.str_val)
+        return res
+
+    def as_dict(self) -> dict[str, str]:
+        self.raise_if_error()
+        res: dict[str, str] = {}
+        if self.val_type == "array":
+            n = len(self.arr_val)
+            i = 0
+            while i + 1 < n:
+                k = self.arr_val[i].as_str()
+                v = self.arr_val[i + 1].as_str()
+                res[k] = v
+                i += 2
+        return res
+
+
+def encode_command_to_buf(cmd_args: List[str], buf: ByteBuffer) -> None:
+    """Zero-copy serializes RESP command array directly into target ByteBuffer without intermediary strings."""
+    buf.append_byte(byte(42))  # '*'
+    buf.append_int(len(cmd_args))
+    buf.append_byte(byte(13))  # '\r'
+    buf.append_byte(byte(10))  # '\n'
+    for i in range(len(cmd_args)):
+        arg = cmd_args[i]
+        b = arg.encode("utf-8")
+        buf.append_byte(byte(36))  # '$'
+        buf.append_int(len(b))
+        buf.append_byte(byte(13))
+        buf.append_byte(byte(10))
+        if len(b) > 0:
+            buf.append_c_str_fast(Ptr[byte](b._ptr), len(b))
+        buf.append_byte(byte(13))
+        buf.append_byte(byte(10))
+
+def encode_command(cmd_args: List[str]) -> str:
+    """Encodes command arguments into a RESP array byte frame with byte-accurate lengths."""
+    parts: List[str] = [f"*{len(cmd_args)}\r\n"]
+    for i in range(len(cmd_args)):
+        arg = cmd_args[i]
+        b = arg.encode("utf-8")
+        parts.append(f"${len(b)}\r\n{arg}\r\n")
+    return "".join(parts)
+
+
+class SyncSocketReader:
+    """Buffered reader for synchronous blocking POSIX sockets using native ByteBuffer."""
+    sock: Socket
+    buf: ByteBuffer
+
+    def __init__(self, sock: Socket, capacity: int = 65536):
+        self.sock = sock
+        self.buf = ByteBuffer(capacity if capacity >= 4096 else 65536)
+
+    def readline(self) -> str:
+        while True:
+            rslice = self.buf.readable_slice()
+            for i in range(rslice.len - 1):
+                if rslice.ptr[i] == byte(13) and rslice.ptr[i + 1] == byte(10): # \r\n
+                    p_res = Ptr[byte](i + 1)
+                    str.memcpy(p_res.as_byte(), rslice.ptr.as_byte(), i)
+                    p_res[i] = byte(0)
+                    self.buf.consume(i + 2)
+                    return _decode_stream_bytes(p_res, i)
+
+            # Need more data from socket
+            self.buf.ensure_writable(4096)
+            buf_ptr = self.buf.write_ptr()
+            ret = c_recv(self.sock.fd, buf_ptr, 4096, i32(0))
+            if ret <= 0:
+                raise RedisConnectionError("Redis socket closed unexpectedly while reading line")
+            self.buf.advance_write(int(ret))
+
+    def readexactly(self, n: int) -> str:
+        while self.buf.readable_bytes() < n:
+            needed = n - self.buf.readable_bytes()
+            chunk_size = needed if needed > 4096 else 4096
+            self.buf.ensure_writable(chunk_size)
+            buf_ptr = self.buf.write_ptr()
+            ret = c_recv(self.sock.fd, buf_ptr, chunk_size, i32(0))
+            if ret <= 0:
+                raise RedisConnectionError(f"Redis socket closed unexpectedly while reading {n} bytes")
+            self.buf.advance_write(int(ret))
+
+        p_res = Ptr[byte](n + 1)
+        str.memcpy(p_res.as_byte(), self.buf.readable_slice().ptr.as_byte(), n)
+        p_res[n] = byte(0)
+        self.buf.consume(n)
+        return _decode_stream_bytes(p_res, n)
+
+
+def parse_resp_sync(reader: SyncSocketReader) -> RedisValue:
+    """Synchronously parses a RESP response frame from a blocking socket."""
+    line = reader.readline()
+    if len(line) == 0:
+        raise RedisConnectionError("Empty reply from Redis server")
+
+    resp_type = line[0]
+    payload = line[1:]
+
+    if resp_type == '+':  # Simple String
+        return RedisValue("str", str_val=payload)
+    elif resp_type == '-':  # Error
+        return RedisValue("error", str_val=payload)
+    elif resp_type == ':':  # Integer
+        return RedisValue("int", int_val=int(payload))
+    elif resp_type == '$':  # Bulk String
+        length = int(payload)
+        if length < 0:
+            return RedisValue("nil")
+        data = reader.readexactly(length)
+        reader.readexactly(2)  # consume \r\n
+        return RedisValue("str", str_val=data)
+    elif resp_type == '*':  # Array
+        count = int(payload)
+        if count < 0:
+            return RedisValue("nil")
+        arr = List[RedisValue]()
+        for _ in range(count):
+            arr.append(parse_resp_sync(reader))
+        return RedisValue("array", arr_val=arr)
+    elif resp_type == '_':  # RESP3 Null
+        return RedisValue("nil")
+    elif resp_type == '#':  # RESP3 Boolean
+        return RedisValue("bool", int_val=1 if payload == "t" else 0)
+    elif resp_type == ',':  # RESP3 Float
+        return RedisValue("float", str_val=payload)
+    elif resp_type == '!':  # RESP3 Blob Error
+        length = int(payload)
+        if length < 0:
+            return RedisValue("error", str_val="Blob error")
+        data = reader.readexactly(length)
+        reader.readexactly(2)
+        return RedisValue("error", str_val=data)
+
+    return RedisValue("str", str_val=line)
+
+
+class _RespArrayFrame:
+    arr: List[RedisValue]
+    remaining: int
+
+    def __init__(self, arr: List[RedisValue], remaining: int):
+        self.arr = arr
+        self.remaining = remaining
+
+
+async def parse_resp_async(reader: AsyncStreamReader):
+    """Asynchronously parses a RESP response frame from an Epoll AsyncStreamReader iteratively."""
+    stack = List[_RespArrayFrame]()
+    root_arr = List[RedisValue]()
+
+    while True:
+        raw_line = await reader.readline()
+        if len(raw_line) == 0:
+            raise RedisConnectionError("Empty reply from Redis server")
+
+        line = raw_line
+        if line.endswith("\r\n"):
+            line = line[:-2]
+        elif line.endswith("\n"):
+            line = line[:-1]
+
+        if len(line) == 0:
+            raise RedisConnectionError("Unexpected empty line from Redis server")
+
+        resp_type = line[0]
+        payload = line[1:]
+
+        val = RedisValue("nil")
+        is_array_push = False
+        new_arr = List[RedisValue]()
+        new_count = 0
+
+        if resp_type == '+':  # Simple String
+            val = RedisValue("str", str_val=payload)
+        elif resp_type == '-':  # Error
+            val = RedisValue("error", str_val=payload)
+        elif resp_type == ':':  # Integer
+            val = RedisValue("int", int_val=int(payload))
+        elif resp_type == '$':  # Bulk String
+            length = int(payload)
+            if length < 0:
+                val = RedisValue("nil")
+            else:
+                data = await reader.readexactly(length)
+                await reader.readexactly(2)  # consume trailing \r\n
+                val = RedisValue("str", str_val=data)
+        elif resp_type == '*':  # Array
+            count = int(payload)
+            if count < 0:
+                val = RedisValue("nil")
+            elif count == 0:
+                val = RedisValue("array", arr_val=List[RedisValue]())
+            else:
+                new_arr = List[RedisValue]()
+                val = RedisValue("array", arr_val=new_arr)
+                is_array_push = True
+                new_count = count
+        elif resp_type == '_':  # RESP3 Null
+            val = RedisValue("nil")
+        elif resp_type == '#':  # RESP3 Boolean
+            val = RedisValue("bool", int_val=1 if payload == "t" else 0)
+        elif resp_type == ',':  # RESP3 Float
+            val = RedisValue("float", str_val=payload)
+        elif resp_type == '!':  # RESP3 Blob Error
+            length = int(payload)
+            if length < 0:
+                val = RedisValue("error", str_val="Blob error")
+            else:
+                data = await reader.readexactly(length)
+                await reader.readexactly(2)
+                val = RedisValue("error", str_val=data)
+        else:
+            val = RedisValue("str", str_val=line)
+
+        if len(stack) == 0:
+            if is_array_push:
+                root_arr = new_arr
+                stack.append(_RespArrayFrame(new_arr, new_count))
+            else:
+                return val
+        else:
+            top = stack[-1]
+            top.arr.append(val)
+            top.remaining -= 1
+
+            if is_array_push:
+                stack.append(_RespArrayFrame(new_arr, new_count))
+
+            while len(stack) > 0 and stack[-1].remaining == 0:
+                stack.pop()
+
+            if len(stack) == 0:
+                return RedisValue("array", arr_val=root_arr)

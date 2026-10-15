@@ -1,0 +1,293 @@
+# Industrial-Grade Asynchronous Redis Connection Pool for Codon Web
+
+import time
+from typing import Optional, List, Tuple
+from asyncio import Future
+from src.core.async.loop import get_event_loop, wait_for
+from src.db.drivers.redis.async_connection import AsyncRedisConnection
+from src.db.drivers.redis.errors import RedisPoolError, RedisConnectionError
+from src.db.drivers.redis.protocol import RedisValue
+
+class AsyncPooledRedisConnection[PoolType]:
+    _pool: PoolType
+    _conn: AsyncRedisConnection
+    _is_returned: bool
+
+    def __init__(self, pool: PoolType, conn: AsyncRedisConnection):
+        self._pool = pool
+        self._conn = conn
+        self._is_returned = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self):
+        self.close()
+
+    def close(self):
+        if not self._is_returned:
+            self._is_returned = True
+            self._pool.release(self._conn)
+
+    @property
+    def is_connected(self) -> bool:
+        return self._conn.is_connected
+
+    async def execute(self, cmd_args: List[str], timeout_sec: float = 5.0):
+        return await self._conn.execute(cmd_args, timeout_sec)
+
+    async def ping(self):
+        return await self._conn.ping()
+
+    async def get(self, key: str):
+        return await self._conn.get(key)
+
+    async def set(self, key: str, val: str, ex: int = 0, px: int = 0, nx: bool = False, xx: bool = False):
+        return await self._conn.set(key, val, ex=ex, px=px, nx=nx, xx=xx)
+
+    async def setex(self, key: str, sec: int, val: str):
+        return await self._conn.setex(key, sec, val)
+
+    async def setnx(self, key: str, val: str):
+        return await self._conn.setnx(key, val)
+
+    async def del_key(self, key: str):
+        return await self._conn.del_key(key)
+
+    async def del_keys(self, keys: List[str]):
+        return await self._conn.del_keys(keys)
+
+    async def exists(self, key: str):
+        return await self._conn.exists(key)
+
+    async def incr(self, key: str):
+        return await self._conn.incr(key)
+
+    async def decr(self, key: str):
+        return await self._conn.decr(key)
+
+    async def expire(self, key: str, sec: int):
+        return await self._conn.expire(key, sec)
+
+    async def ttl(self, key: str):
+        return await self._conn.ttl(key)
+
+    async def hget(self, name: str, key: str):
+        return await self._conn.hget(name, key)
+
+    async def hset(self, name: str, key: str, val: str):
+        return await self._conn.hset(name, key, val)
+
+    async def hgetall(self, name: str):
+        return await self._conn.hgetall(name)
+
+    async def hdel(self, name: str, keys: List[str]):
+        return await self._conn.hdel(name, keys)
+
+    async def lpush(self, name: str, values: List[str]):
+        return await self._conn.lpush(name, values)
+
+    async def rpush(self, name: str, values: List[str]):
+        return await self._conn.rpush(name, values)
+
+    async def lpop(self, name: str):
+        return await self._conn.lpop(name)
+
+    async def rpop(self, name: str):
+        return await self._conn.rpop(name)
+
+    async def sadd(self, name: str, values: List[str]):
+        return await self._conn.sadd(name, values)
+
+    async def smembers(self, name: str):
+        return await self._conn.smembers(name)
+
+    async def zadd(self, name: str, score: float, member: str):
+        return await self._conn.zadd(name, score, member)
+
+    async def zrange(self, name: str, start: int, stop: int):
+        return await self._conn.zrange(name, start, stop)
+
+    async def eval_script(self, script: str, keys: List[str], args: List[str]):
+        return await self._conn.eval_script(script, keys, args)
+
+    async def keys(self, pattern: str = "*"):
+        return await self._conn.keys(pattern)
+
+    async def mget(self, keys: List[str]):
+        return await self._conn.mget(keys)
+
+    async def lrange(self, name: str, start: int, stop: int):
+        return await self._conn.lrange(name, start, stop)
+
+    async def llen(self, name: str):
+        return await self._conn.llen(name)
+
+    async def sismember(self, name: str, value: str):
+        return await self._conn.sismember(name, value)
+
+    async def flushdb(self):
+        return await self._conn.flushdb()
+
+    async def dbsize(self):
+        return await self._conn.dbsize()
+
+
+async def _await_future_conn(fut: Future[AsyncRedisConnection]):
+    return await fut
+
+
+class AsyncRedisPool:
+    host: str
+    port: int
+    password: str
+    db: int
+    min_size: int
+    max_size: int
+    acquire_timeout: float
+    idle_timeout: float
+    _available: List[AsyncRedisConnection]
+    _in_use_count: int
+    _waiters: List[Future[AsyncRedisConnection]]
+    _is_closed: bool
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 6379,
+        password: str = "",
+        db: int = 0,
+        min_size: int = 2,
+        max_size: int = 20,
+        acquire_timeout: float = 5.0,
+        idle_timeout: float = 30.0
+    ):
+        self.host = host
+        self.port = port
+        self.password = password
+        self.db = db
+        self.min_size = min_size
+        self.max_size = max_size if max_size >= min_size else min_size
+        self.acquire_timeout = acquire_timeout
+        self.idle_timeout = idle_timeout
+        self._available = List[AsyncRedisConnection]()
+        self._in_use_count = 0
+        self._waiters = List[Future[AsyncRedisConnection]]()
+        self._is_closed = False
+
+    async def init_pool(self):
+        """Pre-warms the connection pool up to min_size asynchronously."""
+        for _ in range(self.min_size):
+            conn = AsyncRedisConnection(
+                host=self.host,
+                port=self.port,
+                password=self.password,
+                db=self.db,
+                timeout_sec=self.acquire_timeout
+            )
+            ok = await conn.connect(self.acquire_timeout)
+            if ok:
+                self._available.append(conn)
+
+    async def acquire(self):
+        """
+        Asynchronously acquires a connection from the pool.
+        Uses test-on-borrow health detection, dynamic scaling, and backpressure waiting.
+        """
+        if self._is_closed:
+            raise RedisPoolError("Cannot acquire from closed AsyncRedisPool")
+
+        loop = get_event_loop()
+
+        # 1. Check existing idle connections
+        while len(self._available) > 0:
+            conn = self._available.pop(0)
+            if conn.is_connected:
+                # Test-on-borrow if idle > idle_timeout
+                if time.time() - conn.last_active_time > self.idle_timeout:
+                    try:
+                        await conn.execute(["PING"], timeout_sec=1.0)
+                    except Exception:
+                        conn.close()
+                        continue
+                self._in_use_count += 1
+                return AsyncPooledRedisConnection(self, conn)
+
+        # 2. Scale up if under max_size limit
+        if self._in_use_count < self.max_size:
+            conn = AsyncRedisConnection(
+                host=self.host,
+                port=self.port,
+                password=self.password,
+                db=self.db,
+                timeout_sec=self.acquire_timeout
+            )
+            ok = await conn.connect(self.acquire_timeout)
+            if not ok:
+                raise RedisConnectionError(f"Failed to scale up Redis connection to {self.host}:{self.port}")
+            self._in_use_count += 1
+            return AsyncPooledRedisConnection(self, conn)
+
+        # 3. Pool capacity exhausted; wait on non-blocking Future
+        fut = loop.create_future(AsyncRedisConnection)
+        self._waiters.append(fut)
+        try:
+            conn = await wait_for(_await_future_conn(fut), self.acquire_timeout)
+            return AsyncPooledRedisConnection(self, conn)
+        except:
+            # Timeout or cancellation: evict waiter to prevent ghost references
+            new_waiters = List[Future[AsyncRedisConnection]]()
+            for i in range(len(self._waiters)):
+                w = self._waiters[i]
+                if w is not fut:
+                    new_waiters.append(w)
+            self._waiters = new_waiters
+            # Critical leak prevention: check if release() assigned a connection right as timeout fired
+            if fut.done():
+                try:
+                    conn = fut.result()
+                    self.release(conn)
+                except:
+                    pass
+            raise RedisPoolError(f"Timed out after {self.acquire_timeout}s waiting for an available Redis connection")
+
+
+    def release(self, conn: AsyncRedisConnection):
+        """Returns a connection to the pool or hands it over to waiting coroutines."""
+        if self._is_closed or not conn.is_connected:
+            conn.close()
+            self._in_use_count -= 1
+            return
+
+        conn.last_active_time = time.time()
+
+        # Handover to pending waiter if exists
+        while len(self._waiters) > 0:
+            fut = self._waiters.pop(0)
+            if not fut.done():
+                fut.set_result(conn)
+                return
+
+        # Return to idle pool
+        self._in_use_count -= 1
+        self._available.append(conn)
+
+    async def close(self):
+        """Gracefully closes all connections in the pool."""
+        self._is_closed = True
+        for i in range(len(self._available)):
+            self._available[i].close()
+        self._available.clear()
+
+        # Wakeup remaining waiters with error
+        for i in range(len(self._waiters)):
+            w = self._waiters[i]
+            if not w.done():
+                w.set_exception(RedisPoolError("AsyncRedisPool was closed"))
+        self._waiters.clear()

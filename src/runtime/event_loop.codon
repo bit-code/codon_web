@@ -1,8 +1,9 @@
 import time
 from typing import Callable, Optional
 from src.os.constants import (
-    EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP, EPOLLET
+    EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP, EPOLLET, MSG_NOSIGNAL
 )
+from C import send(i32, Ptr[byte], int, i32) -> int as c_send
 from src.os.socket import Socket
 from src.runtime.epoll import Epoll, EpollEvent
 from src.runtime.connection import (
@@ -14,8 +15,14 @@ from src.runtime.connection import (
 )
 from src.runtime.async_context import AsyncContext, AsyncResumer
 from src.core.async.loop import EpollEventLoop, set_event_loop
+from src.runtime.date_cache import get_date_cache
 from src.http.request import Request
 from src.http.response import Response
+from src.http.parser import PARSE_OK, PARSE_NEED_MORE, PARSE_ERROR
+from src.runtime.iouring import (
+    IoUring, IoUringCqe, OP_ACCEPT, OP_RECV, OP_SEND, OP_POLL,
+    make_user_data, decode_op, decode_fd
+)
 
 class RequestHandler:
     def handle(self, req: Request) -> Response:
@@ -58,13 +65,20 @@ class EventLoop(AsyncResumer):
     aio_loop: EpollEventLoop
     listen_socket: Socket
     connections: dict[i32, Connection]
-    async_contexts: dict[i32, AsyncContext]
+    conn_slots: list[Optional[Connection]]
+    free_connections: list[Connection]
     timers: list[NativeTimer]
     handler: RequestHandler
     is_running: bool
     buffer_size: int
     keep_alive_timeout_sec: float
+    async_timeout_sec: float
     last_reap_time: float
+    current_time: float
+    last_date_update_time: float
+    driver: str
+    use_iouring: bool
+    uring: IoUring
 
     def __init__(
         self,
@@ -72,20 +86,35 @@ class EventLoop(AsyncResumer):
         handler: RequestHandler,
         max_events: int = 1024,
         buffer_size: int = 4096,
-        keep_alive_timeout_sec: float = 15.0
+        keep_alive_timeout_sec: float = 15.0,
+        async_timeout_sec: float = 30.0,
+        driver: str = "auto"
     ):
         self.listen_socket = listen_socket
         self.epoll = Epoll(max_events)
         self.aio_loop = EpollEventLoop(epoll=self.epoll)
         set_event_loop(self.aio_loop)
         self.connections = {}
-        self.async_contexts = {}
+        self.free_connections = list[Connection]()
         self.timers = list[NativeTimer]()
         self.handler = handler
         self.is_running = False
         self.buffer_size = buffer_size
         self.keep_alive_timeout_sec = keep_alive_timeout_sec
-        self.last_reap_time = 0.0
+        self.async_timeout_sec = async_timeout_sec
+        init_time = time.time()
+        self.current_time = init_time
+        self.last_reap_time = init_time
+        self.last_date_update_time = init_time
+        self.driver = driver
+        if driver == "io_uring" and IoUring.is_supported():
+            self.uring = IoUring(max_events)
+            self.use_iouring = self.uring.is_valid
+            self.conn_slots = [None] * 16384
+        else:
+            self.use_iouring = False
+            self.uring = IoUring(0)
+            self.conn_slots = list[Optional[Connection]]()
 
     def resume(self, fd: i32, resp: Response) -> bool:
         return self.resume_connection(fd, resp)
@@ -137,12 +166,27 @@ class EventLoop(AsyncResumer):
                 cb()
 
     def reap_idle_connections(self, now: float) -> None:
+        # 1. Close idle keep-alive connections that exceeded timeout
         to_close: list[i32] = []
         for fd, conn in self.connections.items():
             if not conn.is_suspended() and conn.is_idle_timeout(now, self.keep_alive_timeout_sec):
                 to_close.append(fd)
         for i in range(len(to_close)):
             self.close_connection(to_close[i])
+
+        # 2. Reap suspended async requests that exceeded deadline (HTTP 504 Gateway Timeout)
+        timed_out_async: list[i32] = []
+        for afd, aconn in self.connections.items():
+            if aconn.is_suspended() and (now - aconn.last_active_time) > self.async_timeout_sec:
+                timed_out_async.append(afd)
+
+        for j in range(len(timed_out_async)):
+            dead_fd = timed_out_async[j]
+            if dead_fd in self.connections:
+                aconn = self.connections[dead_fd]
+                timeout_resp = Response.json('{"code":504,"error":"Gateway Timeout: Async handler execution deadline exceeded"}', 504)
+                aconn.send_response(timeout_resp, self.epoll)
+            self.close_connection(dead_fd)
 
     def resume_connection(self, fd: i32, resp: Response) -> bool:
         if fd not in self.connections:
@@ -152,19 +196,32 @@ class EventLoop(AsyncResumer):
         if not conn.is_suspended():
             return False
 
-        if fd in self.async_contexts:
-            del self.async_contexts[fd]
+        now = self.current_time
+        if self.use_iouring:
+            conn.write_buf.reset()
+            resp.serialize(conn.write_buf, conn.keep_alive)
+            conn.request.background_tasks.run_all()
+            conn.state = STATE_WRITING
+            rslice = conn.write_buf.readable_slice()
+            self.uring.prep_send(fd, rslice.ptr, rslice.len)
+            Response.recycle(resp)
+        else:
+            conn.send_response(resp, self.epoll, now)
 
-        conn.send_response(resp, self.epoll)
-
-        if conn.state == STATE_CLOSING:
-            self.close_connection(fd)
-        elif conn.state == STATE_REQUEST_READY:
-            self._process_connection_requests(fd, conn)
+            if conn.state == STATE_CLOSING:
+                self.close_connection(fd)
+            else:
+                if conn.state == STATE_KEEP_ALIVE:
+                    conn.on_readable(now)
+                if conn.state == STATE_REQUEST_READY:
+                    self._process_connection_requests(fd, conn)
+                elif conn.state == STATE_CLOSING:
+                    self.close_connection(fd)
 
         return True
 
     def _process_connection_requests(self, fd: i32, conn: Connection) -> None:
+        now = self.current_time
         while conn.state == STATE_REQUEST_READY:
             conn.state = STATE_PROCESSING
             base_r: AsyncResumer = self
@@ -178,15 +235,51 @@ class EventLoop(AsyncResumer):
                 resp = Response.json("{\"error\":\"Internal Server Error\"}", 500)
 
             if resp.is_deferred:
-                # Connection is asynchronously suspended!
-                ctx = conn.request.async_ctx
-                if ctx is not None:
-                    self.async_contexts[fd] = ctx
+                conn.update_activity(now)
                 conn.mark_suspended()
                 break
 
-            # Synchronous response path: zero heap allocations, zero dict operations!
-            conn.send_response(resp, self.epoll)
+            # 1. 绝大多数场景（wrk ping-pong）：read_buf 无堆叠数据，直接立即发送，极速响应，延迟最低
+            if conn.read_buf.readable_bytes() == 0:
+                conn.send_response(resp, self.epoll, now)
+                if conn.state == STATE_CLOSING:
+                    self.close_connection(fd)
+                break
+
+            # 2. 真实 Pipelining 场景：read_buf 明确还有堆叠字节，才执行批量聚合写入
+            conn.append_response(resp)
+            batch_count = 1
+            max_batch = 16
+
+            while batch_count < max_batch and conn.parse_next_pipelined_request():
+                conn.state = STATE_PROCESSING
+                conn.request.fd = fd
+                conn.request.async_resumer = base_r
+                conn.request.async_ctx = None
+
+                try:
+                    p_resp = self.handler.handle(conn.request)
+                except Exception as e:
+                    p_resp = Response.json("{\"error\":\"Internal Server Error\"}", 500)
+
+                if p_resp.is_deferred:
+                    if conn.write_buf.readable_bytes() > 0:
+                        conn.flush_responses(self.epoll, now)
+                    conn.update_activity(now)
+                    conn.mark_suspended()
+                    break
+
+                conn.append_response(p_resp)
+                batch_count += 1
+                if not conn.keep_alive:
+                    conn.state = STATE_CLOSING
+                    break
+
+            if conn.is_suspended():
+                break
+
+            if conn.write_buf.readable_bytes() > 0:
+                conn.flush_responses(self.epoll, now)
 
             if conn.state == STATE_CLOSING:
                 self.close_connection(fd)
@@ -214,48 +307,52 @@ class EventLoop(AsyncResumer):
         return ms
 
     def run(self) -> None:
-        self.epoll.add(self.listen_socket.fd, EPOLLIN | EPOLLET | EPOLLERR | EPOLLHUP)
         self.is_running = True
-        self.last_reap_time = time.time()
+        self.current_time = time.time()
+        self.last_reap_time = self.current_time
+        self.last_date_update_time = self.current_time
+
+        if self.use_iouring:
+            # print("[CodonWeb] Reactor online: Native io_uring Proactor active (kernel ring_fd=" + str(self.uring.ring_fd) + ")")
+            self._run_iouring()
+        else:
+            # print("[CodonWeb] Reactor online: Epoll Edge-Triggered Reactor active (epoll_fd=" + str(self.epoll.fd) + ")")
+            self._run_epoll()
+
+    def _run_epoll(self) -> None:
+        self.epoll.add(self.listen_socket.fd, EPOLLIN | EPOLLET | EPOLLERR | EPOLLHUP)
         tick_count = 0
 
         while self.is_running:
+            # 1. Drain all pending ready coroutines in user-space (Run-to-Complete)
+            while self.aio_loop.has_pending_tasks():
+                self.aio_loop.step()
+
+            # 2. Dynamic timeout calculation (non-blocking if tasks ready, else sleep until nearest timer)
             timeout_ms = 100
             if self.aio_loop.has_pending_tasks():
                 timeout_ms = 0
             elif len(self.timers) > 0:
-                now = time.time()
-                timeout_ms = self._calc_epoll_timeout(now)
+                timeout_ms = self._calc_epoll_timeout(self.current_time)
 
-            events = self.epoll.wait(timeout_ms)
+            # 3. Wait for network events
+            num_events = self.epoll.wait_raw(timeout_ms)
 
-            # 1. Advance coroutine scheduler work queue
-            self.aio_loop.step()
-
-            # 2. Process active timers (zero overhead if empty)
-            if len(self.timers) > 0:
-                now = time.time()
-                self._process_timers(now)
-
-            # 3. Periodic idle connection reaper (check clock every 1024 ticks to eliminate syscall overhead)
+            # 4. Amortize timestamp syscall: update when idle (num_events == 0) or every 32 busy iterations
             tick_count += 1
-            if tick_count >= 1024:
-                tick_count = 0
-                now_for_reap = time.time()
-                if (now_for_reap - self.last_reap_time) > 5.0:
-                    self.last_reap_time = now_for_reap
-                    self.reap_idle_connections(now_for_reap)
+            if num_events == 0 or (tick_count & 31) == 0:
+                self.current_time = time.time()
+            now = self.current_time
 
-            # 4. Handle epoll I/O events
-            for i in range(len(events)):
-                ev = events[i]
-                fd = ev.fd
-                event_mask = ev.events
+            # 5. [CRITICAL I/O FIRST]: Immediately dispatch and finish all ready I/O events
+            # Ready events get immediate CPU priority, eliminating P99 scheduling jitters
+            for i in range(num_events):
+                fd = self.epoll.get_fd(i)
+                event_mask = self.epoll.get_event(i)
 
                 # Priority 0: Coroutine async network/driver I/O (MySQL, Redis, AsyncStream)
-                if self.aio_loop.has_fd_handler(int(fd)):
+                if self.aio_loop.has_handlers() and self.aio_loop.has_fd_handler(int(fd)):
                     self.aio_loop.handle_fd_event(int(fd), event_mask)
-                    self.aio_loop.step()
                     continue
 
                 # Case 1: Listen socket ready -> Accept new connections
@@ -263,7 +360,7 @@ class EventLoop(AsyncResumer):
                     self.accept_connections()
                     continue
 
-                # Case 2: Socket error or hang up
+                # Case 2: Socket error or hang up (triggers cascade task cancellation via close_connection)
                 if (event_mask & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != u32(0):
                     self.close_connection(fd)
                     continue
@@ -272,53 +369,255 @@ class EventLoop(AsyncResumer):
                 if (event_mask & EPOLLIN) != u32(0):
                     if fd in self.connections:
                         conn = self.connections[fd]
-                        if conn.is_suspended():
-                            # Connection is suspended waiting for async result; drain socket if peer closed
-                            continue
-                        state = conn.on_readable()
-                        self._process_connection_requests(fd, conn)
+                        if not conn.is_suspended():
+                            state = conn.on_readable(now)
+                            self._process_connection_requests(fd, conn)
 
-                        if conn.state == STATE_CLOSING:
-                            self.close_connection(fd)
+                            if conn.state == STATE_CLOSING:
+                                self.close_connection(fd)
 
                 # Case 4: Write ready event (resumed from partial write EAGAIN)
                 if (event_mask & EPOLLOUT) != u32(0):
                     if fd in self.connections:
                         conn = self.connections[fd]
                         if conn.state == STATE_WRITE_PENDING:
-                            conn.on_writable(self.epoll)
+                            conn.on_writable(self.epoll, now)
                             if conn.state == STATE_CLOSING:
                                 self.close_connection(fd)
 
-            # 5. Step coroutines once more after I/O events
-            self.aio_loop.step()
+            # 6. Drain awakened tasks once more after processing all I/O events
+            while self.aio_loop.has_pending_tasks():
+                self.aio_loop.step()
+
+            # 7. Process active timers using cached timestamp
+            if len(self.timers) > 0:
+                self._process_timers(now)
+
+            # 8. Housekeeping: Run ONLY when I/O is idle (num_events == 0) or periodically AFTER I/O dispatch
+            # Never interferes with I/O in flight!
+            if num_events == 0 or tick_count >= 1024:
+                if tick_count >= 1024:
+                    tick_count = 0
+                if (now - self.last_date_update_time) >= 1.0:
+                    self.last_date_update_time = now
+                    get_date_cache().update()
+
+                if (now - self.last_reap_time) >= 5.0:
+                    self.last_reap_time = now
+                    self.reap_idle_connections(now)
+
+    def _run_iouring(self) -> None:
+        listen_fd = self.listen_socket.fd
+        self.uring.prep_poll_add(listen_fd, u32(1))
+        epoll_armed = False
+        tick_count = 0
+
+        while self.is_running:
+            # 1. Drain all pending ready coroutines in user-space
+            while self.aio_loop.has_pending_tasks():
+                self.aio_loop.step()
+
+            # 2. Dynamic timeout calculation
+            timeout_ms = 100
+            if self.aio_loop.has_pending_tasks():
+                timeout_ms = 0
+            elif len(self.timers) > 0:
+                timeout_ms = self._calc_epoll_timeout(self.current_time)
+
+            # 3. Synchronize coroutine driver sockets (MySQL, Postgres, Redis)
+            if self.aio_loop.has_handlers():
+                if not epoll_armed:
+                    self.uring.prep_poll_add(self.epoll.fd, u32(1))
+                    epoll_armed = True
+            elif epoll_armed:
+                epoll_armed = False
+
+            # 4. Wait for completions via io_uring
+            min_complete = 0 if timeout_ms == 0 else 1
+            self.uring.enter(min_complete, timeout_ms)
+            num_cqes = self.uring.reap_cqes()
+
+            tick_count += 1
+            if num_cqes == 0 or (tick_count & 31) == 0:
+                self.current_time = time.time()
+            now = self.current_time
+
+            # 5. Dispatch ready CQE completions
+            for i in range(num_cqes):
+                cqe = self.uring.get_cqe(i)
+                op = decode_op(cqe.user_data)
+                fd = decode_fd(cqe.user_data)
+                res = cqe.res
+
+                # Case A: Poll ready (listen socket or coroutine driver epoll fd)
+                if op == OP_POLL:
+                    if fd == listen_fd:
+                        self.accept_connections()
+                        self.uring.prep_poll_add(listen_fd, u32(1))
+                    elif fd == self.epoll.fd:
+                        epoll_armed = False
+                        num_epoll = self.epoll.wait_raw(0)
+                        for j in range(num_epoll):
+                            efd = self.epoll.get_fd(j)
+                            emask = self.epoll.get_event(j)
+                            if self.aio_loop.has_handlers() and self.aio_loop.has_fd_handler(int(efd)):
+                                self.aio_loop.handle_fd_event(int(efd), emask)
+                        if self.aio_loop.has_handlers():
+                            self.uring.prep_poll_add(self.epoll.fd, u32(1))
+                            epoll_armed = True
+
+                # Case B: Async Read completed (Proactor RECV)
+                elif op == OP_RECV:
+                    idx = int(fd)
+                    if idx >= 0 and idx < len(self.conn_slots):
+                        conn_opt = self.conn_slots[idx]
+                        if conn_opt is not None:
+                            conn = conn_opt
+                            if res > 0:
+                                conn.recv_in_flight = False
+                                conn.read_buf.advance_write(int(res))
+                                parse_res, consumed = conn.parser.parse(conn.read_buf.readable_slice(), conn.request)
+                                if parse_res == PARSE_OK:
+                                    conn.read_buf.consume(consumed)
+                                    conn.keep_alive = conn.request.keep_alive
+                                    conn.state = STATE_PROCESSING
+                                    base_r: AsyncResumer = self
+                                    conn.request.fd = fd
+                                    conn.request.async_resumer = base_r
+                                    conn.request.async_ctx = None
+
+                                    try:
+                                        resp = self.handler.handle(conn.request)
+                                    except Exception as e:
+                                        resp = Response.json("{\"error\":\"Internal Server Error\"}", 500)
+
+                                    if resp.is_deferred:
+                                        conn.update_activity(now)
+                                        conn.mark_suspended()
+                                    else:
+                                        conn.write_buf.reset()
+                                        resp.serialize(conn.write_buf, conn.keep_alive)
+                                        conn.request.background_tasks.run_all()
+                                        conn.state = STATE_WRITING
+                                        rslice = conn.write_buf.readable_slice()
+                                        self.uring.prep_send(fd, rslice.ptr, rslice.len)
+                                        Response.recycle(resp)
+
+                                        # 工业级全异步重叠流水线 (Overlapped Pipeline)
+                                        # 同步请求立即在同轮次挂起针对下一个请求的读事件
+                                        if conn.keep_alive:
+                                            self.uring.prep_recv(fd, conn.read_buf.write_ptr(), conn.read_buf.writable_bytes())
+                                            conn.recv_in_flight = True
+                                elif parse_res == PARSE_NEED_MORE:
+                                    self.uring.prep_recv(fd, conn.read_buf.write_ptr(), conn.read_buf.writable_bytes())
+                                    conn.recv_in_flight = True
+                                else:
+                                    self.close_connection(fd)
+                            else:
+                                self.close_connection(fd)
+
+                # Case C: Async Write completed (Proactor SEND)
+                elif op == OP_SEND:
+                    idx = int(fd)
+                    if idx >= 0 and idx < len(self.conn_slots):
+                        conn_opt = self.conn_slots[idx]
+                        if conn_opt is not None:
+                            conn = conn_opt
+                            if res > 0:
+                                conn.update_activity(now)
+                                conn.write_buf.consume(int(res))
+                                if conn.write_buf.readable_bytes() > 0:
+                                    # 处理罕见的 Partial Write，继续推送未完成的剩余字节
+                                    rslice = conn.write_buf.readable_slice()
+                                    self.uring.prep_send(fd, rslice.ptr, rslice.len)
+                                else:
+                                    if not conn.keep_alive:
+                                        self.close_connection(fd)
+                                    else:
+                                        conn.state = STATE_KEEP_ALIVE
+                                        # 关键修复：对于异步请求（如 MySQL/Redis 协程路由），
+                                        # 当响应发送完成时，必须重新挂起下一个请求的读取！
+                                        if not conn.recv_in_flight:
+                                            self.uring.prep_recv(fd, conn.read_buf.write_ptr(), conn.read_buf.writable_bytes())
+                                            conn.recv_in_flight = True
+
+            # 6. Drain awakened coroutines
+            while self.aio_loop.has_pending_tasks():
+                self.aio_loop.step()
+
+            # 7. Process active timers
+            if len(self.timers) > 0:
+                self._process_timers(now)
+
+            # 8. Housekeeping
+            if num_cqes == 0 or tick_count >= 1024:
+                if tick_count >= 1024:
+                    tick_count = 0
+                if (now - self.last_date_update_time) >= 1.0:
+                    self.last_date_update_time = now
+                    get_date_cache().update()
+                if (now - self.last_reap_time) >= 5.0:
+                    self.last_reap_time = now
+                    self.reap_idle_connections(now)
 
     def accept_connections(self) -> None:
+        now = self.current_time
         while True:
             client_fd, client_ip, client_port = self.listen_socket.accept_nonblocking()
             if client_fd < i32(0):
                 break
 
             try:
-                self.epoll.add(client_fd, EPOLLIN | EPOLLET | EPOLLRDHUP)
-                conn = Connection(client_fd, client_ip, client_port, self.buffer_size)
+                Socket.set_fd_tcp_nodelay(client_fd, True)
+                if not self.use_iouring:
+                    self.epoll.add(client_fd, EPOLLIN | EPOLLET | EPOLLRDHUP)
+                if len(self.free_connections) > 0:
+                    conn = self.free_connections.pop()
+                    conn.reset_pool(client_fd, client_ip, client_port, now)
+                else:
+                    conn = Connection(client_fd, client_ip, client_port, self.buffer_size)
+                    conn.last_active_time = now
                 self.connections[client_fd] = conn
+
+                if self.use_iouring:
+                    idx = int(client_fd)
+                    if idx >= len(self.conn_slots):
+                        new_cap = len(self.conn_slots) * 2
+                        if new_cap == 0:
+                            new_cap = 1024
+                        while idx >= new_cap:
+                            new_cap *= 2
+                        self.conn_slots.extend([None] * (new_cap - len(self.conn_slots)))
+                    self.conn_slots[idx] = conn
+                    conn.recv_in_flight = True
+                    self.uring.prep_recv(client_fd, conn.read_buf.write_ptr(), conn.read_buf.writable_bytes())
             except Exception as e:
                 pass
 
+
     def close_connection(self, fd: i32) -> None:
-        if fd in self.async_contexts:
-            ctx = self.async_contexts[fd]
-            ctx.abort()
-            del self.async_contexts[fd]
         if fd in self.connections:
             conn = self.connections[fd]
+            if conn.request.async_ctx is not None:
+                ctx = conn.request.async_ctx
+                if ctx is not None:
+                    ctx.abort()
+            if self.use_iouring:
+                self.uring.prep_cancel(make_user_data(OP_RECV, fd))
+                self.uring.prep_cancel(make_user_data(OP_SEND, fd))
+                idx = int(fd)
+                if idx >= 0 and idx < len(self.conn_slots):
+                    self.conn_slots[idx] = None
             conn.close(self.epoll)
             del self.connections[fd]
+            if len(self.free_connections) < 4096:
+                self.free_connections.append(conn)
 
     def stop(self) -> None:
         self.is_running = False
         for fd in list(self.connections.keys()):
             self.close_connection(fd)
         self.listen_socket.close()
+        if self.use_iouring:
+            self.uring.close()
         self.epoll.close()

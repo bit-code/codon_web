@@ -1,6 +1,7 @@
 from typing import Tuple, Optional
 import asyncio
 from asyncio import Future
+from internal.str import _unicode_decode_utf8_strict
 from src.os.socket import Socket
 from src.os.constants import SOL_SOCKET, EINTR, EAGAIN, EWOULDBLOCK
 from src.os.linux import (
@@ -11,146 +12,275 @@ from src.os.linux import (
     get_error_message
 )
 from src.core.async.loop import get_event_loop, EpollEventLoop
+from src.memory.buffer import ByteBuffer
+
+def _decode_stream_bytes(p: Ptr[byte], n: int) -> str:
+    if n <= 0:
+        return ""
+    try:
+        return _unicode_decode_utf8_strict(Ptr[u8](p), n)
+    except:
+        return str(p, n)
 
 SO_ERROR: i32 = i32(4)
 
 class AsyncStreamReader:
     sock: Socket
     loop: EpollEventLoop
-    buf: str
+    buf: ByteBuffer
 
-    def __init__(self, sock: Socket, loop: Optional[EpollEventLoop] = None):
+    def __init__(self, sock: Socket, loop: Optional[EpollEventLoop] = None, capacity: int = 65536):
         self.sock = sock
         if loop is None:
             self.loop = get_event_loop()
         else:
             self.loop = loop
-        self.buf = ""
+        self.buf = ByteBuffer(capacity if capacity >= 4096 else 65536)
 
-    def read_chunk_async(self, max_bytes: int = 4096):
-        fut = self.loop.create_future(str)
-        fd = int(self.sock.fd)
+    def has_buffered_bytes(self, n: int) -> bool:
+        return self.buf.readable_bytes() >= n
 
-        def on_readable():
-            # Read from non-blocking socket
-            raw_buf = Ptr[byte](max_bytes + 1)
-            n = c_recv(self.sock.fd, raw_buf, max_bytes, i32(0))
-            if n < 0:
-                err = get_errno()
-                if err == EAGAIN or err == EWOULDBLOCK or err == EINTR:
-                    return # keep waiting
-                self.loop.remove_reader(fd)
-                fut.set_result("")
-                return
+    async def fill_buffer_async(self, min_bytes: int = 1):
+        """Reads from non-blocking socket until buffer has at least min_bytes or EOF."""
+        fd = self.sock.fd
+        while self.buf.readable_bytes() < min_bytes:
+            if self.buf.writable_bytes() < 4096:
+                self.buf.ensure_writable(8192)
+
+            wptr = self.buf.write_ptr()
+            wbytes = self.buf.writable_bytes()
+
+            n = c_recv(fd, wptr, wbytes, i32(0))
+            if n > 0:
+                self.buf.advance_write(n)
+                if self.buf.readable_bytes() >= min_bytes:
+                    return
             elif n == 0:
-                # Connection closed by peer
-                self.loop.remove_reader(fd)
-                fut.set_result("")
+                # EOF reached
                 return
-            
-            raw_buf[n] = byte(0)
-            data = str(raw_buf, n)
-            self.loop.remove_reader(fd)
-            fut.set_result(data)
+            else:
+                err = get_errno()
+                if err == EINTR:
+                    continue
+                if err == EAGAIN or err == EWOULDBLOCK:
+                    fut = self.loop.create_future(bool)
+                    self.loop.wait_readable(int(fd), fut)
+                    try:
+                        await fut
+                    except:
+                        self.loop.cancel_wait(int(fd))
+                        raise
+                    continue
+                else:
+                    raise OSError("Socket recv failed with errno: " + str(err))
 
-        self.loop.add_reader(fd, on_readable)
-        return fut
+    async def read_chunk_async(self, max_bytes: int = 4096):
+        if self.buf.readable_bytes() == 0:
+            await self.fill_buffer_async(1)
+        rlen = self.buf.readable_bytes()
+        if rlen == 0:
+            return ""
+        take = min(rlen, max_bytes)
+        p_res = Ptr[byte](take + 1)
+        str.memcpy(p_res.as_byte(), self.buf.readable_slice().ptr.as_byte(), take)
+        p_res[take] = byte(0)
+        self.buf.consume(take)
+        return _decode_stream_bytes(p_res, take)
 
     async def read(self, n: int = -1):
         """Read up to `n` bytes from the stream asynchronously."""
-        if len(self.buf) > 0:
-            if n <= 0 or len(self.buf) <= n:
-                res = self.buf
-                self.buf = ""
-                return res
-            else:
-                res = self.buf[:n]
-                self.buf = self.buf[n:]
-                return res
-
-        chunk = await self.read_chunk_async(4096 if n <= 0 else n)
-        if len(chunk) == 0:
+        if self.buf.readable_bytes() == 0:
+            await self.fill_buffer_async(1)
+        rlen = self.buf.readable_bytes()
+        if rlen == 0:
             return ""
-        if n <= 0 or len(chunk) <= n:
-            return chunk
-        else:
-            res = chunk[:n]
-            self.buf = chunk[n:]
-            return res
+        take = rlen if n <= 0 or n > rlen else n
+        p_res = Ptr[byte](take + 1)
+        str.memcpy(p_res.as_byte(), self.buf.readable_slice().ptr.as_byte(), take)
+        p_res[take] = byte(0)
+        self.buf.consume(take)
+        return _decode_stream_bytes(p_res, take)
 
     async def readexactly(self, n: int):
         """Read exactly `n` bytes from the stream asynchronously."""
-        while len(self.buf) < n:
-            chunk = await self.read_chunk_async(max(4096, n - len(self.buf)))
-            if len(chunk) == 0:
+        if self.buf.readable_bytes() < n:
+            await self.fill_buffer_async(n)
+            if self.buf.readable_bytes() < n:
                 raise OSError("Unexpected EOF while reading " + str(n) + " bytes")
-            self.buf += chunk
         
-        res = self.buf[:n]
-        self.buf = self.buf[n:]
-        return res
+        p_res = Ptr[byte](n + 1)
+        str.memcpy(p_res.as_byte(), self.buf.readable_slice().ptr.as_byte(), n)
+        p_res[n] = byte(0)
+        self.buf.consume(n)
+        return _decode_stream_bytes(p_res, n)
 
     async def readline(self):
         """Read one line up to '\n' asynchronously."""
         while True:
-            idx = self.buf.find("\n")
+            rslice = self.buf.readable_slice()
+            idx = -1
+            for i in range(rslice.len):
+                if rslice.ptr[i] == byte(10): # '\n'
+                    idx = i
+                    break
             if idx >= 0:
-                res = self.buf[:idx + 1]
-                self.buf = self.buf[idx + 1:]
-                return res
-            chunk = await self.read_chunk_async(1024)
-            if len(chunk) == 0:
-                # EOF reached
-                res = self.buf
-                self.buf = ""
-                return res
-            self.buf += chunk
+                take = idx + 1
+                p_res = Ptr[byte](take + 1)
+                str.memcpy(p_res.as_byte(), rslice.ptr.as_byte(), take)
+                p_res[take] = byte(0)
+                self.buf.consume(take)
+                return _decode_stream_bytes(p_res, take)
+            
+            prev_len = self.buf.readable_bytes()
+            await self.fill_buffer_async(prev_len + 1)
+            if self.buf.readable_bytes() == prev_len:
+                if prev_len == 0:
+                    return ""
+                p_res = Ptr[byte](prev_len + 1)
+                str.memcpy(p_res.as_byte(), self.buf.readable_slice().ptr.as_byte(), prev_len)
+                p_res[prev_len] = byte(0)
+                self.buf.consume(prev_len)
+                return _decode_stream_bytes(p_res, prev_len)
 
 class AsyncStreamWriter:
     sock: Socket
     loop: EpollEventLoop
+    high_water_mark: int
+    low_water_mark: int
+    _write_buf: ByteBuffer
+    _is_paused: bool
+    _closed: bool
 
-    def __init__(self, sock: Socket, loop: Optional[EpollEventLoop] = None):
+    def __init__(
+        self,
+        sock: Socket,
+        loop: Optional[EpollEventLoop] = None,
+        high_water_mark: int = 65536,
+        low_water_mark: int = 16384
+    ):
         self.sock = sock
         if loop is None:
             self.loop = get_event_loop()
         else:
             self.loop = loop
+        self.high_water_mark = high_water_mark
+        self.low_water_mark = low_water_mark
+        self._write_buf = ByteBuffer(65536)
+        self._is_paused = False
+        self._closed = False
 
-    def write_async(self, data: str):
-        fut = self.loop.create_future(int)
-        fd = int(self.sock.fd)
-        data_len = len(data)
+    def get_buffer_size(self) -> int:
+        """Return the current number of bytes queued in the internal write buffer."""
+        return self._write_buf.readable_bytes()
 
-        def on_writable():
-            p = data.c_str()
-            n = c_send(self.sock.fd, p, data_len, i32(0))
-            if n < 0:
+    def is_paused(self) -> bool:
+        """Check whether the writer is in a paused backpressure state (buffer exceeds high_water_mark)."""
+        return self._is_paused
+
+    def is_closing(self) -> bool:
+        """Check whether the underlying socket is closed or closing."""
+        return self._closed
+
+    def write_raw(self, p: Ptr[byte], total: int) -> None:
+        """Directly write raw memory bytes to socket or queue into native ByteBuffer."""
+        if self._closed:
+            raise OSError("Cannot write to closed AsyncStreamWriter")
+        if total <= 0:
+            return
+
+        fd = self.sock.fd
+
+        # 1. Optimistic direct transmission if buffer is empty
+        if self._write_buf.readable_bytes() == 0:
+            n = c_send(fd, p, total, i32(0))
+            if n == total:
+                return
+            elif n > 0:
+                self._write_buf.append_c_str_fast(p + n, total - n)
+            elif n < 0:
                 err = get_errno()
                 if err == EAGAIN or err == EWOULDBLOCK or err == EINTR:
-                    return # keep waiting
-                self.loop.remove_writer(fd)
-                fut.set_result(-1)
-                return
-            self.loop.remove_writer(fd)
-            fut.set_result(n)
+                    self._write_buf.append_c_str_fast(p, total)
+                else:
+                    raise OSError("Socket send failed with errno: " + str(err))
+        else:
+            self._write_buf.append_c_str_fast(p, total)
 
-        self.loop.add_writer(fd, on_writable)
-        return fut
+        # 2. Update backpressure high-water status
+        if self._write_buf.readable_bytes() >= self.high_water_mark:
+            self._is_paused = True
+
+    def write_bytes(self, b: bytes) -> None:
+        """Zero-copy write binary bytes payload."""
+        self.write_raw(Ptr[byte](b._ptr), len(b))
+
+    def write_buffer(self, data: str) -> None:
+        """
+        Optimistic non-blocking write with backpressure tracking.
+        Encodes UTF-8 and transmits directly on fast-path syscall. Unsent bytes are buffered.
+        """
+        b = data.encode("utf-8")
+        self.write_raw(Ptr[byte](b._ptr), len(b))
 
     async def write(self, data: str):
-        """Write string to socket asynchronously until all bytes are transmitted."""
-        offset = 0
-        total = len(data)
-        while offset < total:
-            remaining = data[offset:]
-            sent = await self.write_async(remaining)
-            if sent <= 0:
-                raise OSError("Socket send failed or connection closed")
-            offset += sent
+        """
+        Write data with automatic backpressure draining when high-water mark is hit.
+        """
+        self.write_buffer(data)
+        if self._is_paused:
+            await self.drain()
+
+    async def drain(self):
+        """
+        Flush internal write buffer until pending bytes drop below `low_water_mark`.
+        Suspends coroutine via Epoll writable notification when socket buffer is saturated.
+        """
+        if not self._closed:
+            fd = self.sock.fd
+
+            while self._write_buf.readable_bytes() > 0:
+                rslice = self._write_buf.readable_slice()
+                rem = rslice.len
+                p = rslice.ptr
+
+                n = c_send(fd, p, rem, i32(0))
+                if n > 0:
+                    self._write_buf.consume(int(n))
+                    if self._write_buf.readable_bytes() <= self.low_water_mark:
+                        self._is_paused = False
+                    if self._write_buf.readable_bytes() == 0:
+                        break
+                elif n < 0:
+                    err = get_errno()
+                    if err == EINTR:
+                        continue
+                    if err == EAGAIN or err == EWOULDBLOCK:
+                        # Socket send buffer full; wait for writable event via Epoll
+                        fut = self.loop.create_future(bool)
+                        self.loop.wait_writable(int(fd), fut)
+                        try:
+                            await fut
+                        finally:
+                            self.loop.cancel_wait(int(fd))
+                        continue
+                    else:
+                        raise OSError("Socket send failed in drain with errno: " + str(err))
+                else:
+                    raise OSError("Socket connection closed during stream drain")
+
+            if self._write_buf.readable_bytes() <= self.low_water_mark:
+                self._is_paused = False
+
+    async def write_all(self, data: str):
+        """Convenience method: write data and wait for buffer to drain."""
+        self.write_buffer(data)
+        await self.drain()
 
     def close(self):
-        """Close the underlying socket."""
+        """Close the underlying socket and clear buffers."""
+        self._closed = True
+        self._write_buf.reset()
+        self._is_paused = False
         self.sock.close()
 
 async def open_connection(host: str, port: int):
@@ -163,28 +293,33 @@ async def open_connection(host: str, port: int):
     fd = int(sock.fd)
 
     # Begin non-blocking connect
-    # In Linux, connect on non-blocking socket returns False (EINPROGRESS)
     sock.connect(host, port)
 
-    # Wait for socket to become writable via Epoll
+    # Wait for socket to become writable via direct Future
     fut = loop.create_future(bool)
+    loop.wait_writable(fd, fut)
 
-    def on_connected():
-        loop.remove_writer(fd)
-        # Check socket error
-        err_val = i32(0)
-        opt_len = i32(4)
-        c_getsockopt(sock.fd, SOL_SOCKET, SO_ERROR, __ptr__(err_val).as_byte(), __ptr__(opt_len))
-        if err_val != i32(0):
-            fut.set_result(False)
-        else:
-            fut.set_result(True)
+    try:
+        ok = await fut
+    except:
+        loop.cancel_wait(fd)
+        sock.close()
+        raise
 
-    loop.add_writer(fd, on_connected)
-    ok = await fut
+    loop.cancel_wait(fd)
+
     if not ok:
         sock.close()
-        raise OSError(f"Failed to connect to {host}:{port}")
+        raise OSError("Failed to connect to " + host + ":" + str(port))
+
+
+    # Check socket error
+    err_val = i32(0)
+    opt_len = i32(4)
+    c_getsockopt(sock.fd, SOL_SOCKET, SO_ERROR, __ptr__(err_val).as_byte(), __ptr__(opt_len))
+    if err_val != i32(0):
+        sock.close()
+        raise OSError("Socket error connecting to " + host + ":" + str(port) + ", errno=" + str(err_val))
 
     sock.set_tcp_nodelay(True)
     reader = AsyncStreamReader(sock, loop)

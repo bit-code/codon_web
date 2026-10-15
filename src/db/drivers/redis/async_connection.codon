@@ -1,0 +1,398 @@
+# Asynchronous Epoll Native Redis Client for Codon Web
+
+import time
+from typing import Optional, List, Tuple
+from src.core.async.stream import AsyncStreamReader, AsyncStreamWriter, open_connection
+from src.core.async.loop import wait_for
+from src.memory.buffer import ByteBuffer
+from src.db.drivers.redis.errors import RedisConnectionError, RedisCommandError, RedisTimeoutError
+from src.db.drivers.redis.protocol import (
+    RedisValue,
+    encode_command,
+    encode_command_to_buf,
+    parse_resp_async
+)
+
+class AsyncRedisConnection:
+    host: str
+    port: int
+    password: str
+    db: int
+    timeout_sec: float
+    reader: Optional[AsyncStreamReader]
+    writer: Optional[AsyncStreamWriter]
+    is_connected: bool
+    last_active_time: float
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 6379,
+        password: str = "",
+        db: int = 0,
+        timeout_sec: float = 5.0
+    ):
+        self.host = host
+        self.port = port
+        self.password = password
+        self.db = db
+        self.timeout_sec = timeout_sec
+        self.reader = None
+        self.writer = None
+        self.is_connected = False
+        self.last_active_time = 0.0
+
+    async def connect(self, timeout_sec: float = 5.0):
+        self.close()
+        try:
+            r, w = await wait_for(open_connection(self.host, self.port), timeout_sec)
+            self.reader = r
+            self.writer = w
+            self.is_connected = True
+            self.last_active_time = time.time()
+
+            # AUTH if password provided
+            if len(self.password) > 0:
+                res = await self.execute(["AUTH", self.password], timeout_sec=timeout_sec, raise_on_error=False)
+                if res.val_type == "error":
+                    self.close()
+                    raise RedisCommandError(f"AUTH failed: {res.str_val}")
+
+            # SELECT DB if non-zero
+            if self.db != 0:
+                res = await self.execute(["SELECT", str(self.db)], timeout_sec=timeout_sec, raise_on_error=False)
+                if res.val_type == "error":
+                    self.close()
+                    raise RedisCommandError(f"SELECT DB {self.db} failed: {res.str_val}")
+
+            return True
+        except RedisCommandError:
+            self.close()
+            raise
+        except Exception:
+            self.close()
+            return False
+
+    def close(self) -> None:
+        self.is_connected = False
+        if self.writer is not None:
+            try:
+                self.writer.close()
+            except Exception:
+                pass
+        self.writer = None
+        self.reader = None
+
+    async def execute(self, cmd_args: List[str], timeout_sec: float = 5.0, raise_on_error: bool = True):
+        """Executes a command asynchronously over Epoll streams with timeout protection."""
+        if not self.is_connected or self.writer is None or self.reader is None:
+            raise RedisConnectionError(f"Not connected to Redis server at {self.host}:{self.port}")
+
+        buf = ByteBuffer(512)
+        encode_command_to_buf(cmd_args, buf)
+        rslice = buf.readable_slice()
+        try:
+            self.writer.write_raw(rslice.ptr, rslice.len)
+            if self.writer.is_paused() or self.writer.get_buffer_size() > 0:
+                await wait_for(self.writer.drain(), timeout_sec)
+
+            val = await wait_for(parse_resp_async(self.reader), timeout_sec)
+            self.last_active_time = time.time()
+            if raise_on_error:
+                val.raise_if_error()
+            return val
+        except RedisCommandError:
+            raise
+        except Exception as e:
+            self.close()
+            err_msg = str(e)
+            if "Timeout" in err_msg:
+                raise RedisTimeoutError(f"Redis command {cmd_args[0] if len(cmd_args) > 0 else ''} timed out after {timeout_sec}s")
+            raise RedisConnectionError(f"Redis communication error: {err_msg}")
+
+    # -------------------------------------------------------------
+    # High-Level Core Asynchronous Commands
+    # -------------------------------------------------------------
+    async def ping(self):
+        res = await self.execute(["PING"])
+        return res.as_str() == "PONG"
+
+    async def get(self, key: str):
+        res = await self.execute(["GET", key])
+        ret: Optional[str] = None
+        if not res.is_nil():
+            ret = res.as_str()
+        return ret
+
+    async def set(self, key: str, val: str, ex: int = 0, px: int = 0, nx: bool = False, xx: bool = False):
+        cmd: List[str] = ["SET", key, val]
+        if ex > 0:
+            cmd.append("EX")
+            cmd.append(str(ex))
+        elif px > 0:
+            cmd.append("PX")
+            cmd.append(str(px))
+        if nx:
+            cmd.append("NX")
+        elif xx:
+            cmd.append("XX")
+
+        res = await self.execute(cmd)
+        return res.as_str() == "OK"
+
+    async def setex(self, key: str, sec: int, val: str):
+        res = await self.execute(["SETEX", key, str(sec), val])
+        return res.as_str() == "OK"
+
+    async def setnx(self, key: str, val: str):
+        res = await self.execute(["SETNX", key, val])
+        return res.as_int() == 1
+
+    async def del_key(self, key: str):
+        return await self.del_keys([key])
+
+    async def del_keys(self, keys: List[str]):
+        if len(keys) == 0:
+            return 0
+        cmd: List[str] = ["DEL"]
+        for i in range(len(keys)):
+            cmd.append(keys[i])
+        res = await self.execute(cmd)
+        return res.as_int()
+
+    async def exists(self, key: str):
+        res = await self.execute(["EXISTS", key])
+        return res.as_int() > 0
+
+    async def incr(self, key: str):
+        res = await self.execute(["INCR", key])
+        return res.as_int()
+
+    async def decr(self, key: str):
+        res = await self.execute(["DECR", key])
+        return res.as_int()
+
+    async def expire(self, key: str, sec: int):
+        res = await self.execute(["EXPIRE", key, str(sec)])
+        return res.as_int() == 1
+
+    async def ttl(self, key: str):
+        res = await self.execute(["TTL", key])
+        return res.as_int()
+
+    # ----------------- Hashes -----------------
+    async def hget(self, name: str, key: str):
+        res = await self.execute(["HGET", name, key])
+        ret: Optional[str] = None
+        if not res.is_nil():
+            ret = res.as_str()
+        return ret
+
+    async def hset(self, name: str, key: str, val: str):
+        res = await self.execute(["HSET", name, key, val])
+        return res.as_int()
+
+    async def hgetall(self, name: str):
+        res = await self.execute(["HGETALL", name])
+        return res.as_dict()
+
+    async def hdel(self, name: str, keys: List[str]):
+        if len(keys) == 0:
+            return 0
+        cmd: List[str] = ["HDEL", name]
+        for i in range(len(keys)):
+            cmd.append(keys[i])
+        res = await self.execute(cmd)
+        return res.as_int()
+
+    async def hexists(self, name: str, key: str):
+        res = await self.execute(["HEXISTS", name, key])
+        return res.as_int() == 1
+
+    # ----------------- Lists -----------------
+    async def lpush(self, name: str, values: List[str]):
+        if len(values) == 0:
+            return 0
+        cmd: List[str] = ["LPUSH", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        res = await self.execute(cmd)
+        return res.as_int()
+
+    async def rpush(self, name: str, values: List[str]):
+        if len(values) == 0:
+            return 0
+        cmd: List[str] = ["RPUSH", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        res = await self.execute(cmd)
+        return res.as_int()
+
+    async def lpop(self, name: str):
+        res = await self.execute(["LPOP", name])
+        ret: Optional[str] = None
+        if not res.is_nil():
+            ret = res.as_str()
+        return ret
+
+    async def rpop(self, name: str):
+        res = await self.execute(["RPOP", name])
+        ret: Optional[str] = None
+        if not res.is_nil():
+            ret = res.as_str()
+        return ret
+
+    async def brpop(self, keys: List[str], timeout_sec: int = 1):
+        ret: Optional[Tuple[str, str]] = None
+        if len(keys) == 0:
+            return ret
+        cmd: List[str] = ["BRPOP"]
+        for i in range(len(keys)):
+            cmd.append(keys[i])
+        cmd.append(str(timeout_sec))
+
+        res = await self.execute(cmd, timeout_sec=float(timeout_sec + 2))
+        if not res.is_nil() and len(res.arr_val) >= 2:
+            ret = (res.arr_val[0].as_str(), res.arr_val[1].as_str())
+        return ret
+
+    async def llen(self, name: str):
+        res = await self.execute(["LLEN", name])
+        return res.as_int()
+
+    async def lrange(self, name: str, start: int, stop: int):
+        res = await self.execute(["LRANGE", name, str(start), str(stop)])
+        return res.as_list()
+
+    # ----------------- Sets -----------------
+    async def sadd(self, name: str, values: List[str]):
+        if len(values) == 0:
+            return 0
+        cmd: List[str] = ["SADD", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        res = await self.execute(cmd)
+        return res.as_int()
+
+    async def srem(self, name: str, values: List[str]):
+        if len(values) == 0:
+            return 0
+        cmd: List[str] = ["SREM", name]
+        for i in range(len(values)):
+            cmd.append(values[i])
+        res = await self.execute(cmd)
+        return res.as_int()
+
+    async def smembers(self, name: str):
+        res = await self.execute(["SMEMBERS", name])
+        return res.as_list()
+
+    async def sismember(self, name: str, val: str):
+        res = await self.execute(["SISMEMBER", name, val])
+        return res.as_int() == 1
+
+    async def scard(self, name: str):
+        res = await self.execute(["SCARD", name])
+        return res.as_int()
+
+    # ----------------- Sorted Sets (ZSets) -----------------
+    async def zadd(self, name: str, score: float, member: str):
+        res = await self.execute(["ZADD", name, str(score), member])
+        return res.as_int()
+
+    async def zrem(self, name: str, members: List[str]):
+        if len(members) == 0:
+            return 0
+        cmd: List[str] = ["ZREM", name]
+        for i in range(len(members)):
+            cmd.append(members[i])
+        res = await self.execute(cmd)
+        return res.as_int()
+
+    async def zcard(self, name: str):
+        res = await self.execute(["ZCARD", name])
+        return res.as_int()
+
+    async def zrange(self, name: str, start: int, stop: int):
+        res = await self.execute(["ZRANGE", name, str(start), str(stop)])
+        return res.as_list()
+
+    async def zrangebyscore(self, name: str, min_score: float, max_score: float, offset: int = -1, count: int = -1):
+        cmd: List[str] = ["ZRANGEBYSCORE", name, str(min_score), str(max_score)]
+        if offset >= 0 and count > 0:
+            cmd.append("LIMIT")
+            cmd.append(str(offset))
+            cmd.append(str(count))
+        res = await self.execute(cmd)
+        return res.as_list()
+
+    # ----------------- Scripting & Server -----------------
+    async def eval_script(self, script: str, keys: List[str], args: List[str]):
+        cmd: List[str] = ["EVAL", script, str(len(keys))]
+        for i in range(len(keys)):
+            cmd.append(keys[i])
+        for i in range(len(args)):
+            cmd.append(args[i])
+        return await self.execute(cmd)
+
+    async def select(self, db_idx: int):
+        res = await self.execute(["SELECT", str(db_idx)])
+        if res.as_str() == "OK":
+            self.db = db_idx
+            return True
+        return False
+
+    async def dbsize(self):
+        res = await self.execute(["DBSIZE"])
+        return res.as_int()
+
+    async def flushdb(self):
+        res = await self.execute(["FLUSHDB"])
+        return res.as_str() == "OK"
+
+    async def keys(self, pattern: str = "*"):
+        res = await self.execute(["KEYS", pattern])
+        return res.as_list()
+
+    async def mget(self, keys: List[str]):
+        if len(keys) == 0:
+            return List[Optional[str]]()
+        cmd: List[str] = ["MGET"]
+        for i in range(len(keys)):
+            cmd.append(keys[i])
+        res = await self.execute(cmd)
+        out: List[Optional[str]] = List[Optional[str]]()
+        for i in range(len(res.arr_val)):
+            item = res.arr_val[i]
+            if item.is_nil():
+                out.append(None)
+            else:
+                out.append(item.as_str())
+        return out
+
+    async def lrange(self, name: str, start: int, stop: int):
+        res = await self.execute(["LRANGE", name, str(start), str(stop)])
+        return res.as_list()
+
+    async def llen(self, name: str):
+        res = await self.execute(["LLEN", name])
+        return res.as_int()
+
+    async def sismember(self, name: str, value: str):
+        res = await self.execute(["SISMEMBER", name, value])
+        return res.as_int() == 1
+
+
+async def connect_redis_async(
+    host: str = "127.0.0.1",
+    port: int = 6379,
+    password: str = "",
+    db: int = 0,
+    timeout_sec: float = 5.0
+):
+    """Convenience factory to create and connect an AsyncRedisConnection."""
+    conn = AsyncRedisConnection(host=host, port=port, password=password, db=db, timeout_sec=timeout_sec)
+    ok = await conn.connect(timeout_sec=timeout_sec)
+    if not ok:
+        raise RedisConnectionError(f"Could not connect to Redis at {host}:{port}")
+    return conn

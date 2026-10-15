@@ -1,0 +1,41 @@
+from src.memory.buffer import ByteBuffer
+from src.http.fast_json import FastJsonWriter
+
+class SchemaModel:
+    """Core domain base model for CodonWeb AOT schemas.
+    Common runtime behaviors are inherited from here to avoid code-gen duplication.
+    """
+    def _write_json_fields(self, w: FastJsonWriter):
+        """Virtual method overridden by concrete schema generators."""
+        pass
+
+    def to_dict(self) -> Dict[str, str]:
+        """Virtual serialization method overridden by concrete schemas or @extend."""
+        return Dict[str, str]()
+
+    def model_dump(self) -> Dict[str, str]:
+        """Pydantic v2 compatible dict serialization via virtual dispatch."""
+        return self.to_dict()
+
+    def to_json(self) -> str:
+        """Industrial-grade streaming JSON serialization via virtual dispatch."""
+        w = FastJsonWriter(2048)
+        self._write_json_fields(w)
+        return w.finish()
+
+    def model_dump_json(self) -> str:
+        """Pydantic v2 compatible JSON serialization via virtual dispatch."""
+        return self.to_json()
+
+    def write_to_buffer(self, dest: ByteBuffer) -> int:
+        """Zero-allocation streaming JSON serialization directly into network/IO buffer."""
+        w = FastJsonWriter(dest, 2048)
+        self._write_json_fields(w)
+        return w.finish_buffer()
+
+
+# Backward-compatible alias for developers accustomed to Pydantic
+class BaseModel(SchemaModel):
+    pass
+
+

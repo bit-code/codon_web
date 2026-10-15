@@ -8,6 +8,7 @@ AF_INET: i32 = i32(2)
 SOCK_STREAM: i32 = i32(1)
 SOCK_NONBLOCK: i32 = i32(2048)        # 0x800 (octal 00004000)
 SOCK_CLOEXEC: i32 = i32(524288)       # 0x80000 (octal 02000000)
+MSG_NOSIGNAL: i32 = i32(16384)        # 0x4000 (suppress SIGPIPE)
 
 # Socket Options
 SOL_SOCKET: i32 = i32(1)
@@ -15,6 +16,8 @@ SO_REUSEADDR: i32 = i32(2)
 SO_REUSEPORT: i32 = i32(15)
 IPPROTO_TCP: i32 = i32(6)
 TCP_NODELAY: i32 = i32(1)
+TCP_DEFER_ACCEPT: i32 = i32(9)
+TCP_QUICKACK: i32 = i32(12)
 
 # File Control Flags
 F_GETFL: i32 = i32(3)
@@ -42,3 +45,10 @@ EWOULDBLOCK: i32 = i32(11)
 EPIPE: i32 = i32(32)
 ECONNRESET: i32 = i32(104)
 EINPROGRESS: i32 = i32(115)
+
+# POSIX Process & Signal Management Constants
+WNOHANG: i32 = i32(1)
+SIGINT: i32 = i32(2)
+SIGKILL: i32 = i32(9)
+SIGTERM: i32 = i32(15)
+

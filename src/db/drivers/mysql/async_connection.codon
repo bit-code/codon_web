@@ -6,7 +6,7 @@ from src.core.async.protocols import AsyncDriver
 from src.db.errors import (
     DatabaseError, InterfaceError, OperationalError, ProgrammingError
 )
-from src.db.types import FieldInfo, Row
+from src.db.types import FieldInfo, Row, infer_column_kind, COL_KIND_STR
 from src.db.drivers.mysql.constants import (
     COM_QUIT, COM_QUERY, COM_PING,
     PACKET_OK, PACKET_EOF, PACKET_ERR,
@@ -24,6 +24,7 @@ class AsyncMySQLCursor[Conn]:
     _row_idx: int
     _fields: List[FieldInfo]
     _field_names: List[str]
+    _field_kinds: List[int]
     _affected_rows: int
     _last_insert_id: int
 
@@ -33,6 +34,7 @@ class AsyncMySQLCursor[Conn]:
         self._row_idx = 0
         self._fields = List[FieldInfo]()
         self._field_names = List[str]()
+        self._field_kinds = List[int]()
         self._affected_rows = 0
         self._last_insert_id = 0
 
@@ -48,25 +50,66 @@ class AsyncMySQLCursor[Conn]:
 
     @property
     def description(self) -> List[FieldInfo]:
+        if len(self._fields) == 0 and len(self._field_names) > 0:
+            for i in range(len(self._field_names)):
+                kind = self._field_kinds[i] if i < len(self._field_kinds) else COL_KIND_STR
+                self._fields.append(FieldInfo(self._field_names[i], "", 0, 0, 0, kind))
         return self._fields
 
     def _reset(self) -> None:
-        self._rows.clear()
+        self._rows = List[Row]()
         self._row_idx = 0
-        self._fields.clear()
-        self._field_names.clear()
+        self._fields = List[FieldInfo]()
+        self._field_names = List[str]()
+        self._field_kinds = List[int]()
         self._affected_rows = 0
         self._last_insert_id = 0
 
-    async def _read_packet(self):
-        hdr = await self._conn.stream_reader.readexactly(4)
-        b0 = ord(hdr[0])
-        b1 = ord(hdr[1])
-        b2 = ord(hdr[2])
+    def try_read_packet_sync(self) -> bool:
+        sr = self._conn.stream_reader
+        if not sr.has_buffered_bytes(4):
+            return False
+        rptr = sr.buf.readable_slice().ptr
+        b0 = int(rptr[0])
+        b1 = int(rptr[1])
+        b2 = int(rptr[2])
         pay_len = b0 | (b1 << 8) | (b2 << 16)
-        seq = ord(hdr[3])
-        payload = await self._conn.stream_reader.readexactly(pay_len)
-        self._conn.reader.load_payload(payload, seq)
+        seq = int(rptr[3])
+        total_len = 4 + pay_len
+        if not sr.has_buffered_bytes(total_len):
+            return False
+
+        # Complete packet already in stream buffer: synchronous decode with 0 awaits!
+        sr.buf.consume(4)
+        payload_ptr = sr.buf.readable_slice().ptr
+        self._conn.reader.load_payload_ptr(payload_ptr, pay_len, seq)
+        sr.buf.consume(pay_len)
+        return True
+
+    async def _read_packet(self):
+        # 1. Pipeline Fast Path: Synchronous decode if packet is buffered
+        if self.try_read_packet_sync():
+            return
+
+        # 2. Slow Path: Read 4-byte header
+        while not self._conn.stream_reader.has_buffered_bytes(4):
+            await self._conn.stream_reader.fill_buffer_async(4)
+
+        rptr = self._conn.stream_reader.buf.readable_slice().ptr
+        b0 = int(rptr[0])
+        b1 = int(rptr[1])
+        b2 = int(rptr[2])
+        pay_len = b0 | (b1 << 8) | (b2 << 16)
+        seq = int(rptr[3])
+        self._conn.stream_reader.buf.consume(4)
+
+        # Read payload
+        while not self._conn.stream_reader.has_buffered_bytes(pay_len):
+            await self._conn.stream_reader.fill_buffer_async(pay_len)
+
+        payload_ptr = self._conn.stream_reader.buf.readable_slice().ptr
+        self._conn.reader.load_payload_ptr(payload_ptr, pay_len, seq)
+        self._conn.stream_reader.buf.consume(pay_len)
 
     async def execute(self, sql: str):
         self._reset()
@@ -80,8 +123,9 @@ class AsyncMySQLCursor[Conn]:
         writer.reset()
         writer.write_uint8(COM_QUERY)
         writer.write_str(sql)
-        pkt = writer.build_packet(0)
-        await self._conn.stream_writer.write(pkt)
+        writer.write_to_stream(self._conn.stream_writer, 0)
+        if self._conn.stream_writer.is_paused():
+            await self._conn.stream_writer.drain()
 
         # 2. Read first response packet asynchronously
         await self._read_packet()
@@ -110,12 +154,12 @@ class AsyncMySQLCursor[Conn]:
             if reader.is_err():
                 raise ProgrammingError("Error reading column definition: " + reader.get_err_message())
 
-            _catalog = reader.read_length_encoded_str()
-            _schema = reader.read_length_encoded_str()
-            table = reader.read_length_encoded_str()
-            _org_table = reader.read_length_encoded_str()
+            reader.skip_length_encoded_str() # catalog
+            reader.skip_length_encoded_str() # schema
+            reader.skip_length_encoded_str() # table
+            reader.skip_length_encoded_str() # org_table
             name = reader.read_length_encoded_str()
-            _org_name = reader.read_length_encoded_str()
+            reader.skip_length_encoded_str() # org_name
             _fixed_len = reader.read_length_encoded_int()
 
             _charset = reader.read_uint16()
@@ -124,11 +168,9 @@ class AsyncMySQLCursor[Conn]:
             flags = reader.read_uint16()
             decimals = reader.read_uint8()
 
-            col_name = name if name is not None else f"col_{i}"
-            tbl_name = table if table is not None else ""
-            field = FieldInfo(col_name, tbl_name, col_type, flags, decimals)
-            self._fields.append(field)
+            col_name = name if name is not None else "col_" + str(i)
             self._field_names.append(col_name)
+            self._field_kinds.append(infer_column_kind(col_type, flags))
 
         # Read EOF or OK packet after column definitions
         await self._read_packet()
@@ -149,7 +191,7 @@ class AsyncMySQLCursor[Conn]:
                 val = reader.read_length_encoded_str()
                 raw_values.append(val)
 
-            row = Row(list(self._field_names), raw_values)
+            row = Row(self._field_names, raw_values, self._field_kinds)
             self._rows.append(row)
 
         return len(self._rows)
@@ -205,14 +247,23 @@ class AsyncMySQLConnection(AsyncDriver):
         return AsyncMySQLCursor[AsyncMySQLConnection](self)
 
     async def _read_packet(self):
-        hdr = await self.stream_reader.readexactly(4)
-        b0 = ord(hdr[0])
-        b1 = ord(hdr[1])
-        b2 = ord(hdr[2])
+        while not self.stream_reader.has_buffered_bytes(4):
+            await self.stream_reader.fill_buffer_async(4)
+
+        rptr = self.stream_reader.buf.readable_slice().ptr
+        b0 = int(rptr[0])
+        b1 = int(rptr[1])
+        b2 = int(rptr[2])
         pay_len = b0 | (b1 << 8) | (b2 << 16)
-        seq = ord(hdr[3])
-        payload = await self.stream_reader.readexactly(pay_len)
-        self.reader.load_payload(payload, seq)
+        seq = int(rptr[3])
+        self.stream_reader.buf.consume(4)
+
+        while not self.stream_reader.has_buffered_bytes(pay_len):
+            await self.stream_reader.fill_buffer_async(pay_len)
+
+        payload_ptr = self.stream_reader.buf.readable_slice().ptr
+        self.reader.load_payload_ptr(payload_ptr, pay_len, seq)
+        self.stream_reader.buf.consume(pay_len)
 
     async def ping(self):
         if self.is_closed:
@@ -230,6 +281,10 @@ class AsyncMySQLConnection(AsyncDriver):
     def close(self) -> None:
         if not self.is_closed:
             self.is_closed = True
+            try:
+                self.stream_reader.loop.unregister_fd(int(self.stream_reader.sock.fd))
+            except:
+                pass
             try:
                 self.writer.reset()
                 self.writer.write_uint8(COM_QUIT)
@@ -346,6 +401,33 @@ async def connect_async(
         stream_writer.close()
         raise OperationalError(f"Access denied for user '{user}': {reader.get_err_message()}")
 
+    # AuthSwitchRequest check (0xFE)
+    if reader.length > 0 and int(reader.data[0]) == 0xfe:
+        reader.offset = 1
+        new_plugin = reader.read_null_terminated_str()
+        new_salt = List[byte]()
+        while reader.has_more():
+            b = reader.read_uint8()
+            if b == 0:
+                break
+            new_salt.append(byte(b))
+
+        new_auth = List[byte]()
+        if new_plugin == "mysql_native_password":
+            new_auth = scramble_native_password(password, new_salt)
+        elif new_plugin == "caching_sha2_password":
+            new_auth = scramble_caching_sha2(password, new_salt)
+
+        writer.reset()
+        writer.write_bytes(new_auth)
+        switch_resp = writer.build_packet(3)
+        await stream_writer.write(switch_resp)
+
+        await read_pkt()
+        if reader.is_err():
+            stream_writer.close()
+            raise OperationalError(f"AuthSwitch failed: {reader.get_err_message()}")
+
     # caching_sha2_password fast auth check (0x01 0x03)
     if reader.length == 2 and int(reader.data[0]) == 1 and int(reader.data[1]) == 3:
         # Fast auth successful, read final OK packet
@@ -361,4 +443,5 @@ async def connect_async(
         connection_id=conn_id,
         auth_plugin_name=auth_plugin
     )
+    stream_reader.loop.register_persistent_fd(int(stream_reader.sock.fd))
     return conn

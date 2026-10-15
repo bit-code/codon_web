@@ -1,0 +1,212 @@
+# Fluent, Parameterized QueryBuilder for Codon ORM
+from typing import List, Dict, Tuple, Optional
+from src.orm.dialect import Dialect, MYSQL_DIALECT, POSTGRESQL_DIALECT
+from src.orm.model import ModelMeta
+
+class WhereCondition:
+    field: str
+    op: str
+    val: str
+    is_raw: bool
+    is_null_check: bool
+
+    def __init__(self, field: str, op: str, val: str = "", is_raw: bool = False, is_null_check: bool = False):
+        self.field = field
+        norm_op = op.strip().upper()
+        if not is_raw:
+            valid_op = (
+                norm_op == "=" or norm_op == "!=" or norm_op == "<>" or
+                norm_op == ">" or norm_op == ">=" or norm_op == "<" or
+                norm_op == "<=" or norm_op == "LIKE" or norm_op == "NOT LIKE" or
+                norm_op == "ILIKE" or norm_op == "NOT ILIKE" or
+                norm_op == "IS NULL" or norm_op == "IS NOT NULL"
+            )
+            if not valid_op:
+                raise ValueError("Disallowed SQL comparison operator: " + op)
+        self.op = norm_op
+        self.val = val
+        self.is_raw = is_raw
+        self.is_null_check = is_null_check
+
+class Query:
+    meta: ModelMeta
+    dialect: Dialect
+    _selected_cols: List[str]
+    _conditions: List[WhereCondition]
+    _in_conditions: List[Tuple[str, List[str]]]
+    _order_bys: List[str]
+    _limit: int
+    _offset: int
+
+    def __init__(self, meta: ModelMeta, dialect: Dialect = MYSQL_DIALECT):
+        self.meta = meta
+        self.dialect = dialect
+        self._selected_cols = List[str]()
+        self._conditions = List[WhereCondition]()
+        self._in_conditions = List[Tuple[str, List[str]]]()
+        self._order_bys = List[str]()
+        self._limit = -1
+        self._offset = -1
+
+    def select(self, cols: List[str]) -> Query:
+        self._selected_cols = cols
+        return self
+
+    def filter(self, field: str, op: str, value: str) -> Query:
+        self._conditions.append(WhereCondition(field, op, value))
+        return self
+
+    def where_eq(self, field: str, value: str) -> Query:
+        return self.filter(field, "=", value)
+
+    def where_ne(self, field: str, value: str) -> Query:
+        return self.filter(field, "!=", value)
+
+    def where_gt(self, field: str, value: str) -> Query:
+        return self.filter(field, ">", value)
+
+    def where_gte(self, field: str, value: str) -> Query:
+        return self.filter(field, ">=", value)
+
+    def where_lt(self, field: str, value: str) -> Query:
+        return self.filter(field, "<", value)
+
+    def where_lte(self, field: str, value: str) -> Query:
+        return self.filter(field, "<=", value)
+
+    def where_like(self, field: str, pattern: str) -> Query:
+        return self.filter(field, "LIKE", pattern)
+
+    def where_null(self, field: str) -> Query:
+        self._conditions.append(WhereCondition(field, "IS NULL", is_null_check=True))
+        return self
+
+    def where_not_null(self, field: str) -> Query:
+        self._conditions.append(WhereCondition(field, "IS NOT NULL", is_null_check=True))
+        return self
+
+    def where_in(self, field: str, values: List[str]) -> Query:
+        self._in_conditions.append((field, values))
+        return self
+
+    def order_by(self, field: str, desc: bool = False) -> Query:
+        clean_f = field.strip()
+        if ";" in clean_f or "--" in clean_f or "/*" in clean_f:
+            raise ValueError("Disallowed SQL characters in order_by field: " + field)
+        q_field = self.dialect.quote_identifier(clean_f)
+        self._order_bys.append(q_field + (" DESC" if desc else " ASC"))
+        return self
+
+    def limit(self, count: int) -> Query:
+        self._limit = count
+        return self
+
+    def offset(self, off: int) -> Query:
+        self._offset = off
+        return self
+
+    def _build_where_clause(self, start_param_idx: int = 1) -> Tuple[str, List[str], int]:
+        clauses = List[str]()
+        params = List[str]()
+        param_idx = start_param_idx
+
+        for cond in self._conditions:
+            q_col = self.dialect.quote_identifier(cond.field)
+            if cond.is_null_check:
+                clauses.append(q_col + " " + cond.op)
+            else:
+                ph = self.dialect.placeholder(param_idx)
+                clauses.append(q_col + " " + cond.op + " " + ph)
+                params.append(cond.val)
+                param_idx += 1
+
+        for in_cond in self._in_conditions:
+            q_col = self.dialect.quote_identifier(in_cond[0])
+            vals = in_cond[1]
+            if len(vals) == 0:
+                clauses.append("1=0") # Empty IN matches nothing
+            else:
+                phs = List[str]()
+                for v in vals:
+                    phs.append(self.dialect.placeholder(param_idx))
+                    params.append(v)
+                    param_idx += 1
+                clauses.append(q_col + " IN (" + ", ".join(phs) + ")")
+
+        if len(clauses) == 0:
+            return ("", params, param_idx)
+        return (" WHERE " + " AND ".join(clauses), params, param_idx)
+
+    def to_sql(self) -> Tuple[str, List[str]]:
+        if len(self._selected_cols) == 0:
+            sql = self.meta.get_select_base(self.dialect)
+        else:
+            q_cols = List[str]()
+            for c in self._selected_cols:
+                q_cols.append(self.dialect.quote_identifier(c))
+            cols_str = "*" if len(q_cols) == 0 else ", ".join(q_cols)
+            q_table = self.dialect.quote_identifier(self.meta.table_name)
+            sql = "SELECT " + cols_str + " FROM " + q_table
+
+        where_str, params, _ = self._build_where_clause(start_param_idx=1)
+        sql += where_str
+
+        if len(self._order_bys) > 0:
+            sql += " ORDER BY " + ", ".join(self._order_bys)
+
+        sql += self.dialect.limit_offset(self._limit, self._offset)
+        return (sql, params)
+
+    def to_count_sql(self) -> Tuple[str, List[str]]:
+        q_table = self.dialect.quote_identifier(self.meta.table_name)
+        sql = "SELECT COUNT(*) AS count FROM " + q_table
+        where_str, params, _ = self._build_where_clause(start_param_idx=1)
+        sql += where_str
+        return (sql, params)
+
+    def to_delete_sql(self) -> Tuple[str, List[str]]:
+        q_table = self.dialect.quote_identifier(self.meta.table_name)
+        sql = "DELETE FROM " + q_table
+        where_str, params, _ = self._build_where_clause(start_param_idx=1)
+        sql += where_str
+        return (sql, params)
+
+    def to_update_sql(self, values: Dict[str, str]) -> Tuple[str, List[str]]:
+        q_table = self.dialect.quote_identifier(self.meta.table_name)
+        set_clauses = List[str]()
+        params = List[str]()
+        param_idx = 1
+
+        for k, v in values.items():
+            q_col = self.dialect.quote_identifier(k)
+            ph = self.dialect.placeholder(param_idx)
+            set_clauses.append(q_col + " = " + ph)
+            params.append(v)
+            param_idx += 1
+
+        sql = "UPDATE " + q_table + " SET " + ", ".join(set_clauses)
+        where_str, where_params, _ = self._build_where_clause(start_param_idx=param_idx)
+        sql += where_str
+        for p in where_params:
+            params.append(p)
+
+        return (sql, params)
+
+    def to_insert_sql(self, values: Dict[str, str]) -> Tuple[str, List[str]]:
+        q_table = self.dialect.quote_identifier(self.meta.table_name)
+        cols = List[str]()
+        phs = List[str]()
+        params = List[str]()
+        param_idx = 1
+
+        for k, v in values.items():
+            cols.append(self.dialect.quote_identifier(k))
+            phs.append(self.dialect.placeholder(param_idx))
+            params.append(v)
+            param_idx += 1
+
+        sql = "INSERT INTO " + q_table + " (" + ", ".join(cols) + ") VALUES (" + ", ".join(phs) + ")"
+        if self.dialect.supports_returning() and len(self.meta.primary_key) > 0:
+            sql += " RETURNING " + self.dialect.quote_identifier(self.meta.primary_key)
+
+        return (sql, params)

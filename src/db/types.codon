@@ -1,9 +1,70 @@
 # Database Driver Data Types and Row Abstraction
-from C import strlen(cobj) -> int
+
+from src.memory.buffer import ByteBuffer
+from typing import List, Dict, Optional, Set
+from C import c_get_tls_json_stream() -> cobj
+from C import c_json_stream_init(cobj, Ptr[byte], int)
+from C import c_json_stream_append_str_pair(cobj, Ptr[byte], int, Ptr[byte], int)
+from C import c_json_stream_append_int_pair(cobj, Ptr[byte], int, int)
+from C import c_json_stream_append_raw_pair(cobj, Ptr[byte], int, Ptr[byte], int)
+from C import c_json_stream_append_null_pair(cobj, Ptr[byte], int)
+from C import c_json_stream_append_bool_pair(cobj, Ptr[byte], int, int)
+from C import c_json_stream_append_float_pair(cobj, Ptr[byte], int, float)
+from C import c_json_stream_finish(cobj) -> int
+
+# Universal Column Kind for Schema-Aware Serialization
+COL_KIND_UNKNOWN: int = 0
+COL_KIND_INT: int = 1      # Integer types: emit raw without quotes
+COL_KIND_FLOAT: int = 2    # Float / Double / Decimal: emit raw without quotes
+COL_KIND_BOOL: int = 3     # Boolean: emit true / false
+COL_KIND_STR: int = 4      # String / Text / Datetime: escape and wrap with double quotes
+COL_KIND_RAW_JSON: int = 5 # Pre-serialized JSON: emit raw
+
+def infer_column_kind(column_type: int, flags: int = 0) -> int:
+    # 1. MySQL Column Types:
+    # TINY(1), SHORT(2), LONG(3), LONGLONG(8), INT24(9), YEAR(13)
+    if column_type == 1:
+        return COL_KIND_INT
+    if column_type == 2 or column_type == 3 or column_type == 8 or column_type == 9 or column_type == 13:
+        return COL_KIND_INT
+    # FLOAT(4), DOUBLE(5), DECIMAL(0), NEWDECIMAL(246)
+    if column_type == 0 or column_type == 4 or column_type == 5 or column_type == 246:
+        return COL_KIND_FLOAT
+    # JSON(245)
+    if column_type == 245:
+        return COL_KIND_RAW_JSON
+
+    # 2. SQLite Types:
+    # 1=INTEGER, 2=FLOAT, 3=TEXT, 4=BLOB, 5=NULL
+    if column_type == 1:
+        return COL_KIND_INT
+    if column_type == 2:
+        return COL_KIND_FLOAT
+
+    # 3. PostgreSQL OIDs:
+    # BOOLOID = 16
+    if column_type == 16:
+        return COL_KIND_BOOL
+    # INT8OID=20, INT2OID=21, INT4OID=23, OIDOID=26
+    if column_type == 20 or column_type == 21 or column_type == 23 or column_type == 26:
+        return COL_KIND_INT
+    # FLOAT4OID=700, FLOAT8OID=701, NUMERICOID=1700
+    if column_type == 700 or column_type == 701 or column_type == 1700:
+        return COL_KIND_FLOAT
+    # JSONOID=114, JSONBOID=3802
+    if column_type == 114 or column_type == 3802:
+        return COL_KIND_RAW_JSON
+
+    # Default to String (VARCHAR, TEXT, DATE, DATETIME, TIMESTAMP, etc.)
+    return COL_KIND_STR
+
 
 def _append_escaped_json_str(sb: List[str], s: str):
+    slen = len(s)
+    if slen == 0:
+        sb.append('""')
+        return
     c_str = s.c_str()
-    slen = strlen(c_str.as_byte())
     has_special = False
     for j in range(slen):
         b = int(c_str[j])
@@ -43,6 +104,7 @@ class FieldInfo:
     column_type: int
     flags: int
     decimals: int
+    kind: int
 
     def __init__(
         self,
@@ -50,28 +112,101 @@ class FieldInfo:
         table: str = "",
         column_type: int = 0,
         flags: int = 0,
-        decimals: int = 0
+        decimals: int = 0,
+        kind: int = -1
     ):
         self.name = name
         self.table = table
         self.column_type = column_type
         self.flags = flags
         self.decimals = decimals
+        if kind >= 0:
+            self.kind = kind
+        elif column_type > 0:
+            self.kind = infer_column_kind(column_type, flags)
+        else:
+            self.kind = COL_KIND_STR
 
     def __repr__(self) -> str:
-        return f"FieldInfo(name='{self.name}', table='{self.table}', type={self.column_type})"
+        return f"FieldInfo(name='{self.name}', table='{self.table}', type={self.column_type}, kind={self.kind})"
+
 
 class Row:
     field_names: List[str]
     values: List[Optional[str]]
-    name_to_idx: Dict[str, int]
+    field_infos: List[FieldInfo]
+    field_kinds: List[int]
+    _name_to_idx: Optional[Dict[str, int]]
 
     def __init__(self, field_names: List[str], values: List[Optional[str]]):
         self.field_names = field_names
         self.values = values
-        self.name_to_idx = Dict[str, int]()
-        for i in range(len(field_names)):
-            self.name_to_idx[field_names[i]] = i
+        self.field_infos = List[FieldInfo]()
+        self.field_kinds = List[int]()
+        self._name_to_idx = None
+
+    def __init__(self, field_names: List[str], values: List[Optional[str]], field_kinds: List[int]):
+        self.field_names = field_names
+        self.values = values
+        self.field_infos = List[FieldInfo]()
+        self.field_kinds = field_kinds
+        self._name_to_idx = None
+
+    def __init__(self, field_names: List[str], values: List[Optional[str]], field_infos: List[FieldInfo]):
+        self.field_names = field_names
+        self.values = values
+        self.field_infos = field_infos
+        kinds = List[int]()
+        for i in range(len(field_infos)):
+            kinds.append(field_infos[i].kind)
+        self.field_kinds = kinds
+        self._name_to_idx = None
+
+    def __init__(self, field_names: List[str], values: List[str]):
+        self.field_names = field_names
+        vals = List[Optional[str]]()
+        for i in range(len(values)):
+            vals.append(Optional[str](values[i]))
+        self.values = vals
+        self.field_infos = List[FieldInfo]()
+        self.field_kinds = List[int]()
+        self._name_to_idx = None
+
+    def __init__(self, field_names: List[str], values: List[str], field_kinds: List[int]):
+        self.field_names = field_names
+        vals = List[Optional[str]]()
+        for i in range(len(values)):
+            vals.append(Optional[str](values[i]))
+        self.values = vals
+        self.field_infos = List[FieldInfo]()
+        self.field_kinds = field_kinds
+        self._name_to_idx = None
+
+    def __init__(self, field_names: List[str], values: List[str], field_infos: List[FieldInfo]):
+        self.field_names = field_names
+        vals = List[Optional[str]]()
+        for i in range(len(values)):
+            vals.append(Optional[str](values[i]))
+        self.values = vals
+        self.field_infos = field_infos
+        kinds = List[int]()
+        for i in range(len(field_infos)):
+            kinds.append(field_infos[i].kind)
+        self.field_kinds = kinds
+        self._name_to_idx = None
+
+    def _ensure_name_to_idx(self) -> Dict[str, int]:
+        if self._name_to_idx is None:
+            d = Dict[str, int]()
+            for i in range(len(self.field_names)):
+                d[self.field_names[i]] = i
+            self._name_to_idx = d
+            return d
+        else:
+            opt = self._name_to_idx
+            if opt is not None:
+                return opt
+            return Dict[str, int]()
 
     def __len__(self) -> int:
         return len(self.values)
@@ -84,10 +219,15 @@ class Row:
     def __getitem__(self, name: str) -> Optional[str]:
         return self.get(name)
 
+    def __contains__(self, name: str) -> bool:
+        d = self._ensure_name_to_idx()
+        return name in d
+
     def get(self, name: str) -> Optional[str]:
-        if name not in self.name_to_idx:
+        d = self._ensure_name_to_idx()
+        if name not in d:
             raise KeyError("Column not found in row: " + name)
-        idx = self.name_to_idx[name]
+        idx = d[name]
         return self.values[idx]
 
     def is_null(self, idx: int) -> bool:
@@ -95,14 +235,33 @@ class Row:
             raise IndexError("Row index out of range: " + str(idx))
         return self.values[idx] is None
 
+    def is_null(self, name: str) -> bool:
+        v = self.get(name)
+        return v is None
+
     def get_str(self, idx: int, default_val: str = "") -> str:
         v = self[idx]
         if v is None:
             return default_val
         return v
 
+    def get_str(self, name: str, default_val: str = "") -> str:
+        v = self.get(name)
+        if v is None:
+            return default_val
+        return v
+
     def get_int(self, idx: int, default_val: int = 0) -> int:
         v = self[idx]
+        if v is None:
+            return default_val
+        try:
+            return int(v)
+        except:
+            return default_val
+
+    def get_int(self, name: str, default_val: int = 0) -> int:
+        v = self.get(name)
         if v is None:
             return default_val
         try:
@@ -119,6 +278,37 @@ class Row:
         except:
             return default_val
 
+    def get_float(self, name: str, default_val: float = 0.0) -> float:
+        v = self.get(name)
+        if v is None:
+            return default_val
+        try:
+            return float(v)
+        except:
+            return default_val
+
+    def get_bool(self, idx: int, default_val: bool = False) -> bool:
+        v = self[idx]
+        if v is None:
+            return default_val
+        v_lower = v.lower()
+        if v_lower == "1" or v_lower == "true" or v_lower == "t":
+            return True
+        if v_lower == "0" or v_lower == "false" or v_lower == "f":
+            return False
+        return default_val
+
+    def get_bool(self, name: str, default_val: bool = False) -> bool:
+        v = self.get(name)
+        if v is None:
+            return default_val
+        v_lower = v.lower()
+        if v_lower == "1" or v_lower == "true" or v_lower == "t":
+            return True
+        if v_lower == "0" or v_lower == "false" or v_lower == "f":
+            return False
+        return default_val
+
     def to_dict(self) -> Dict[str, str]:
         res = Dict[str, str]()
         for i in range(len(self.field_names)):
@@ -128,7 +318,8 @@ class Row:
         return res
 
     def to_json(self) -> str:
-        # High performance direct JSON serialization for Web APIs
+        # High performance Schema-Aware direct JSON serialization for Web APIs
+        has_kinds = len(self.field_kinds) == len(self.field_names)
         sb = List[str]()
         sb.append("{")
         first = True
@@ -142,9 +333,82 @@ class Row:
             if val is None:
                 sb.append("null")
             else:
-                _append_escaped_json_str(sb, val)
+                kind = self.field_kinds[i] if has_kinds else COL_KIND_STR
+                if kind == COL_KIND_INT or kind == COL_KIND_FLOAT:
+                    if len(val) == 0:
+                        sb.append("null")
+                    else:
+                        sb.append(val)
+                elif kind == COL_KIND_BOOL:
+                    v_len = len(val)
+                    is_true = False
+                    if v_len == 1:
+                        c0 = val[0]
+                        if c0 == '1' or c0 == 't' or c0 == 'T' or c0 == 'y' or c0 == 'Y':
+                            is_true = True
+                    elif v_len == 4:
+                        c0 = val[0]
+                        if c0 == 't' or c0 == 'T':
+                            is_true = True
+                    sb.append("true" if is_true else "false")
+                elif kind == COL_KIND_RAW_JSON:
+                    sb.append(val)
+                else:
+                    _append_escaped_json_str(sb, val)
         sb.append("}")
         return "".join(sb)
+
+    def write_json_direct(self, dest: ByteBuffer) -> int:
+        dest.ensure_writable(4096)
+        buf_ptr = dest.ptr + dest.write_pos
+        stream = c_get_tls_json_stream()
+        c_json_stream_init(stream, buf_ptr, dest.writable_bytes())
+
+        has_kinds = len(self.field_kinds) == len(self.field_names)
+
+        for i in range(len(self.field_names)):
+            k = self.field_names[i]
+            v = self.values[i]
+            k_ptr = k.c_str().as_byte()
+            k_len = len(k)
+
+            if v is None:
+                c_json_stream_append_null_pair(stream, k_ptr, k_len)
+            else:
+                kind = self.field_kinds[i] if has_kinds else COL_KIND_STR
+                v_ptr = v.c_str().as_byte()
+                v_len = len(v)
+
+                if kind == COL_KIND_INT or kind == COL_KIND_FLOAT:
+                    if v_len == 0:
+                        c_json_stream_append_null_pair(stream, k_ptr, k_len)
+                    else:
+                        c_json_stream_append_raw_pair(stream, k_ptr, k_len, v_ptr, v_len)
+                elif kind == COL_KIND_BOOL:
+                    is_true = False
+                    if v_len == 1:
+                        c0 = v[0]
+                        if c0 == '1' or c0 == 't' or c0 == 'T' or c0 == 'y' or c0 == 'Y':
+                            is_true = True
+                    elif v_len == 4:
+                        c0 = v[0]
+                        if c0 == 't' or c0 == 'T':
+                            is_true = True
+                    c_json_stream_append_bool_pair(stream, k_ptr, k_len, 1 if is_true else 0)
+                elif kind == COL_KIND_RAW_JSON:
+                    c_json_stream_append_raw_pair(stream, k_ptr, k_len, v_ptr, v_len)
+                else:
+                    c_json_stream_append_str_pair(stream, k_ptr, k_len, v_ptr, v_len)
+
+        written = c_json_stream_finish(stream)
+        if written > 0:
+            dest.advance_write(written)
+            return written
+        # Fallback if row size exceeds buffer
+        fallback = self.to_json()
+        dest.append_str(fallback)
+        return len(fallback)
+
 
     def __repr__(self) -> str:
         items = List[str]()
@@ -153,3 +417,147 @@ class Row:
             v_str = "None" if v is None else f"'{v}'"
             items.append(f"{self.field_names[i]}={v_str}")
         return f"Row({', '.join(items)})"
+
+
+class RowView:
+    row: Row
+    overrides: dict[str, str]
+    override_kinds: dict[str, int]
+    hidden_fields: set[str]
+
+    def __init__(self, row: Row):
+        self.row = row
+        self.overrides = {}
+        self.override_kinds = {}
+        self.hidden_fields = set[str]()
+
+    def get(self, name: str, default_val: str = "") -> str:
+        if name in self.overrides:
+            return self.overrides[name]
+        try:
+            v = self.row.get(name)
+            return default_val if v is None else v
+        except:
+            return default_val
+
+    def set(self, name: str, val: str) -> None:
+        self.overrides[name] = val
+        self.override_kinds[name] = COL_KIND_STR
+
+    def set_str(self, name: str, val: str) -> None:
+        self.overrides[name] = val
+        self.override_kinds[name] = COL_KIND_STR
+
+    def set_int(self, name: str, val: int) -> None:
+        self.overrides[name] = str(val)
+        self.override_kinds[name] = COL_KIND_INT
+
+    def set_float(self, name: str, val: float) -> None:
+        self.overrides[name] = str(val)
+        self.override_kinds[name] = COL_KIND_FLOAT
+
+    def set_bool(self, name: str, val: bool) -> None:
+        self.overrides[name] = "true" if val else "false"
+        self.override_kinds[name] = COL_KIND_BOOL
+
+    def set_null(self, name: str) -> None:
+        self.overrides[name] = "null"
+        self.override_kinds[name] = COL_KIND_UNKNOWN
+
+    def hide(self, name: str) -> None:
+        self.hidden_fields.add(name)
+
+    def write_json_direct(self, dest: ByteBuffer) -> int:
+        dest.ensure_writable(4096)
+        buf_ptr = dest.ptr + dest.write_pos
+        stream = c_get_tls_json_stream()
+        c_json_stream_init(stream, buf_ptr, dest.writable_bytes())
+
+        has_kinds = len(self.row.field_kinds) == len(self.row.field_names)
+
+        # 1. Output original fields
+        for i in range(len(self.row.field_names)):
+            k = self.row.field_names[i]
+            if k in self.hidden_fields:
+                continue
+
+            k_ptr = k.c_str().as_byte()
+            k_len = len(k)
+
+            if k in self.overrides:
+                val = self.overrides[k]
+                kind = self.override_kinds.get(k, COL_KIND_STR)
+                if kind == COL_KIND_UNKNOWN or val == "null":
+                    c_json_stream_append_null_pair(stream, k_ptr, k_len)
+                elif kind == COL_KIND_INT or kind == COL_KIND_FLOAT or kind == COL_KIND_RAW_JSON:
+                    c_json_stream_append_raw_pair(stream, k_ptr, k_len, val.c_str().as_byte(), len(val))
+                elif kind == COL_KIND_BOOL:
+                    is_true = (val == "true" or val == "1" or val == "t" or val == "T")
+                    c_json_stream_append_bool_pair(stream, k_ptr, k_len, 1 if is_true else 0)
+                else:
+                    c_json_stream_append_str_pair(stream, k_ptr, k_len, val.c_str().as_byte(), len(val))
+            else:
+                raw_v = self.row.values[i]
+                if raw_v is None:
+                    c_json_stream_append_null_pair(stream, k_ptr, k_len)
+                else:
+                    kind = self.row.field_kinds[i] if has_kinds else COL_KIND_STR
+                    v_ptr = raw_v.c_str().as_byte()
+                    v_len = len(raw_v)
+                    if kind == COL_KIND_INT or kind == COL_KIND_FLOAT:
+                        if v_len == 0:
+                            c_json_stream_append_null_pair(stream, k_ptr, k_len)
+                        else:
+                            c_json_stream_append_raw_pair(stream, k_ptr, k_len, v_ptr, v_len)
+                    elif kind == COL_KIND_BOOL:
+                        is_true = False
+                        if v_len == 1:
+                            c0 = raw_v[0]
+                            if c0 == '1' or c0 == 't' or c0 == 'T' or c0 == 'y' or c0 == 'Y':
+                                is_true = True
+                        elif v_len == 4:
+                            c0 = raw_v[0]
+                            if c0 == 't' or c0 == 'T':
+                                is_true = True
+                        c_json_stream_append_bool_pair(stream, k_ptr, k_len, 1 if is_true else 0)
+                    elif kind == COL_KIND_RAW_JSON:
+                        c_json_stream_append_raw_pair(stream, k_ptr, k_len, v_ptr, v_len)
+                    else:
+                        c_json_stream_append_str_pair(stream, k_ptr, k_len, v_ptr, v_len)
+
+        # 2. Append new fields added to overrides
+        row_fields = self.row._ensure_name_to_idx()
+        for k, val in self.overrides.items():
+            if k not in row_fields and k not in self.hidden_fields:
+                k_ptr = k.c_str().as_byte()
+                k_len = len(k)
+                kind = self.override_kinds.get(k, COL_KIND_STR)
+                if kind == COL_KIND_UNKNOWN or val == "null":
+                    c_json_stream_append_null_pair(stream, k_ptr, k_len)
+                elif kind == COL_KIND_INT or kind == COL_KIND_FLOAT or kind == COL_KIND_RAW_JSON:
+                    c_json_stream_append_raw_pair(stream, k_ptr, k_len, val.c_str().as_byte(), len(val))
+                elif kind == COL_KIND_BOOL:
+                    is_true = (val == "true" or val == "1" or val == "t")
+                    c_json_stream_append_bool_pair(stream, k_ptr, k_len, 1 if is_true else 0)
+                else:
+                    c_json_stream_append_str_pair(stream, k_ptr, k_len, val.c_str().as_byte(), len(val))
+
+        written = c_json_stream_finish(stream)
+        if written > 0:
+            dest.advance_write(written)
+            return written
+        fallback = self.to_json()
+        dest.append_str(fallback)
+        return len(fallback)
+
+    def to_json(self) -> str:
+        buf = ByteBuffer(4096)
+        self.write_json_direct(buf)
+        rslice = buf.readable_slice()
+        return str(rslice.ptr, rslice.len)
+
+@extend
+class Row:
+    def create_view(self) -> RowView:
+        return RowView(self)
+

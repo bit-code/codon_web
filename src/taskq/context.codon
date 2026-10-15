@@ -1,0 +1,102 @@
+# Industrial-Grade Task Context and Hierarchical Cancellation Token
+# Solves deep cancellation propagation across multi-layer nested async coroutines and sync tasks
+
+from typing import Optional
+from src.taskq.protocol import TaskCancelledError
+from src.taskq.broker.base import Broker
+
+class CancellationToken:
+    task_id: str
+    is_cancelled: bool
+    cancel_reason: str
+    children: list[CancellationToken]
+
+    def __init__(self, task_id: str = ""):
+        self.task_id = task_id
+        self.is_cancelled = False
+        self.cancel_reason = ""
+        self.children = []
+
+    def cancel(self, reason: str = "Task was cancelled") -> None:
+        """Triggers cancellation on this token and cascade-cancels all child tokens."""
+        if self.is_cancelled:
+            return
+        self.is_cancelled = True
+        self.cancel_reason = reason
+        for i in range(len(self.children)):
+            self.children[i].cancel(reason)
+
+    def child(self) -> CancellationToken:
+        """Derives a linked child token. Cancelling the parent automatically cancels the child."""
+        c = CancellationToken(self.task_id)
+        if self.is_cancelled:
+            c.cancel(self.cancel_reason)
+        self.children.append(c)
+        return c
+
+    def throw_if_cancelled(self) -> None:
+        """Fast-fail check: raises TaskCancelledError immediately if cancellation was requested."""
+        if self.is_cancelled:
+            raise TaskCancelledError(self.task_id, self.cancel_reason)
+
+
+import time
+
+class TaskContext:
+    task_id: str
+    token: CancellationToken
+    broker: Optional[Broker]
+    last_poll_ms: int
+    poll_interval_ms: int
+
+    def __init__(
+        self,
+        task_id: str,
+        token: Optional[CancellationToken] = None,
+        broker: Optional[Broker] = None,
+        poll_interval_ms: int = 50
+    ):
+        self.task_id = task_id
+        self.token = token if token is not None else CancellationToken(task_id)
+        self.broker = broker
+        self.last_poll_ms = 0
+        self.poll_interval_ms = poll_interval_ms
+
+    def is_cancelled(self) -> bool:
+        """Returns True if this task context (or its parent) has received a cancellation signal."""
+        return self.token.is_cancelled
+
+    def check_cancelled(self) -> None:
+        """Throws TaskCancelledError immediately if this context has been cancelled."""
+        self.token.throw_if_cancelled()
+
+    def cancel(self, reason: str = "Explicit cancellation") -> None:
+        """Locally triggers cancellation for this task and all its child operations."""
+        self.token.cancel(reason)
+
+    def poll_cancelled(self, force: bool = False) -> bool:
+        """
+        Polls the remote Broker (e.g. Redis) to check if a client requested cancellation.
+        Throttled to avoid overwhelming the broker with network queries on every loop tick.
+        If remotely cancelled, propagates the cancellation locally through the token tree.
+        """
+        if self.token.is_cancelled:
+            return True
+        now_ms = int(time.time() * 1000.0)
+        if not force and (now_ms - self.last_poll_ms < self.poll_interval_ms):
+            return False
+        self.last_poll_ms = now_ms
+
+        if self.broker is not None:
+            if self.broker.is_cancelled(self.task_id):
+                self.token.cancel("Cancelled remotely via Broker")
+                return True
+        return False
+
+    def child_context(self) -> TaskContext:
+        """
+        Derives a sub-context for nested child coroutines or functions.
+        If the parent task is cancelled, this child context will also be cancelled.
+        """
+        child_token = self.token.child()
+        return TaskContext(self.task_id, child_token, self.broker, self.poll_interval_ms)

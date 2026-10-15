@@ -1,0 +1,241 @@
+# Synchronous POSIX Socket Redis Connection Pool for Codon
+
+import time
+from typing import Optional, List, Tuple
+from src.db.drivers.redis.connection import RedisConnection
+from src.db.drivers.redis.errors import RedisPoolError, RedisConnectionError
+from src.db.drivers.redis.protocol import RedisValue
+
+class PooledRedisConnection[PoolType]:
+    _pool: PoolType
+    _conn: RedisConnection
+    _is_returned: bool
+
+    def __init__(self, pool: PoolType, conn: RedisConnection):
+        self._pool = pool
+        self._conn = conn
+        self._is_returned = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self):
+        self.close()
+
+    def close(self):
+        if not self._is_returned:
+            self._is_returned = True
+            self._pool.release(self._conn)
+
+    @property
+    def is_connected(self) -> bool:
+        return self._conn.is_connected
+
+    def execute(self, cmd_args: List[str]) -> RedisValue:
+        return self._conn.execute(cmd_args)
+
+    def ping(self) -> bool:
+        return self._conn.ping()
+
+    def get(self, key: str) -> Optional[str]:
+        return self._conn.get(key)
+
+    def set(self, key: str, val: str, ex: int = 0, px: int = 0, nx: bool = False, xx: bool = False) -> bool:
+        return self._conn.set(key, val, ex=ex, px=px, nx=nx, xx=xx)
+
+    def setex(self, key: str, sec: int, val: str) -> bool:
+        return self._conn.setex(key, sec, val)
+
+    def setnx(self, key: str, val: str) -> bool:
+        return self._conn.setnx(key, val)
+
+    def del_key(self, key: str) -> int:
+        return self._conn.del_key(key)
+
+    def del_keys(self, keys: List[str]) -> int:
+        return self._conn.del_keys(keys)
+
+    def exists(self, key: str) -> bool:
+        return self._conn.exists(key)
+
+    def incr(self, key: str) -> int:
+        return self._conn.incr(key)
+
+    def decr(self, key: str) -> int:
+        return self._conn.decr(key)
+
+    def expire(self, key: str, sec: int) -> bool:
+        return self._conn.expire(key, sec)
+
+    def ttl(self, key: str) -> int:
+        return self._conn.ttl(key)
+
+    def hget(self, name: str, key: str) -> Optional[str]:
+        return self._conn.hget(name, key)
+
+    def hset(self, name: str, key: str, val: str) -> int:
+        return self._conn.hset(name, key, val)
+
+    def hgetall(self, name: str) -> dict[str, str]:
+        return self._conn.hgetall(name)
+
+    def hdel(self, name: str, keys: List[str]) -> int:
+        return self._conn.hdel(name, keys)
+
+    def lpush(self, name: str, values: List[str]) -> int:
+        return self._conn.lpush(name, values)
+
+    def rpush(self, name: str, values: List[str]) -> int:
+        return self._conn.rpush(name, values)
+
+    def lpop(self, name: str) -> Optional[str]:
+        return self._conn.lpop(name)
+
+    def rpop(self, name: str) -> Optional[str]:
+        return self._conn.rpop(name)
+
+    def sadd(self, name: str, values: List[str]) -> int:
+        return self._conn.sadd(name, values)
+
+    def smembers(self, name: str) -> List[str]:
+        return self._conn.smembers(name)
+
+    def zadd(self, name: str, score: float, member: str) -> int:
+        return self._conn.zadd(name, score, member)
+
+    def zrange(self, name: str, start: int, stop: int) -> List[str]:
+        return self._conn.zrange(name, start, stop)
+
+    def eval_script(self, script: str, keys: List[str], args: List[str]) -> RedisValue:
+        return self._conn.eval_script(script, keys, args)
+
+    def keys(self, pattern: str = "*") -> List[str]:
+        return self._conn.keys(pattern)
+
+    def mget(self, keys: List[str]) -> List[Optional[str]]:
+        return self._conn.mget(keys)
+
+    def lrange(self, name: str, start: int, stop: int) -> List[str]:
+        return self._conn.lrange(name, start, stop)
+
+    def llen(self, name: str) -> int:
+        return self._conn.llen(name)
+
+    def sismember(self, name: str, value: str) -> bool:
+        return self._conn.sismember(name, value)
+
+    def flushdb(self) -> bool:
+        return self._conn.flushdb()
+
+    def dbsize(self) -> int:
+        return self._conn.dbsize()
+
+
+class RedisPool:
+    host: str
+    port: int
+    password: str
+    db: int
+    min_size: int
+    max_size: int
+    timeout_sec: float
+    idle_timeout: float
+    _available: List[RedisConnection]
+    _in_use_count: int
+    _is_closed: bool
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 6379,
+        password: str = "",
+        db: int = 0,
+        min_size: int = 2,
+        max_size: int = 20,
+        timeout_sec: float = 5.0,
+        idle_timeout: float = 30.0
+    ):
+        self.host = host
+        self.port = port
+        self.password = password
+        self.db = db
+        self.min_size = min_size
+        self.max_size = max_size if max_size >= min_size else min_size
+        self.timeout_sec = timeout_sec
+        self.idle_timeout = idle_timeout
+        self._available = List[RedisConnection]()
+        self._in_use_count = 0
+        self._is_closed = False
+
+        # Pre-warm min_size
+        for _ in range(self.min_size):
+            conn = RedisConnection(
+                host=self.host,
+                port=self.port,
+                password=self.password,
+                db=self.db,
+                timeout_sec=self.timeout_sec
+            )
+            if conn.connect():
+                self._available.append(conn)
+
+    def acquire(self) -> PooledRedisConnection:
+        if self._is_closed:
+            raise RedisPoolError("Cannot acquire from closed RedisPool")
+
+        # 1. Check idle connections with test-on-borrow
+        while len(self._available) > 0:
+            conn = self._available.pop(0)
+            if conn.is_connected:
+                if time.time() - conn.last_active_time > self.idle_timeout:
+                    try:
+                        conn.ping()
+                    except Exception:
+                        conn.close()
+                        continue
+                self._in_use_count += 1
+                return PooledRedisConnection(self, conn)
+
+        # 2. Scale up if under max_size
+        if self._in_use_count < self.max_size:
+            conn = RedisConnection(
+                host=self.host,
+                port=self.port,
+                password=self.password,
+                db=self.db,
+                timeout_sec=self.timeout_sec
+            )
+            if not conn.connect():
+                raise RedisConnectionError(f"Failed to create Redis connection to {self.host}:{self.port}")
+            self._in_use_count += 1
+            return PooledRedisConnection(self, conn)
+
+        # 3. Adaptive backoff wait up to timeout_sec
+        t0 = time.time()
+        backoff = 0.001
+        while time.time() - t0 < self.timeout_sec:
+            time.sleep(backoff)
+            if len(self._available) > 0:
+                conn = self._available.pop(0)
+                if conn.is_connected:
+                    self._in_use_count += 1
+                    return PooledRedisConnection(self, conn)
+            backoff = min(backoff * 1.5, 0.02)
+
+        raise RedisPoolError(f"Timeout ({self.timeout_sec}s) waiting for an available Redis connection from pool")
+
+    def release(self, conn: RedisConnection):
+        if self._is_closed or not conn.is_connected:
+            conn.close()
+            self._in_use_count -= 1
+            return
+
+        conn.last_active_time = time.time()
+        self._in_use_count -= 1
+        self._available.append(conn)
+
+    def close(self):
+        self._is_closed = True
+        for i in range(len(self._available)):
+            self._available[i].close()
+        self._available.clear()

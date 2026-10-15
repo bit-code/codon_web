@@ -1,0 +1,48 @@
+# Task Queue Broker Abstraction
+# Base class for all distributed brokers (Memory, Redis, RabbitMQ, etc.)
+
+from typing import Optional
+from src.taskq.protocol import TaskMessage, TaskResult
+
+class Broker:
+    def enqueue(self, queue: str, msg: TaskMessage) -> bool:
+        return False
+
+    def dequeue(self, queue: str, timeout_sec: int = 1) -> Optional[TaskMessage]:
+        res: Optional[TaskMessage] = None
+        return res
+
+    def dequeue_multi(self, queues: list[str], timeout_sec: int = 1) -> Optional[TaskMessage]:
+        for i in range(len(queues)):
+            msg = self.dequeue(queues[i], 0)
+            if msg is not None:
+                return msg
+        if timeout_sec > 0 and len(queues) > 0:
+            return self.dequeue(queues[0], timeout_sec)
+        res: Optional[TaskMessage] = None
+        return res
+
+    def schedule(self, queue: str, msg: TaskMessage, delay_sec: int) -> bool:
+        return False
+
+    def poll_delayed(self, queue: str, limit: int = 50) -> list[TaskMessage]:
+        return []
+
+    def enqueue_dead_letter(self, queue: str, msg: TaskMessage, reason: str) -> bool:
+        return False
+
+    def store_result(self, task_id: str, res: TaskResult, expire_sec: int = 3600) -> bool:
+        return False
+
+    def get_result(self, task_id: str) -> Optional[TaskResult]:
+        res: Optional[TaskResult] = None
+        return res
+
+    def cancel_task(self, task_id: str, expire_sec: int = 86400) -> bool:
+        return False
+
+    def is_cancelled(self, task_id: str) -> bool:
+        return False
+
+    def close(self) -> None:
+        pass

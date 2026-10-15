@@ -1,0 +1,41 @@
+from src.framework.app import App
+from src.http.request import Request
+from src.http.response import Response
+from src.runtime.iouring import IoUring
+import time
+
+print("=== Testing Industrial Dual-Engine Architecture (io_uring & epoll) ===")
+
+supported = IoUring.is_supported()
+print("[Check 1] IoUring.is_supported() = " + str(supported))
+
+# Test Epoll Mode
+print("\n[Check 2] Initializing App with driver='epoll'...")
+app_epoll = App(port=19101, driver="epoll", enable_openapi=False)
+@app_epoll.get("/ping")
+def ping_epoll(req: Request) -> Response:
+    return Response.text("pong-epoll", 200)
+
+print("  ServerConfig driver: " + app_epoll.config.driver)
+assert app_epoll.config.driver == "epoll"
+print("  App initialized with epoll driver successfully!")
+
+# Test IoUring Mode
+print("\n[Check 3] Initializing App with driver='io_uring'...")
+app_uring = App(port=19102, driver="io_uring", enable_openapi=False)
+@app_uring.get("/ping")
+def ping_uring(req: Request) -> Response:
+    return Response.text("pong-uring", 200)
+
+print("  ServerConfig driver: " + app_uring.config.driver)
+assert app_uring.config.driver == "io_uring"
+print("  App initialized with io_uring driver successfully!")
+
+# Test Auto-Adaptive Mode
+print("\n[Check 4] Initializing App with driver='auto'...")
+app_auto = App(port=19103, driver="auto", enable_openapi=False)
+print("  ServerConfig driver: " + app_auto.config.driver)
+assert app_auto.config.driver == "auto"
+print("  App initialized with auto-adaptive driver successfully!")
+
+print("\n=== ALL DUAL-ENGINE ARCHITECTURE CHECKS PASSED SUCCESSFULLY! ===")

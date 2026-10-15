@@ -1,0 +1,204 @@
+# High-Performance Asynchronous PostgreSQL Connection Pool
+from typing import Optional, List
+import asyncio
+from asyncio import Future
+from src.core.async.loop import get_event_loop
+from src.db.drivers.postgres.async_connection import AsyncPostgresConnection, AsyncPostgresCursor, connect_async
+from src.db.errors import OperationalError
+
+class AsyncPooledPostgresConnection:
+    _pool: Optional[cobj]
+    _conn: AsyncPostgresConnection
+    _is_returned: bool
+
+    def __init__(self, conn: AsyncPostgresConnection, pool_ptr: cobj):
+        self._conn = conn
+        self._pool = pool_ptr
+        self._is_returned = False
+
+    def cursor(self) -> AsyncPostgresCursor[AsyncPostgresConnection]:
+        return self._conn.cursor()
+
+    async def ping(self):
+        return await self._conn.ping()
+
+    @property
+    def is_closed(self) -> bool:
+        return self._conn.is_closed
+
+    @property
+    def database(self) -> str:
+        return self._conn.database
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._conn.in_transaction
+
+
+class AsyncPostgresPool:
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+    conninfo: str
+    min_size: int
+    max_size: int
+    _available: List[AsyncPostgresConnection]
+    _in_use_count: int
+    _waiters: List[Future[AsyncPostgresConnection]]
+    _is_closed: bool
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 5432,
+        user: str = "postgres",
+        password: str = "",
+        database: str = "postgres",
+        conninfo: str = "",
+        min_size: int = 4,
+        max_size: int = 32
+    ):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.database = database
+        self.conninfo = conninfo
+        self.min_size = min_size
+        self.max_size = max_size if max_size >= min_size else min_size
+        self._available = List[AsyncPostgresConnection]()
+        self._in_use_count = 0
+        self._waiters = List[Future[AsyncPostgresConnection]]()
+        self._is_closed = False
+
+    async def _create_connection(self):
+        return await connect_async(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=self.password,
+            database=self.database,
+            conninfo=self.conninfo
+        )
+
+    async def init_pool(self):
+        """Pre-warms the connection pool up to min_size asynchronously."""
+        for _ in range(self.min_size):
+            conn = await self._create_connection()
+            self._available.append(conn)
+
+    async def acquire(self):
+        """
+        Asynchronously acquires a connection.
+        If all connections are in use and pool is at max_size, non-blockingly waits.
+        """
+        if self._is_closed:
+            raise OperationalError("Cannot acquire from closed AsyncPostgresPool")
+
+        loop = get_event_loop()
+
+        # 1. Try to get existing idle connection
+        while len(self._available) > 0:
+            conn = self._available.pop()
+            if not conn.is_closed:
+                self._in_use_count += 1
+                return conn
+
+        # 2. Can we create a new connection?
+        if (len(self._available) + self._in_use_count) < self.max_size:
+            self._in_use_count += 1
+            try:
+                conn = await self._create_connection()
+                return conn
+            except:
+                self._in_use_count -= 1
+                raise
+
+        # 3. Pool is exhausted: non-blockingly wait on Future
+        fut = loop.create_future(AsyncPostgresConnection)
+        self._waiters.append(fut)
+        conn = await fut
+        self._in_use_count += 1
+        return conn
+
+    def release(self, conn: AsyncPostgresConnection) -> None:
+        """Returns a connection back to the pool, notifying waiters non-blockingly."""
+        self._in_use_count = max(0, self._in_use_count - 1)
+
+        if self._is_closed or conn.is_closed:
+            conn.close()
+            return
+
+        # If there are suspended requests waiting, wake up the first waiter
+        if len(self._waiters) > 0:
+            waiter = self._waiters.pop(0)
+            waiter.set_result(conn)
+        else:
+            self._available.append(conn)
+
+    def connection(self):
+        return AsyncPostgresConnectionContext(self)
+
+    def available_count(self) -> int:
+        return len(self._available)
+
+    def in_use_count(self) -> int:
+        return self._in_use_count
+
+    def close(self) -> None:
+        """Closes all idle physical connections in the pool."""
+        self._is_closed = True
+        while len(self._available) > 0:
+            conn = self._available.pop()
+            conn.close()
+
+
+class AsyncPostgresConnectionContext:
+    _pool: AsyncPostgresPool
+    _conn: Optional[AsyncPostgresConnection]
+
+    def __init__(self, pool: AsyncPostgresPool):
+        self._pool = pool
+        self._conn = None
+
+    async def __aenter__(self):
+        conn = await self._pool.acquire()
+        self._conn = conn
+        return conn
+
+    async def __aexit__(self):
+        if self._conn is not None:
+            c = self._conn
+            self._pool.release(c)
+
+    @property
+    def conn(self) -> AsyncPostgresConnection:
+        assert self._conn is not None, "Connection not acquired or already released"
+        return self._conn
+
+    def cursor(self):
+        assert self._conn is not None, "Connection not acquired or already released"
+        return self._conn.cursor()
+
+    async def ping(self):
+        assert self._conn is not None, "Connection not acquired or already released"
+        return await self._conn.ping()
+
+    async def execute(self, sql: str, params: List[str] = List[str]()):
+        assert self._conn is not None, "Connection not acquired or already released"
+        return await self._conn.execute(sql, params)
+
+    async def begin(self):
+        assert self._conn is not None, "Connection not acquired or already released"
+        await self._conn.begin()
+
+    async def commit(self):
+        assert self._conn is not None, "Connection not acquired or already released"
+        await self._conn.commit()
+
+    async def rollback(self):
+        assert self._conn is not None, "Connection not acquired or already released"
+        await self._conn.rollback()
+

@@ -3,7 +3,11 @@ from src.core.async.loop import (
     get_event_loop,
     set_event_loop,
     run,
-    create_task
+    create_task,
+    wait_for,
+    gather,
+    gather2,
+    gather3
 )
 from src.core.async.stream import (
     AsyncStreamReader,

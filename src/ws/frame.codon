@@ -66,7 +66,9 @@ def encode_frame(opcode: int, payload: list[byte], is_server: bool = True) -> li
 
     return frame
 
-def decode_frame(raw: list[byte]) -> WSFrame:
+MAX_WS_FRAME_SIZE: int = 16777216 # 16 MB
+
+def decode_frame(raw: list[byte], require_mask: bool = False, max_payload: int = 16777216) -> WSFrame:
     if len(raw) < 2:
         return WSFrame(True, WS_OPCODE_CLOSE, "", list[byte]())
 
@@ -77,6 +79,11 @@ def decode_frame(raw: list[byte]) -> WSFrame:
     opcode = b0 & 0x0F
     is_masked = (b1 & 0x80) != 0
     len_field = b1 & 0x7F
+
+    # RFC 6455 Section 5.1: If require_mask is enabled (server receiving client frame),
+    # unmasked client frame MUST be rejected as protocol error.
+    if require_mask and not is_masked:
+        return WSFrame(True, WS_OPCODE_CLOSE, "Protocol Error: unmasked client frame", list[byte]())
 
     offset = 2
     payload_len = 0
@@ -94,6 +101,10 @@ def decode_frame(raw: list[byte]) -> WSFrame:
         for i in range(8):
             payload_len = (payload_len << 8) | int(raw[2 + i])
         offset = 10
+
+    # Guard against negative length or excessive payload DoS
+    if payload_len < 0 or payload_len > max_payload:
+        return WSFrame(True, WS_OPCODE_CLOSE, "Payload Too Large", list[byte]())
 
     mask_key = [0, 0, 0, 0]
     if is_masked:

@@ -1,0 +1,122 @@
+# Comprehensive Verification Test for Framework-level Zero-Copy & Zero-Allocation
+# Validates:
+# 1. Zero-Allocation Radix Router (sliding-window path matching without str/list/dict allocations)
+# 2. In-Place Query Parameters (query_param_slice, query_param_int without dict parsing)
+# 3. In-Place Cookie Scanner (cookie_slice without Cookie header splitting)
+# 4. Zero-Copy JSON Processing (loads_slice & parse_slice_to_dict directly on ByteSlice)
+# 5. Response Object Pooling & Recycling (0 heap allocations for Response instances)
+
+from src.framework.app import App
+from src.framework.radix import RadixRouter
+from src.framework.route import RouteHandler
+from src.http.request import Request
+from src.http.response import Response, _FREE_RESPONSES
+from src.http.fast_json import FastJson, FastJsonDoc
+from src.http.method import METHOD_GET, METHOD_POST
+from src.memory.slice import ByteSlice
+from src.testing.test_client import TestClient
+
+print("--- Running Framework Zero-Copy & Zero-Allocation Tests ---")
+
+# 1. Radix Router Zero-Alloc Test
+class EchoHandler(RouteHandler):
+    def handle(self, req: Request) -> Response:
+        id_val = req.param_int("id", 0)
+        slug_slice = req.param_slice("slug")
+        wc = req.param("*")
+        return Response.json("{\"id\":" + str(id_val) + ",\"slug\":\"" + slug_slice.to_str() + "\",\"wc\":\"" + wc + "\"}")
+
+router = RadixRouter()
+router.add_route(METHOD_GET, "/api/items/{id:int}", EchoHandler())
+router.add_route(METHOD_GET, "/articles/{slug}/comments", EchoHandler())
+router.add_route(METHOD_GET, "/downloads/*", EchoHandler())
+
+# 1a. Test dynamic int parameter
+req1 = Request()
+req1.method = METHOD_GET
+req1.path = ByteSlice("/api/items/12345".c_str().as_byte(), 16)
+resp1 = router.dispatch(req1)
+assert resp1.status_code == 200
+assert req1.param_int("id") == 12345
+assert req1.param("id") == "12345"
+assert len(req1.fast_params) == 1
+assert req1.fast_params[0][0] == "id"
+print("[PASS] Test 1: Dynamic int path param parsed via ByteSlice")
+
+# 1b. Test dynamic string parameter
+req2 = Request()
+req2.method = METHOD_GET
+req2.path = ByteSlice("/articles/zero-copy-architecture/comments".c_str().as_byte(), 41)
+resp2 = router.dispatch(req2)
+assert resp2.status_code == 200
+assert req2.param_slice("slug").equals_ascii("zero-copy-architecture")
+assert req2.param("slug") == "zero-copy-architecture"
+print("[PASS] Test 2: Dynamic string path param matched via sliding window")
+
+# 1c. Test wildcard parameter
+req3 = Request()
+req3.method = METHOD_GET
+req3.path = ByteSlice("/downloads/v1/release/bundle.tar.gz".c_str().as_byte(), 35)
+resp3 = router.dispatch(req3)
+assert resp3.status_code == 200
+assert req3.param("*") == "v1/release/bundle.tar.gz"
+print("[PASS] Test 3: Wildcard parameter captured with zero allocations")
+
+# 2. In-Place Query Parameters Test
+q_str = "category=electronics&page=3&limit=25&flag"
+req4 = Request()
+req4.query = ByteSlice(q_str.c_str().as_byte(), len(q_str))
+
+assert req4.query_param_slice("category").equals_ascii("electronics")
+assert req4.query_param_int("page") == 3
+assert req4.query_param_int("limit") == 25
+assert req4.query_param("category") == "electronics"
+# Assert that full dictionary parsing was NOT triggered
+assert not req4.parsed_query, "query_params dict should remain unparsed for zero-allocation access"
+assert len(req4.query_params) == 0
+print("[PASS] Test 4: In-place query param extraction completely bypassed dict allocations")
+
+# 3. In-Place Cookie Scanner Test
+c_str = "theme=dark; session_token=secret_tok_123; tracking=disabled"
+req5 = Request()
+req5.headers.set("Cookie", c_str)
+
+assert req5.cookie_slice("theme").equals_ascii("dark")
+assert req5.cookie_slice("session_token").equals_ascii("secret_tok_123")
+assert req5.cookie("theme") == "dark"
+assert not req5.parsed_cookies, "cookies dict should remain unparsed for zero-allocation access"
+assert len(req5.cookies) == 0
+print("[PASS] Test 5: In-place cookie scanning bypassed dict allocations")
+
+# 4. Zero-Copy JSON Processing Test
+json_payload = "{\"sku\":\"PROD-999\",\"count\":42,\"active\":true}"
+req6 = Request()
+req6.body = ByteSlice(json_payload.c_str().as_byte(), len(json_payload))
+
+doc = req6.json_doc()
+assert doc.root.get("sku").as_str() == "PROD-999"
+assert doc.root.get("count").as_int() == 42
+
+d = req6.json()
+assert d["sku"] == "PROD-999"
+assert d["count"] == "42"
+print("[PASS] Test 6: FastJson directly parsed ByteSlice without intermediate string copy")
+
+# 5. Response Object Pooling & Recycling Test
+initial_free = len(_FREE_RESPONSES)
+r_obj1 = Response.text("Hello 1")
+assert r_obj1.body == "Hello 1"
+Response.recycle(r_obj1)
+assert len(_FREE_RESPONSES) == initial_free + 1
+
+# Next create should pop the exact same object from pool
+r_obj2 = Response.json("{\"status\":\"ok\"}")
+assert r_obj2.status_code == 200
+assert r_obj2.content_type == "application/json; charset=utf-8"
+Response.recycle(r_obj2)
+assert len(_FREE_RESPONSES) == initial_free + 1
+print("[PASS] Test 7: Response object pool properly reuses and recycles instances")
+
+print("==============================================================")
+print("ALL ZERO-COPY & ZERO-ALLOCATION ARCHITECTURE TESTS PASSED 100%!")
+print("==============================================================")

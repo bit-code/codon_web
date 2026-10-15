@@ -1,0 +1,63 @@
+# Industrial-Grade Asynchronous Task Handler and Registry for TaskQ
+# Allows defining non-blocking I/O coroutines (crawlers, external API calls, async DB operations)
+
+from typing import Optional
+from src.core.async import sleep
+from src.taskq.context import TaskContext
+
+class AsyncTaskHandler:
+    name: str
+    max_retries: int
+    default_queue: str
+    timeout_ms: int
+
+    def __init__(
+        self,
+        name: str,
+        max_retries: int = 3,
+        default_queue: str = "default",
+        timeout_ms: int = 0
+    ):
+        self.name = name
+        self.max_retries = max_retries
+        self.default_queue = default_queue
+        self.timeout_ms = timeout_ms
+
+    async def run(self, payload: str):
+        # Override this coroutine in subclasses for basic tasks
+        await sleep(0.0)
+        return ""
+
+    async def run_with_context(self, payload: str, ctx: TaskContext):
+        # Advanced coroutine with cancellation context.
+        # Subclasses can override this to access hierarchical tokens and pass child contexts.
+        # Default behavior seamlessly delegates to run(payload).
+        return await self.run(payload)
+
+
+class AsyncTaskRegistry:
+    handlers: dict[str, AsyncTaskHandler]
+
+    def __init__(self):
+        self.handlers = {}
+
+    def register(self, handler: AsyncTaskHandler) -> None:
+        if handler.name in self.handlers:
+            raise ValueError(f"Async task '{handler.name}' already registered in registry")
+        self.handlers[handler.name] = handler
+
+    def get(self, name: str) -> Optional[AsyncTaskHandler]:
+        if name in self.handlers:
+            return self.handlers[name]
+        ret: Optional[AsyncTaskHandler] = None
+        return ret
+
+    def has(self, name: str) -> bool:
+        return name in self.handlers
+
+    def count(self) -> int:
+        return len(self.handlers)
+
+
+# Global singleton for async tasks
+GLOBAL_ASYNC_REGISTRY: AsyncTaskRegistry = AsyncTaskRegistry()

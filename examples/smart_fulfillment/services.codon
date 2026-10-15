@@ -1,0 +1,443 @@
+# ==============================================================================
+# Smart Fulfillment Hub - Asynchronous ORM Domain Service Layer
+# Encapsulates business logic, price computation, risk assessment,
+# and Real Database Asynchronous ORM persistence pipeline (AsyncSession).
+# ==============================================================================
+
+from typing import List, Dict, Optional, Tuple
+from examples.smart_fulfillment.config import app_config
+from examples.smart_fulfillment.schemas import (
+    AddressSchema,
+    FulfillmentItemSchema,
+    FulfillmentRequest,
+    FulfillmentOrderUpdateSchema,
+    WarehouseInventorySchema,
+    InventoryUpdateSchema,
+    LogisticsRoutePointSchema,
+    ShipmentTrackingSchema,
+    ShipmentUpdateSchema
+)
+from examples.smart_fulfillment.entities import (
+    FulfillmentOrderTable,
+    WarehouseInventoryTable,
+    ShipmentTrackingTable
+)
+from src.orm import (
+    AsyncSession, get_table_schema, MYSQL_DIALECT,
+    select, update, delete, Table, and_, or_, desc, asc, func
+)
+from src.db.async_pool import AsyncMySQLPool
+from src.db.types import Row
+from src.memory.buffer import ByteBuffer
+from src.schema import ValidationError, ValidationResult
+
+
+class FulfillmentCalculation:
+    """Calculated financial and dispatch metrics for an order."""
+    item_subtotal: float
+    total_quantity: int
+    shipping_fee: float
+    insurance_fee: float
+    discount_amount: float
+    final_payable: float
+
+    def __init__(
+        self,
+        item_subtotal: float = 0.0,
+        total_quantity: int = 0,
+        shipping_fee: float = 0.0,
+        insurance_fee: float = 0.0,
+        discount_amount: float = 0.0,
+        final_payable: float = 0.0
+    ):
+        self.item_subtotal = item_subtotal
+        self.total_quantity = total_quantity
+        self.shipping_fee = shipping_fee
+        self.insurance_fee = insurance_fee
+        self.discount_amount = discount_amount
+        self.final_payable = final_payable
+
+
+_GLOBAL_ASYNC_POOL: Optional[AsyncMySQLPool] = None
+_GLOBAL_ASYNC_SESSION: Optional[AsyncSession] = None
+
+def get_async_session() -> AsyncSession:
+    global _GLOBAL_ASYNC_POOL, _GLOBAL_ASYNC_SESSION
+    if _GLOBAL_ASYNC_SESSION is None:
+        pool = AsyncMySQLPool(
+            host=app_config.db_host,
+            port=app_config.db_port,
+            user=app_config.db_user,
+            password=app_config.db_password,
+            database=app_config.db_name,
+            min_size=2,
+            max_size=10
+        )
+        _GLOBAL_ASYNC_POOL = Optional[AsyncMySQLPool](pool)
+        _GLOBAL_ASYNC_SESSION = Optional[AsyncSession](AsyncSession(pool, dialect=MYSQL_DIALECT))
+    return _GLOBAL_ASYNC_SESSION
+
+
+def _empty_order() -> FulfillmentRequest:
+    return FulfillmentRequest(
+        "", "", "standard", 1, False, 0.0,
+        Optional[str](), Optional[str](), List[str](),
+        AddressSchema("", "", ""), List[FulfillmentItemSchema]()
+    )
+
+def _empty_inventory() -> WarehouseInventorySchema:
+    return WarehouseInventorySchema(
+        "", "WH-EAST-01", 1, 0, 0, 1.0, False,
+        Optional[float](), Optional[int](), Optional[bool](),
+        List[int](), List[bool]()
+    )
+
+def _empty_shipment() -> ShipmentTrackingSchema:
+    return ShipmentTrackingSchema(
+        "", "SF-EXPRESS", 1, "", 1.0,
+        Optional[bool](), Optional[int](), Optional[float](),
+        List[float](), List[LogisticsRoutePointSchema]()
+    )
+
+
+class FulfillmentService:
+    """Enterprise Fulfillment domain service orchestrator with Async ORM support."""
+
+    @staticmethod
+    def get_session() -> AsyncSession:
+        return get_async_session()
+
+    @staticmethod
+    async def init_db_schema():
+        """Executes real DDL to verify/create all 3 tables in MySQL asynchronously."""
+        session = FulfillmentService.get_session()
+        try:
+            await session.execute_raw("DROP TABLE IF EXISTS fulfillment_orders, warehouse_inventories, shipment_trackings")
+        except:
+            pass
+        # 1. Fulfillment Orders Table
+        schema_order = get_table_schema("fulfillment_orders")
+        await session.create_table(schema_order)
+
+        # 2. Warehouse Inventory Table
+        schema_inv = get_table_schema("warehouse_inventories")
+        await session.create_table(schema_inv)
+
+        # 3. Shipment Tracking Table
+        schema_ship = get_table_schema("shipment_trackings")
+        await session.create_table(schema_ship)
+
+    # --------------------------------------------------------------------------
+    # Scenario 1: Fulfillment Orders CRUD
+    # --------------------------------------------------------------------------
+    @staticmethod
+    def calculate_order_metrics(order: FulfillmentRequest) -> FulfillmentCalculation:
+        subtotal = 0.0
+        total_qty = 0
+        for item in order.items:
+            subtotal += item.unit_price * float(item.quantity)
+            total_qty += item.quantity
+
+        shipping_fee = app_config.calculate_shipping(subtotal, order.delivery_speed)
+        insurance_fee = order.insured_amount * 0.005
+
+        discount = 0.0
+        if order.discount_code is not None:
+            code = order.discount_code
+            if code == "VIP20":
+                discount = subtotal * 0.20
+            elif code == "FLAT10":
+                discount = 10.0
+
+        if discount > subtotal:
+            discount = subtotal
+
+        final_payable = subtotal + shipping_fee + insurance_fee - discount
+        return FulfillmentCalculation(
+            item_subtotal=subtotal,
+            total_quantity=total_qty,
+            shipping_fee=shipping_fee,
+            insurance_fee=insurance_fee,
+            discount_amount=discount,
+            final_payable=final_payable
+        )
+
+    @staticmethod
+    def transfer_to_orm(order: FulfillmentRequest, target: FulfillmentOrderTable) -> None:
+        order.copy_to(target)
+
+    @staticmethod
+    def restore_from_orm(entity: FulfillmentOrderTable) -> ValidationResult[FulfillmentRequest]:
+        return FulfillmentRequest.from_orm(entity)
+
+    @staticmethod
+    async def create_order(order: FulfillmentRequest):
+        session = FulfillmentService.get_session()
+        table_record = FulfillmentOrderTable(order)
+        new_id = await session.save(table_record)
+        return new_id
+
+    @staticmethod
+    async def get_order_by_id(pk_id: int):
+        session = FulfillmentService.get_session()
+        row_opt = await session.get(FulfillmentOrderTable, str(pk_id))
+        if row_opt is None:
+            return (False, _empty_order())
+        table_record = FulfillmentOrderTable(row_opt)
+        res = FulfillmentRequest.from_orm(table_record)
+        if res.is_ok():
+            return (True, res.unwrap())
+        return (False, _empty_order())
+
+    @staticmethod
+    async def get_order_by_sn(tracking_sn: str):
+        session = FulfillmentService.get_session()
+        query = session.query(FulfillmentOrderTable).where_eq("tracking_sn", tracking_sn)
+        row = await session.first(query)
+        if row is None:
+            return (False, _empty_order())
+        table_record = FulfillmentOrderTable(row)
+        res = FulfillmentRequest.from_orm(table_record)
+        if res.is_ok():
+            return (True, res.unwrap())
+        return (False, _empty_order())
+
+    @staticmethod
+    async def list_orders(speed: str = "", city: str = "", limit: int = 10, offset: int = 0):
+        session = FulfillmentService.get_session()
+        tbl = Table("fulfillment_orders")
+        stmt = select().select_from(tbl)
+        if len(speed) > 0 and len(city) > 0:
+            stmt = stmt.where((tbl["delivery_speed"] == speed) & (tbl["city"] == city))
+        elif len(speed) > 0:
+            stmt = stmt.where(tbl["delivery_speed"] == speed)
+        elif len(city) > 0:
+            stmt = stmt.where(tbl["city"] == city)
+        stmt = stmt.order_by(tbl["id"].desc()).limit(limit).offset(offset)
+        rows = await session.execute(stmt)
+
+        results = List[FulfillmentRequest]()
+        for r in rows:
+            rec = FulfillmentOrderTable(r)
+            res = FulfillmentRequest.from_orm(rec)
+            if res.is_ok():
+                results.append(res.unwrap())
+        return results
+
+    @staticmethod
+    async def update_order(tracking_sn: str, update_req: FulfillmentOrderUpdateSchema):
+        session = FulfillmentService.get_session()
+        tbl = Table("fulfillment_orders")
+        up_vals = Dict[str, str]()
+        up_vals["delivery_speed"] = update_req.delivery_speed
+        up_vals["priority"] = str(update_req.priority)
+        up_vals["insured_amount"] = str(update_req.insured_amount)
+        up_vals["status_code"] = str(update_req.status_code)
+        if update_req.memo is not None:
+            up_vals["memo"] = update_req.memo
+        stmt = update(tbl).where(tbl["tracking_sn"] == tracking_sn).values(up_vals)
+        affected = await session.execute_update(stmt)
+        return affected > 0
+
+    @staticmethod
+    async def delete_order(tracking_sn: str):
+        session = FulfillmentService.get_session()
+        tbl = Table("fulfillment_orders")
+        stmt = delete(tbl).where(tbl["tracking_sn"] == tracking_sn)
+        affected = await session.execute_delete(stmt)
+        return affected > 0
+
+    @staticmethod
+    async def count_orders():
+        session = FulfillmentService.get_session()
+        q = session.query(FulfillmentOrderTable)
+        return await session.count(q)
+
+    # --------------------------------------------------------------------------
+    # Scenario 2: Warehouse Inventory CRUD
+    # --------------------------------------------------------------------------
+    @staticmethod
+    async def create_inventory(item: WarehouseInventorySchema):
+        session = FulfillmentService.get_session()
+        schema = get_table_schema("warehouse_inventories")
+        table_record = WarehouseInventoryTable(item)
+        new_id = await session.save(table_record, schema)
+        return new_id
+
+    @staticmethod
+    async def get_inventory_by_sku(sku_id: str):
+        session = FulfillmentService.get_session()
+        query = session.query(WarehouseInventoryTable).where_eq("sku_id", sku_id)
+        row = await session.first(query)
+        if row is None:
+            return (False, _empty_inventory())
+        table_record = WarehouseInventoryTable(row)
+        res = WarehouseInventorySchema.from_orm(table_record)
+        if res.is_ok():
+            return (True, res.unwrap())
+        return (False, _empty_inventory())
+
+    @staticmethod
+    async def list_inventory(wh_code: str = "", min_stock: int = 0, limit: int = 10, offset: int = 0):
+        session = FulfillmentService.get_session()
+        tbl = Table("warehouse_inventories")
+        stmt = select().select_from(tbl)
+        if len(wh_code) > 0 and min_stock > 0:
+            stmt = stmt.where((tbl["warehouse_code"] == wh_code) & (tbl["total_stock"] >= min_stock))
+        elif len(wh_code) > 0:
+            stmt = stmt.where(tbl["warehouse_code"] == wh_code)
+        elif min_stock > 0:
+            stmt = stmt.where(tbl["total_stock"] >= min_stock)
+        stmt = stmt.order_by(tbl["id"].desc()).limit(limit).offset(offset)
+        rows = await session.execute(stmt)
+
+        results = List[WarehouseInventorySchema]()
+        for r in rows:
+            rec = WarehouseInventoryTable(r)
+            res = WarehouseInventorySchema.from_orm(rec)
+            if res.is_ok():
+                results.append(res.unwrap())
+        return results
+
+    @staticmethod
+    async def update_inventory(sku_id: str, update_req: InventoryUpdateSchema):
+        session = FulfillmentService.get_session()
+        tbl = Table("warehouse_inventories")
+        up_vals = Dict[str, str]()
+        up_vals["total_stock"] = str(update_req.total_stock)
+        up_vals["reserved_stock"] = str(update_req.reserved_stock)
+        if update_req.min_reorder_level is not None:
+            up_vals["min_reorder_level"] = str(update_req.min_reorder_level)
+        if update_req.is_quarantine is not None:
+            up_vals["is_quarantine"] = "1" if update_req.is_quarantine else "0"
+        stmt = update(tbl).where(tbl["sku_id"] == sku_id).values(up_vals)
+        affected = await session.execute_update(stmt)
+        return affected > 0
+
+    @staticmethod
+    async def delete_inventory(sku_id: str):
+        session = FulfillmentService.get_session()
+        tbl = Table("warehouse_inventories")
+        stmt = delete(tbl).where(tbl["sku_id"] == sku_id)
+        affected = await session.execute_delete(stmt)
+        return affected > 0
+
+    @staticmethod
+    async def lock_and_reserve_stock(sku_id: str, qty: int):
+        """Demonstrates Row Locking (FOR UPDATE) in high-concurrency stock reservation."""
+        session = FulfillmentService.get_session()
+        tbl = Table("warehouse_inventories")
+        lock_stmt = select(tbl["id"], tbl["total_stock"], tbl["reserved_stock"]).select_from(tbl).where(tbl["sku_id"] == sku_id).for_update()
+        row_opt = await session.first(lock_stmt)
+        if row_opt is None:
+            return False
+        total = row_opt.get_int(1)
+        reserved = row_opt.get_int(2)
+        if total - reserved < qty:
+            return False
+        up_stmt = update(tbl).where(tbl["sku_id"] == sku_id).set("reserved_stock", reserved + qty)
+        affected = await session.execute_update(up_stmt)
+        return affected > 0
+
+    # --------------------------------------------------------------------------
+    # Scenario 3: Shipment Tracking CRUD
+    # --------------------------------------------------------------------------
+    @staticmethod
+    async def create_shipment(shipment: ShipmentTrackingSchema):
+        session = FulfillmentService.get_session()
+        schema = get_table_schema("shipment_trackings")
+        table_record = ShipmentTrackingTable(shipment)
+        new_id = await session.save(table_record, schema)
+        return new_id
+
+    @staticmethod
+    async def get_shipment_by_waybill(waybill_no: str):
+        session = FulfillmentService.get_session()
+        query = session.query(ShipmentTrackingTable).where_eq("waybill_no", waybill_no)
+        row = await session.first(query)
+        if row is None:
+            return (False, _empty_shipment())
+        table_record = ShipmentTrackingTable(row)
+        res = ShipmentTrackingSchema.from_orm(table_record)
+        if res.is_ok():
+            return (True, res.unwrap())
+        return (False, _empty_shipment())
+
+    @staticmethod
+    async def list_shipments(carrier: str = "", status: int = -1, limit: int = 10, offset: int = 0):
+        session = FulfillmentService.get_session()
+        tbl = Table("shipment_trackings")
+        stmt = select().select_from(tbl)
+        if len(carrier) > 0 and status >= 0:
+            stmt = stmt.where((tbl["carrier_code"] == carrier) & (tbl["status_code"] == status))
+        elif len(carrier) > 0:
+            stmt = stmt.where(tbl["carrier_code"] == carrier)
+        elif status >= 0:
+            stmt = stmt.where(tbl["status_code"] == status)
+        stmt = stmt.order_by(tbl["id"].desc()).limit(limit).offset(offset)
+        rows = await session.execute(stmt)
+
+        results = List[ShipmentTrackingSchema]()
+        for r in rows:
+            rec = ShipmentTrackingTable(r)
+            res = ShipmentTrackingSchema.from_orm(rec)
+            if res.is_ok():
+                results.append(res.unwrap())
+        return results
+
+    @staticmethod
+    async def update_shipment(waybill_no: str, update_req: ShipmentUpdateSchema):
+        session = FulfillmentService.get_session()
+        tbl = Table("shipment_trackings")
+        up_vals = Dict[str, str]()
+        up_vals["status_code"] = str(update_req.status_code)
+        up_vals["status_remark"] = update_req.status_remark
+        if update_req.carbon_footprint_kg is not None:
+            up_vals["carbon_footprint_kg"] = str(update_req.carbon_footprint_kg)
+        stmt = update(tbl).where(tbl["waybill_no"] == waybill_no).values(up_vals)
+        affected = await session.execute_update(stmt)
+        return affected > 0
+
+    @staticmethod
+    async def delete_shipment(waybill_no: str):
+        session = FulfillmentService.get_session()
+        tbl = Table("shipment_trackings")
+        stmt = delete(tbl).where(tbl["waybill_no"] == waybill_no)
+        affected = await session.execute_delete(stmt)
+        return affected > 0
+
+    # --------------------------------------------------------------------------
+    # Buffers & Serialization
+    # --------------------------------------------------------------------------
+    @staticmethod
+    def write_direct_to_buffer(order: FulfillmentRequest) -> ByteBuffer:
+        buf = ByteBuffer(1024)
+        order.write_to_buffer(buf)
+        return buf
+
+    @staticmethod
+    def audit_snapshot_dict(order: FulfillmentRequest) -> Dict[str, str]:
+        return order.to_dict()
+
+    @staticmethod
+    def format_buffer_receipt(order: FulfillmentRequest, calc: FulfillmentCalculation) -> str:
+        buf = ByteBuffer(1024)
+        buf.append_str("========== FULFILLMENT RECEIPT ==========\n")
+        buf.append_str("Tracking SN : ")
+        buf.append_str(order.tracking_sn)
+        buf.append_str("\nCustomer    : ")
+        buf.append_str(order.customer_email)
+        buf.append_str("\nDestination : ")
+        buf.append_str(order.address.city)
+        buf.append_str(" - ")
+        buf.append_str(order.address.detail)
+        buf.append_str("\nSpeed SLA   : ")
+        buf.append_str(order.delivery_speed)
+        buf.append_str("\nItem Total  : $")
+        buf.append_str(str(calc.item_subtotal))
+        buf.append_str("\nShipping    : $")
+        buf.append_str(str(calc.shipping_fee))
+        buf.append_str("\nPayable     : $")
+        buf.append_str(str(calc.final_payable))
+        buf.append_str("\n=========================================\n")
+        return buf.to_str()

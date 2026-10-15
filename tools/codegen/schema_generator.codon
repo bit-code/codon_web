@@ -1,0 +1,747 @@
+# Industrial-Grade Pure-Codon AOT Code Generator
+# Emits zero-reflection, SIMD-accelerated deserializers & OpenAPI metadata.
+# Supports both Standalone Module Generation and In-Place @extend Injection.
+from tools.codegen.schema_parser import ParsedClass, ParsedField
+
+def _escape_json_str(s: str) -> str:
+    res = ""
+    for i in range(len(s)):
+        ch = s[i]
+        if ch == '"':
+            res += '\\"'
+        elif ch == '\\':
+            res += '\\\\'
+        elif ch == '\n':
+            res += '\\n'
+        elif ch == '\r':
+            res += '\\r'
+        elif ch == '\t':
+            res += '\\t'
+        else:
+            res += ch
+    return res
+
+
+def _generate_openapi_json(cls: ParsedClass) -> str:
+    """Generates standard OpenAPI 3.0 Schema Object JSON representation."""
+    props = List[str]()
+    reqs = List[str]()
+
+    for f in cls.fields:
+        prop_key = f.alias if len(f.alias) > 0 else f.name
+        if f.required:
+            reqs.append('"' + _escape_json_str(prop_key) + '"')
+
+        f_meta = List[str]()
+        if f.is_list:
+            f_meta.append('"type":"array"')
+            if f.min_items > 0:
+                f_meta.append('"minItems":' + str(f.min_items))
+            if f.max_items > 0:
+                f_meta.append('"maxItems":' + str(f.max_items))
+            if f.list_item_type == "int":
+                f_meta.append('"items":{"type":"integer"}')
+            elif f.list_item_type == "float":
+                f_meta.append('"items":{"type":"number"}')
+            elif f.list_item_type == "bool":
+                f_meta.append('"items":{"type":"boolean"}')
+            elif f.is_submodel:
+                f_meta.append('"items":{"type":"object","title":"' + _escape_json_str(f.list_item_type) + '"}')
+            else:
+                f_meta.append('"items":{"type":"string"}')
+
+        elif f.is_submodel:
+            f_meta.append('"type":"object"')
+            f_meta.append('"title":"' + _escape_json_str(f.submodel_name) + '"')
+
+        elif f.field_type == "int":
+            f_meta.append('"type":"integer"')
+            if f.has_ge:
+                f_meta.append('"minimum":' + str(f.ge))
+            if f.has_le:
+                f_meta.append('"maximum":' + str(f.le))
+            if f.has_gt:
+                f_meta.append('"exclusiveMinimum":' + str(f.gt))
+            if f.has_lt:
+                f_meta.append('"exclusiveMaximum":' + str(f.lt))
+            if f.has_default:
+                f_meta.append('"default":' + f.default_val)
+
+        elif f.field_type == "float":
+            f_meta.append('"type":"number"')
+            if f.has_ge_f:
+                f_meta.append('"minimum":' + str(f.ge_f))
+            if f.has_le_f:
+                f_meta.append('"maximum":' + str(f.le_f))
+            if f.has_gt_f:
+                f_meta.append('"exclusiveMinimum":' + str(f.gt_f))
+            if f.has_lt_f:
+                f_meta.append('"exclusiveMaximum":' + str(f.lt_f))
+            if f.has_default:
+                f_meta.append('"default":' + f.default_val)
+
+        elif f.field_type == "bool":
+            f_meta.append('"type":"boolean"')
+            if f.has_default:
+                f_meta.append('"default":' + f.default_val.lower())
+
+        else: # str
+            f_meta.append('"type":"string"')
+            if f.min_length > 0:
+                f_meta.append('"minLength":' + str(f.min_length))
+            if f.max_length > 0:
+                f_meta.append('"maxLength":' + str(f.max_length))
+            if len(f.format) > 0:
+                f_meta.append('"format":"' + _escape_json_str(f.format) + '"')
+            if len(f.pattern) > 0:
+                f_meta.append('"pattern":"' + _escape_json_str(f.pattern) + '"')
+            if len(f.choices) > 0:
+                ch_parts = List[str]()
+                for c in f.choices:
+                    ch_parts.append('"' + _escape_json_str(c) + '"')
+                f_meta.append('"enum":[' + ','.join(ch_parts) + ']')
+            if f.has_default:
+                f_meta.append('"default":' + f.default_val)
+
+        if len(f.description) > 0:
+            f_meta.append('"description":"' + _escape_json_str(f.description) + '"')
+
+        prop_json = '"' + _escape_json_str(prop_key) + '":{' + ','.join(f_meta) + '}'
+        props.append(prop_json)
+
+    schema_parts = List[str]()
+    schema_parts.append('"type":"object"')
+    schema_parts.append('"title":"' + _escape_json_str(cls.name) + '"')
+    if len(cls.docstring) > 0:
+        schema_parts.append('"description":"' + _escape_json_str(cls.docstring) + '"')
+
+    schema_parts.append('"properties":{' + ','.join(props) + '}')
+    if len(reqs) > 0:
+        schema_parts.append('"required":[' + ','.join(reqs) + ']')
+
+    return '{' + ','.join(schema_parts) + '}'
+
+
+def _has_custom_validate(cls: ParsedClass) -> bool:
+    for m in cls.custom_methods:
+        if "def custom_validate" in m:
+            return True
+    return False
+
+
+def generate_model_methods(cls: ParsedClass) -> List[str]:
+    """Generates pure-Codon AOT methods: to_dict, to_json, model_dump_json, from_fast_json, from_json, from_json_doc, from_dict, openapi_schema_json."""
+    lines = List[str]()
+    cname = cls.name
+    has_custom_val = _has_custom_validate(cls)
+
+    # 1. to_dict() Method (string dictionary backward compatibility)
+    lines.append("")
+    lines.append("    def to_dict(self) -> Dict[str, str]:")
+    lines.append("        d = Dict[str, str]()")
+    for f in cls.fields:
+        if f.is_list:
+            if f.list_item_type == "str":
+                lines.append(f'        d["{f.name}"] = ",".join(self.{f.name})')
+            elif f.is_submodel:
+                lines.append(f'        _sub_items = List[str]()')
+                lines.append(f'        for _x in self.{f.name}:')
+                lines.append(f'            _sub_items.append(_x.to_json())')
+                lines.append(f'        d["{f.name}"] = "[" + ",".join(_sub_items) + "]"\')')
+            else:
+                lines.append(f'        _s_items = List[str]()')
+                lines.append(f'        for _x in self.{f.name}:')
+                lines.append(f'            _s_items.append(str(_x))')
+                lines.append(f'        d["{f.name}"] = ",".join(_s_items)')
+        elif f.is_submodel:
+            lines.append(f'        d["{f.name}"] = self.{f.name}.to_json()')
+        elif f.field_type == "str":
+            lines.append(f'        d["{f.name}"] = self.{f.name}')
+        elif f.field_type == "bool":
+            lines.append(f'        d["{f.name}"] = "true" if self.{f.name} else "false"')
+        else:
+            lines.append(f'        d["{f.name}"] = str(self.{f.name})')
+    lines.append("        return d")
+
+    # 2. to_json() & model_dump_json() Methods (RFC 8259 Zero-Alloc Serialization)
+    lines.append("")
+    lines.append("    def to_json(self) -> str:")
+    lines.append("        parts = List[str]()")
+    for f in cls.fields:
+        k_out = f.alias if len(f.alias) > 0 else f.name
+        k_esc = _escape_json_str(k_out)
+
+        if f.is_optional:
+            lines.append(f'        if self.{f.name} is not None:')
+            if f.inner_type == "str":
+                lines.append(f'            parts.append(\'"{k_esc}":"\' + self.{f.name}.unwrap().replace("\\\\", "\\\\\\\\").replace(\'"\', \'\\\\"\') + \'"\')')
+            elif f.inner_type == "bool":
+                lines.append(f'            parts.append(\'"{k_esc}:"\' + ("true" if self.{f.name}.unwrap() else "false"))')
+            elif f.inner_type == "int" or f.inner_type == "float":
+                lines.append(f'            parts.append(\'"{k_esc}":\' + str(self.{f.name}.unwrap()))')
+            elif f.is_submodel:
+                lines.append(f'            parts.append(\'"{k_esc}":\' + self.{f.name}.unwrap().to_json())')
+            lines.append('        else:')
+            lines.append(f'            parts.append(\'"{k_esc}":null\')')
+
+        elif f.is_list:
+            if f.list_item_type == "str":
+                lines.append(f'        _arr_{f.name} = List[str]()')
+                lines.append(f'        for _x in self.{f.name}:')
+                lines.append(f'            _arr_{f.name}.append(\'"\' + _x.replace("\\\\", "\\\\\\\\").replace(\'"\', \'\\\\"\') + \'"\')')
+                lines.append(f'        parts.append(\'"{k_esc}":[\' + ",".join(_arr_{f.name}) + \']\')')
+            elif f.list_item_type == "int" or f.list_item_type == "float":
+                lines.append(f'        _arr_{f.name} = List[str]()')
+                lines.append(f'        for _x in self.{f.name}:')
+                lines.append(f'            _arr_{f.name}.append(str(_x))')
+                lines.append(f'        parts.append(\'"{k_esc}":[\' + ",".join(_arr_{f.name}) + \']\')')
+            elif f.is_submodel:
+                lines.append(f'        _arr_{f.name} = List[str]()')
+                lines.append(f'        for _x in self.{f.name}:')
+                lines.append(f'            _arr_{f.name}.append(_x.to_json())')
+                lines.append(f'        parts.append(\'"{k_esc}":[\' + ",".join(_arr_{f.name}) + \']\')')
+
+        elif f.is_submodel:
+            lines.append(f'        parts.append(\'"{k_esc}":\' + self.{f.name}.to_json())')
+
+        elif f.field_type == "int" or f.field_type == "float":
+            lines.append(f'        parts.append(\'"{k_esc}":\' + str(self.{f.name}))')
+
+        elif f.field_type == "bool":
+            lines.append(f'        parts.append(\'"{k_esc}":\' + ("true" if self.{f.name} else "false"))')
+
+        else: # str
+            lines.append(f'        parts.append(\'"{k_esc}":"\' + self.{f.name}.replace("\\\\", "\\\\\\\\").replace(\'"\', \'\\\\"\') + \'"\')')
+
+    lines.append('        return "{" + ",".join(parts) + "}"')
+    lines.append("")
+    lines.append("    def model_dump_json(self) -> str:")
+    lines.append("        return self.to_json()")
+
+    # 3. Ultra-High Performance from_fast_json Deserializer
+    lines.append("")
+    lines.append("    @staticmethod")
+    lines.append(f"    def from_fast_json(val: FastJsonVal) -> ValidationResult[{cname}]:")
+    lines.append("        errors = List[ValidationError]()")
+    lines.append("        if not val.is_obj():")
+    lines.append(f'            errors.append(ValidationError("", "Expected JSON object", "type_error.object", loc=["body"]))')
+    lines.append(f"            return ValidationResult[{cname}](None, errors)")
+    lines.append("")
+
+    call_args = List[str]()
+
+    for f in cls.fields:
+        fname = f.name
+        ftyp = f.field_type
+        lookup_key = f.alias if len(f.alias) > 0 else f.name
+        call_args.append(f"_{fname}")
+
+        lines.append(f'        # --- Field: {fname} ({ftyp}) ---')
+        lines.append(f'        _v_{fname} = val["{lookup_key}"]')
+        if len(f.alias) > 0 and f.alias != fname:
+            lines.append(f'        if _v_{fname}.is_null():')
+            lines.append(f'            _v_{fname} = val["{fname}"]')
+
+        if f.is_list:
+            item_t = f.list_item_type
+            lines.append(f'        _{fname} = List[{item_t}]()')
+            lines.append(f'        if _v_{fname}.is_null():')
+            if f.has_default:
+                lines.append(f'            pass')
+            elif f.required:
+                lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' is required", "missing", loc=["body", "{lookup_key}"]))')
+            lines.append(f'        elif not _v_{fname}.is_arr():')
+            lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' must be a list/array", "type_error.list", loc=["body", "{lookup_key}"]))')
+            lines.append('        else:')
+            lines.append(f'            _n_{fname} = _v_{fname}.len()')
+            if f.min_items > 0:
+                lines.append(f'            if _n_{fname} < {f.min_items}:')
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' requires at least {f.min_items} items", "value_error.list.min_items", loc=["body", "{lookup_key}"]))')
+            if f.max_items > 0:
+                lines.append(f'            if _n_{fname} > {f.max_items}:')
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must not exceed {f.max_items} items", "value_error.list.max_items", loc=["body", "{lookup_key}"]))')
+            lines.append(f'            for _idx_{fname} in range(_n_{fname}):')
+            lines.append(f'                _item_{fname} = _v_{fname}[_idx_{fname}]')
+            if item_t == "str":
+                lines.append(f'                if not _item_{fname}.is_str():')
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Item at index " + str(_idx_{fname}) + " must be a string", "type_error.str", loc=["body", "{lookup_key}", str(_idx_{fname})]))')
+                lines.append('                else:')
+                lines.append(f'                    _{fname}.append(_item_{fname}.as_str())')
+            elif item_t == "int":
+                lines.append(f'                if not _item_{fname}.is_int():')
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Item at index " + str(_idx_{fname}) + " must be an integer", "type_error.integer", loc=["body", "{lookup_key}", str(_idx_{fname})]))')
+                lines.append('                else:')
+                lines.append(f'                    _{fname}.append(_item_{fname}.as_int())')
+            elif item_t == "float":
+                lines.append(f'                if not _item_{fname}.is_float():')
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Item at index " + str(_idx_{fname}) + " must be a float", "type_error.float", loc=["body", "{lookup_key}", str(_idx_{fname})]))')
+                lines.append('                else:')
+                lines.append(f'                    _{fname}.append(_item_{fname}.as_float())')
+            elif item_t == "bool":
+                lines.append(f'                if not _item_{fname}.is_bool():')
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Item at index " + str(_idx_{fname}) + " must be a boolean", "type_error.bool", loc=["body", "{lookup_key}", str(_idx_{fname})]))')
+                lines.append('                else:')
+                lines.append(f'                    _{fname}.append(_item_{fname}.as_bool())')
+            elif f.is_submodel:
+                lines.append(f'                _sub_res_{fname} = {item_t}.from_fast_json(_item_{fname})')
+                lines.append(f'                if not _sub_res_{fname}.is_ok():')
+                lines.append(f'                    for _s_err in _sub_res_{fname}.errors:')
+                lines.append(f'                        errors.append(_s_err.with_prefix(str(_idx_{fname})).with_prefix("{lookup_key}"))')
+                lines.append('                else:')
+                lines.append(f'                    _{fname}.append(_sub_res_{fname}.unwrap())')
+
+        elif f.is_submodel:
+            sub_t = f.submodel_name
+            lines.append(f'        if _v_{fname}.is_null():')
+            if f.has_default:
+                lines.append(f'            _{fname} = {f.default_val}')
+            elif f.required:
+                lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' is required", "missing", loc=["body", "{lookup_key}"]))')
+                lines.append(f'            _{fname} = {sub_t}()')
+            else:
+                lines.append(f'            _{fname} = {sub_t}()')
+            lines.append(f'        elif not _v_{fname}.is_obj():')
+            lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' must be an object", "type_error.object", loc=["body", "{lookup_key}"]))')
+            lines.append(f'            _{fname} = {sub_t}()')
+            lines.append('        else:')
+            lines.append(f'            _sub_res_{fname} = {sub_t}.from_fast_json(_v_{fname})')
+            lines.append(f'            if not _sub_res_{fname}.is_ok():')
+            lines.append(f'                for _s_err in _sub_res_{fname}.errors:')
+            lines.append(f'                    errors.append(_s_err.with_prefix("{lookup_key}"))')
+            lines.append(f'                _{fname} = {sub_t}()')
+            lines.append('            else:')
+            lines.append(f'                _{fname} = _sub_res_{fname}.unwrap()')
+
+        elif ftyp == "int":
+            fallback = f.default_val if f.has_default else "0"
+            lines.append(f"        if _v_{fname}.is_null():")
+            if f.has_default:
+                lines.append(f"            _{fname} = {fallback}")
+            else:
+                lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' is required", "missing", loc=["body", "{lookup_key}"]))')
+                lines.append(f"            _{fname} = 0")
+            lines.append(f"        elif not _v_{fname}.is_int():")
+            lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' must be an integer", "type_error.integer", loc=["body", "{lookup_key}"]))')
+            lines.append(f"            _{fname} = {fallback}")
+            lines.append("        else:")
+            lines.append(f"            _{fname} = _v_{fname}.as_int()")
+            if f.has_ge:
+                lines.append(f"            if _{fname} < {f.ge}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be >= {f.ge}", "value_error.number.ge", loc=["body", "{lookup_key}"]))')
+            if f.has_le:
+                lines.append(f"            if _{fname} > {f.le}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be <= {f.le}", "value_error.number.le", loc=["body", "{lookup_key}"]))')
+            if f.has_gt:
+                lines.append(f"            if _{fname} <= {f.gt}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be > {f.gt}", "value_error.number.gt", loc=["body", "{lookup_key}"]))')
+            if f.has_lt:
+                lines.append(f"            if _{fname} >= {f.lt}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be < {f.lt}", "value_error.number.lt", loc=["body", "{lookup_key}"]))')
+
+        elif ftyp == "float":
+            fallback = f.default_val if f.has_default else "0.0"
+            lines.append(f"        if _v_{fname}.is_null():")
+            if f.has_default:
+                lines.append(f"            _{fname} = {fallback}")
+            else:
+                lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' is required", "missing", loc=["body", "{lookup_key}"]))')
+                lines.append(f"            _{fname} = 0.0")
+            lines.append(f"        elif not _v_{fname}.is_float():")
+            lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' must be a float", "type_error.float", loc=["body", "{lookup_key}"]))')
+            lines.append(f"            _{fname} = {fallback}")
+            lines.append("        else:")
+            lines.append(f"            _{fname} = _v_{fname}.as_float()")
+            if f.has_ge_f:
+                lines.append(f"            if _{fname} < {f.ge_f}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be >= {f.ge_f}", "value_error.number.ge", loc=["body", "{lookup_key}"]))')
+            if f.has_le_f:
+                lines.append(f"            if _{fname} > {f.le_f}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be <= {f.le_f}", "value_error.number.le", loc=["body", "{lookup_key}"]))')
+            if f.has_gt_f:
+                lines.append(f"            if _{fname} <= {f.gt_f}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be > {f.gt_f}", "value_error.number.gt", loc=["body", "{lookup_key}"]))')
+            if f.has_lt_f:
+                lines.append(f"            if _{fname} >= {f.lt_f}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be < {f.lt_f}", "value_error.number.lt", loc=["body", "{lookup_key}"]))')
+
+        elif ftyp == "bool":
+            fallback = f.default_val if f.has_default else "False"
+            lines.append(f"        if _v_{fname}.is_null():")
+            if f.has_default:
+                lines.append(f"            _{fname} = {fallback}")
+            else:
+                lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' is required", "missing", loc=["body", "{lookup_key}"]))')
+                lines.append(f"            _{fname} = False")
+            lines.append(f"        elif not _v_{fname}.is_bool():")
+            lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' must be a boolean", "type_error.bool", loc=["body", "{lookup_key}"]))')
+            lines.append(f"            _{fname} = {fallback}")
+            lines.append("        else:")
+            lines.append(f"            _{fname} = _v_{fname}.as_bool()")
+
+        else: # str
+            fallback = f.default_val if f.has_default else '""'
+            lines.append(f"        if _v_{fname}.is_null():")
+            if f.has_default:
+                lines.append(f"            _{fname} = {fallback}")
+            else:
+                lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' is required", "missing", loc=["body", "{lookup_key}"]))')
+                lines.append(f'            _{fname} = ""')
+            lines.append(f"        elif not _v_{fname}.is_str():")
+            lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' must be a string", "type_error.str", loc=["body", "{lookup_key}"]))')
+            lines.append(f"            _{fname} = {fallback}")
+            lines.append("        else:")
+            lines.append(f"            _{fname} = _v_{fname}.as_str()")
+            if f.strip_whitespace:
+                lines.append(f"            _{fname} = _{fname}.strip()")
+            if f.min_length > 0:
+                lines.append(f"            if len(_{fname}) < {f.min_length}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' length must be >= {f.min_length}", "value_error.length.min", loc=["body", "{lookup_key}"]))')
+            if f.max_length > 0:
+                lines.append(f"            if len(_{fname}) > {f.max_length}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' length must be <= {f.max_length}", "value_error.length.max", loc=["body", "{lookup_key}"]))')
+            if len(f.format) > 0:
+                if f.format == "email":
+                    lines.append(f'            if ("@" not in _{fname}) or ("." not in _{fname}):')
+                    lines.append(f'                errors.append(ValidationError("{fname}", "Invalid email address format", "value_error.format.email", loc=["body", "{lookup_key}"]))')
+            if len(f.choices) > 0:
+                ch_checks = List[str]()
+                for c in f.choices:
+                    ch_checks.append(f'_{fname} == "{c}"')
+                lines.append(f"            if not ({' or '.join(ch_checks)}):")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be one of: {", ".join(f.choices)}", "value_error.choices", loc=["body", "{lookup_key}"]))')
+            if len(f.pattern) > 0:
+                lines.append(f'            if not bool(re.search(r"{f.pattern}", _{fname})):')
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' does not match pattern: {f.pattern}", "value_error.pattern", loc=["body", "{lookup_key}"]))')
+
+    lines.append("")
+    lines.append("        if len(errors) > 0:")
+    lines.append(f"            return ValidationResult[{cname}](None, errors)")
+    lines.append(f"        _inst = {cname}({', '.join(call_args)})")
+    if has_custom_val:
+        lines.append("        _custom_errs = _inst.custom_validate()")
+        lines.append("        if len(_custom_errs) > 0:")
+        lines.append("            for _ce in _custom_errs:")
+        lines.append("                errors.append(_ce)")
+        lines.append(f"            return ValidationResult[{cname}](None, errors)")
+    lines.append("")
+    lines.append("        return ValidationResult.ok(_inst)")
+
+    # 4. Helper: from_json (Parse raw string with automatic doc lifecycle cleanup)
+    lines.append("")
+    lines.append("    @staticmethod")
+    lines.append(f"    def from_json(raw: str) -> ValidationResult[{cname}]:")
+    lines.append("        try:")
+    lines.append("            doc = FastJson.loads(raw)")
+    lines.append(f"            res = {cname}.from_fast_json(doc.root)")
+    lines.append("            doc.close()")
+    lines.append("            return res")
+    lines.append("        except:")
+    lines.append("            errors = List[ValidationError]()")
+    lines.append(f'            errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))')
+    lines.append(f"            return ValidationResult[{cname}](None, errors)")
+
+    # 5. Helper: from_json_doc
+    lines.append("")
+    lines.append("    @staticmethod")
+    lines.append(f"    def from_json_doc(doc: FastJsonDoc) -> ValidationResult[{cname}]:")
+    lines.append(f"        return {cname}.from_fast_json(doc.root)")
+
+    # 6. Helper: from_dict (for Query Params & URL Forms)
+    lines.append("")
+    lines.append("    @staticmethod")
+    lines.append(f"    def from_dict(d: Dict[str, str]) -> ValidationResult[{cname}]:")
+    lines.append("        errors = List[ValidationError]()")
+
+    for f in cls.fields:
+        fname = f.name
+        ftyp = f.field_type
+        lookup_key = f.alias if len(f.alias) > 0 else f.name
+        fallback = f.default_val if f.has_default else ('""' if ftyp == 'str' else ('0' if ftyp == 'int' else ('0.0' if ftyp == 'float' else 'False')))
+
+        lines.append(f'        # Dict field: {fname}')
+        lines.append(f'        _has_{fname} = ("{lookup_key}" in d and len(d["{lookup_key}"].strip()) > 0)')
+        if lookup_key != fname:
+            lines.append(f'        if not _has_{fname}:')
+            lines.append(f'            _has_{fname} = ("{fname}" in d and len(d["{fname}"].strip()) > 0)')
+
+        lines.append(f'        if not _has_{fname}:')
+        if f.is_list:
+            lines.append(f"            _d_{fname} = List[{f.list_item_type}]()")
+        elif f.has_default:
+            lines.append(f"            _d_{fname} = {fallback}")
+        elif f.required:
+            lines.append(f'            errors.append(ValidationError("{fname}", "Field \'{fname}\' is required", "missing", loc=["query", "{lookup_key}"]))')
+            lines.append(f"            _d_{fname} = {fallback}")
+        else:
+            lines.append(f"            _d_{fname} = {fallback}")
+        lines.append("        else:")
+        if lookup_key != fname:
+            lines.append(f'            _raw_{fname} = (d["{lookup_key}"].strip() if "{lookup_key}" in d else d["{fname}"].strip())')
+        else:
+            lines.append(f'            _raw_{fname} = d["{lookup_key}"].strip()')
+
+        if f.is_list:
+            item_t = f.list_item_type
+            lines.append(f"            _d_{fname} = List[{item_t}]()")
+            lines.append(f"            _items_{fname} = _raw_{fname}.split(',')")
+            if f.min_items > 0:
+                lines.append(f'            if len(_items_{fname}) < {f.min_items}:')
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' requires at least {f.min_items} items", "value_error.list.min_items", loc=["query", "{lookup_key}"]))')
+            if f.max_items > 0:
+                lines.append(f'            if len(_items_{fname}) > {f.max_items}:')
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must not exceed {f.max_items} items", "value_error.list.max_items", loc=["query", "{lookup_key}"]))')
+            lines.append(f'            for _sub_item in _items_{fname}:')
+            lines.append(f'                _clean_sub = _sub_item.strip()')
+            if item_t == "int":
+                lines.append(f'                try: _d_{fname}.append(int(_clean_sub))')
+                lines.append(f'                except: errors.append(ValidationError("{fname}", "Item must be integer", "type_error.int", loc=["query", "{lookup_key}"]))')
+            elif item_t == "float":
+                lines.append(f'                try: _d_{fname}.append(float(_clean_sub))')
+                lines.append(f'                except: errors.append(ValidationError("{fname}", "Item must be float", "type_error.float", loc=["query", "{lookup_key}"]))')
+            else:
+                lines.append(f'                _d_{fname}.append(_clean_sub)')
+
+        elif ftyp == "int":
+            lines.append("            try:")
+            lines.append(f"                _d_{fname} = int(_raw_{fname})")
+            if f.has_ge:
+                lines.append(f"                if _d_{fname} < {f.ge}:")
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Field \'{fname}\' must be >= {f.ge}", "value_error.number.ge", loc=["query", "{lookup_key}"]))')
+            if f.has_le:
+                lines.append(f"                if _d_{fname} > {f.le}:")
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Field \'{fname}\' must be <= {f.le}", "value_error.number.le", loc=["query", "{lookup_key}"]))')
+            if f.has_gt:
+                lines.append(f"                if _d_{fname} <= {f.gt}:")
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Field \'{fname}\' must be > {f.gt}", "value_error.number.gt", loc=["query", "{lookup_key}"]))')
+            if f.has_lt:
+                lines.append(f"                if _d_{fname} >= {f.lt}:")
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Field \'{fname}\' must be < {f.lt}", "value_error.number.lt", loc=["query", "{lookup_key}"]))')
+            lines.append("            except:")
+            lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be an integer", "type_error.int", loc=["query", "{lookup_key}"]))')
+            lines.append(f"                _d_{fname} = {fallback}")
+
+        elif ftyp == "float":
+            lines.append("            try:")
+            lines.append(f"                _d_{fname} = float(_raw_{fname})")
+            if f.has_ge_f:
+                lines.append(f"                if _d_{fname} < {f.ge_f}:")
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Field \'{fname}\' must be >= {f.ge_f}", "value_error.number.ge", loc=["query", "{lookup_key}"]))')
+            if f.has_le_f:
+                lines.append(f"                if _d_{fname} > {f.le_f}:")
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Field \'{fname}\' must be <= {f.le_f}", "value_error.number.le", loc=["query", "{lookup_key}"]))')
+            if f.has_gt_f:
+                lines.append(f"                if _d_{fname} <= {f.gt_f}:")
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Field \'{fname}\' must be > {f.gt_f}", "value_error.number.gt", loc=["query", "{lookup_key}"]))')
+            if f.has_lt_f:
+                lines.append(f"                if _d_{fname} >= {f.lt_f}:")
+                lines.append(f'                    errors.append(ValidationError("{fname}", "Field \'{fname}\' must be < {f.lt_f}", "value_error.number.lt", loc=["query", "{lookup_key}"]))')
+            lines.append("            except:")
+            lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be a float", "type_error.float", loc=["query", "{lookup_key}"]))')
+            lines.append(f"                _d_{fname} = {fallback}")
+
+        elif ftyp == "bool":
+            lines.append(f"            _lowered_{fname} = _raw_{fname}.lower()")
+            lines.append(f'            if _lowered_{fname} == "true" or _lowered_{fname} == "1" or _lowered_{fname} == "yes":')
+            lines.append(f"                _d_{fname} = True")
+            lines.append(f'            elif _lowered_{fname} == "false" or _lowered_{fname} == "0" or _lowered_{fname} == "no":')
+            lines.append(f"                _d_{fname} = False")
+            lines.append("            else:")
+            lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be a boolean", "type_error.bool", loc=["query", "{lookup_key}"]))')
+            lines.append(f"                _d_{fname} = False")
+
+        else: # str
+            lines.append(f"            _d_{fname} = _raw_{fname}")
+            if f.strip_whitespace:
+                lines.append(f"            _d_{fname} = _d_{fname}.strip()")
+            if f.min_length > 0:
+                lines.append(f"            if len(_d_{fname}) < {f.min_length}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' length must be >= {f.min_length}", "value_error.length.min", loc=["query", "{lookup_key}"]))')
+            if f.max_length > 0:
+                lines.append(f"            if len(_d_{fname}) > {f.max_length}:")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' length must be <= {f.max_length}", "value_error.length.max", loc=["query", "{lookup_key}"]))')
+            if len(f.format) > 0:
+                if f.format == "email":
+                    lines.append(f'            if ("@" not in _d_{fname}) or ("." not in _d_{fname}):')
+                    lines.append(f'                errors.append(ValidationError("{fname}", "Invalid email address format", "value_error.format.email", loc=["query", "{lookup_key}"]))')
+            if len(f.choices) > 0:
+                ch_checks = List[str]()
+                for c in f.choices:
+                    ch_checks.append(f'_d_{fname} == "{c}"')
+                lines.append(f"            if not ({' or '.join(ch_checks)}):")
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' must be one of: {", ".join(f.choices)}", "value_error.choices", loc=["query", "{lookup_key}"]))')
+            if len(f.pattern) > 0:
+                lines.append(f'            if not bool(re.search(r"{f.pattern}", _d_{fname})):')
+                lines.append(f'                errors.append(ValidationError("{fname}", "Field \'{fname}\' does not match pattern: {f.pattern}", "value_error.pattern", loc=["query", "{lookup_key}"]))')
+
+    lines.append("")
+    lines.append("        if len(errors) > 0:")
+    lines.append(f"            return ValidationResult[{cname}](None, errors)")
+    dict_call_args = List[str]()
+    for f in cls.fields:
+        dict_call_args.append("_d_" + f.name)
+    lines.append(f"        _inst = {cname}({', '.join(dict_call_args)})")
+    if has_custom_val:
+        lines.append("        _custom_errs = _inst.custom_validate()")
+        lines.append("        if len(_custom_errs) > 0:")
+        lines.append("            for _ce in _custom_errs:")
+        lines.append("                errors.append(_ce)")
+        lines.append(f"            return ValidationResult[{cname}](None, errors)")
+    lines.append("")
+    lines.append("        return ValidationResult.ok(_inst)")
+
+    # 7. OpenAPI JSON Spec Method
+    openapi_json_raw = _generate_openapi_json(cls)
+    lines.append("")
+    lines.append("    @staticmethod")
+    lines.append("    def openapi_schema_json() -> str:")
+    lines.append(f'        return \'{openapi_json_raw}\'')
+
+    return lines
+
+
+def generate_class_code(cls: ParsedClass) -> str:
+    """Generates a standalone class definition for batch out-of-tree generation."""
+    lines = List[str]()
+    cname = cls.name
+
+    # 1. Class Header
+    lines.append(f"class {cname}(BaseModel):")
+    if len(cls.docstring) > 0:
+        lines.append(f'    """{cls.docstring}"""')
+
+    # 2. Typed Field Slot Declarations
+    for f in cls.fields:
+        lines.append(f"    {f.name}: {f.field_type}")
+
+    # 3. Constructor __init__
+    init_params = List[str]()
+    for f in cls.fields:
+        def_expr = ""
+        if f.has_default:
+            def_expr = " = " + f.default_val
+        elif f.is_list:
+            def_expr = " = List[" + f.list_item_type + "]()"
+        elif f.is_submodel:
+            def_expr = " = " + f.submodel_name + "()"
+        elif f.field_type == "int":
+            def_expr = " = 0"
+        elif f.field_type == "float":
+            def_expr = " = 0.0"
+        elif f.field_type == "bool":
+            def_expr = " = False"
+        else:
+            def_expr = ' = ""'
+        init_params.append(f"{f.name}: {f.field_type}{def_expr}")
+
+    lines.append("")
+    lines.append(f"    def __init__(self, {', '.join(init_params)}):")
+    for f in cls.fields:
+        lines.append(f"        self.{f.name} = {f.name}")
+
+    # 4. Custom Methods or default custom_validate
+    has_custom_validate = False
+    for m in cls.custom_methods:
+        if "def custom_validate" in m:
+            has_custom_validate = True
+        lines.append(m)
+
+    if not has_custom_validate:
+        lines.append("")
+        lines.append("    def custom_validate(self) -> List[ValidationError]:")
+        lines.append("        return List[ValidationError]()")
+
+    # 5. Append common serialization & validation methods
+    for m in generate_model_methods(cls):
+        lines.append(m)
+
+    return "\n".join(lines)
+
+
+def generate_extend_block(cls: ParsedClass) -> str:
+    """Generates an @extend class block for in-place source injection."""
+    lines = List[str]()
+    cname = cls.name
+    lines.append("@extend")
+    lines.append(f"class {cname}:")
+    for m in generate_model_methods(cls):
+        lines.append(m)
+    return "\n".join(lines)
+
+
+def compute_source_checksum(clean_src: str) -> str:
+    """Computes a deterministic 64-bit FNV-1a checksum of the user source definition."""
+    h = u64(14695981039346656037)
+    fnv_prime = u64(1099511628211)
+    for i in range(len(clean_src)):
+        h = (h ^ u64(ord(clean_src[i]))) * fnv_prime
+    return f"{int(h):x}"
+
+
+def extract_existing_checksum(src_text: str) -> str:
+    """Extracts existing CodeGen-Checksum from file comments, if present."""
+    marker = "# CodeGen-Checksum: "
+    idx = src_text.find(marker)
+    if idx < 0:
+        return ""
+    start = idx + len(marker)
+    end = src_text.find("\n", start)
+    if end < 0:
+        end = len(src_text)
+    return src_text[start:end].strip()
+
+
+def extract_user_source(src_text: str) -> str:
+    """Extracts purely the user-authored source code, stripping any auto-generated section."""
+    auto_marker = "# ==================== AUTO-GENERATED METHODS"
+    m_idx = src_text.find(auto_marker)
+    clean_src = src_text[:m_idx] if m_idx >= 0 else src_text
+    while len(clean_src) > 0 and (clean_src.endswith("\n") or clean_src.endswith("\r") or clean_src.endswith(" ")):
+        clean_src = clean_src[:-1]
+    return clean_src
+
+
+def generate_in_place_content(original_src: str, classes: List[ParsedClass]) -> str:
+    """Safely and idempotently injects @extend methods block into the source file with checksum."""
+    clean_src = extract_user_source(original_src)
+    checksum = compute_source_checksum(clean_src)
+
+    lines = List[str]()
+    lines.append(clean_src)
+    lines.append("")
+    lines.append("")
+    lines.append("# ==================== AUTO-GENERATED METHODS (DO NOT EDIT) ====================")
+    lines.append("# Generated by CodonWeb In-Place Schema Generator. DO NOT EDIT DIRECTLY.")
+    lines.append(f"# CodeGen-Checksum: {checksum}")
+    lines.append("# Supports IDE code folding. All modifications above remain 100% preserved.")
+    lines.append("import re")
+    lines.append("from src.http.fast_json import FastJson, FastJsonVal, FastJsonDoc")
+    lines.append("from src.schema.errors import ValidationError, ValidationResult")
+    lines.append("")
+
+    for cls in classes:
+        lines.append(generate_extend_block(cls))
+        lines.append("")
+
+    lines.append("# =================== END AUTO-GENERATED METHODS ====================")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def generate_source_file(classes: List[ParsedClass]) -> str:
+    """Generates complete Codon module containing all parsed and compiled schemas."""
+    lines = List[str]()
+    lines.append("# ==============================================================================")
+    lines.append("# Code-First AOT Generated Schemas for CodonWeb")
+    lines.append("# Auto-generated by tools/codegen/schema_generator.codon. DO NOT EDIT DIRECTLY.")
+    lines.append("# ==============================================================================")
+    lines.append("import re")
+    lines.append("from src.http.fast_json import FastJson, FastJsonVal, FastJsonDoc")
+    lines.append("from src.schema.errors import ValidationError, ValidationResult")
+    lines.append("from src.schema.base import BaseModel")
+    lines.append("")
+
+    for cls in classes:
+        lines.append(generate_class_code(cls))
+        lines.append("")
+
+    return "\n".join(lines)

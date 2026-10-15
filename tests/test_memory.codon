@@ -28,6 +28,87 @@ buf.consume(4)
 print("After consume 4, readable bytes:", buf.readable_bytes())
 assert buf.readable_bytes() == 39
 
+# Test append_int
+buf.reset()
+buf.append_int(0)
+assert buf.readable_slice().equals_ascii("0")
+
+buf.reset()
+buf.append_int(200)
+assert buf.readable_slice().equals_ascii("200")
+
+buf.reset()
+buf.append_int(123456789)
+assert buf.readable_slice().equals_ascii("123456789")
+
+buf.reset()
+buf.append_int(-42)
+assert buf.readable_slice().equals_ascii("-42")
+
+# Test append_c_str_fast
+buf.reset()
+test_msg = "Fast C Str"
+buf.append_c_str_fast(test_msg.c_str().as_byte(), 10)
+assert buf.readable_slice().equals_ascii("Fast C Str")
+
 buf.reset()
 assert buf.readable_bytes() == 0
+
+# === Industrial ByteSlice Unit Tests ===
+# 1. 64-bit boundary and overflow protection tests
+str_max = "9223372036854775807"
+bs_max = ByteSlice(str_max.c_str().as_byte(), len(str_max))
+ok_max, val_max = bs_max.parse_int()
+assert ok_max and val_max == 9223372036854775807
+
+str_min = "-9223372036854775808"
+bs_min = ByteSlice(str_min.c_str().as_byte(), len(str_min))
+ok_min, val_min = bs_min.parse_int()
+assert ok_min and val_min == -9223372036854775808
+
+str_ovf_pos = "9223372036854775808"
+bs_ovf_pos = ByteSlice(str_ovf_pos.c_str().as_byte(), len(str_ovf_pos))
+ok_ovf_pos, _ = bs_ovf_pos.parse_int()
+assert not ok_ovf_pos
+
+str_ovf_neg = "-9223372036854775809"
+bs_ovf_neg = ByteSlice(str_ovf_neg.c_str().as_byte(), len(str_ovf_neg))
+ok_ovf_neg, _ = bs_ovf_neg.parse_int()
+assert not ok_ovf_neg
+
+# 2. Hexadecimal parsing tests
+str_hex = "0x1a3f"
+bs_hex = ByteSlice(str_hex.c_str().as_byte(), len(str_hex))
+ok_hex, val_hex = bs_hex.parse_hex()
+assert ok_hex and val_hex == 0x1a3f
+
+str_raw_hex = "2F0"
+bs_raw_hex = ByteSlice(str_raw_hex.c_str().as_byte(), len(str_raw_hex))
+ok_raw_hex, val_raw_hex = bs_raw_hex.parse_hex()
+assert ok_raw_hex and val_raw_hex == 752
+
+# 3. Trim tests
+str_spaces = "\r\n  zero-copy-slice \t\r\n"
+bs_spaces = ByteSlice(str_spaces.c_str().as_byte(), len(str_spaces))
+trimmed = bs_spaces.trim()
+assert trimmed.equals_ascii("zero-copy-slice")
+
+# 4. find_byte and split_once tests
+str_kv = "Authorization: Bearer token123"
+bs_kv = ByteSlice(str_kv.c_str().as_byte(), len(str_kv))
+col_idx = bs_kv.find_byte(byte(58)) # ':'
+assert col_idx == 13
+
+k, v, found = bs_kv.split_once(byte(58))
+assert found
+assert k.equals_ascii("Authorization")
+assert v.trim().equals_ascii("Bearer token123")
+
+# 5. Dict hashing test
+d = dict[ByteSlice, str]()
+d[k] = "auth_header"
+assert k in d
+assert d[k] == "auth_header"
+
 print("Memory slice and buffer tests PASSED!")
+

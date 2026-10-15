@@ -1,0 +1,109 @@
+# Test ORM Dialects and QueryBuilder for MySQL and PostgreSQL
+from src.orm.dialect import MYSQL_DIALECT, POSTGRESQL_DIALECT, get_dialect
+from src.orm.fields import (
+    Field, IntegerField, BigIntegerField, CharField, TextField, BooleanField, FloatField, DoubleField, DateTimeField
+)
+from src.orm.model import ModelMeta
+from src.orm.query import Query
+
+print("=== Testing ORM Dialects & QueryBuilder ===")
+
+# 1. Define Test Model Meta
+fields = List[Field]()
+fields.append(IntegerField("id", primary_key=True, auto_increment=True))
+fields.append(CharField("username", max_length=64, unique=True))
+fields.append(CharField("email", max_length=128))
+fields.append(IntegerField("age", default_val="18"))
+fields.append(BooleanField("is_active", default_val="true"))
+fields.append(DoubleField("score", default_val="0.0"))
+fields.append(DateTimeField("created_at", nullable=True))
+user_meta = ModelMeta("users", fields)
+
+# 2. Test DDL Generation for MySQL
+mysql_ddl = user_meta.create_table_sql(MYSQL_DIALECT)
+assert "CREATE TABLE IF NOT EXISTS `users`" in mysql_ddl
+assert "`id` INT AUTO_INCREMENT PRIMARY KEY" in mysql_ddl
+assert "`username` VARCHAR(64) UNIQUE" in mysql_ddl
+assert "`is_active` TINYINT(1)" in mysql_ddl
+assert "`score` DOUBLE" in mysql_ddl
+assert "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4" in mysql_ddl
+print("[PASS] 1. MySQL DDL Generation verified!")
+
+# 3. Test DDL Generation for PostgreSQL
+pg_ddl = user_meta.create_table_sql(POSTGRESQL_DIALECT)
+assert "CREATE TABLE IF NOT EXISTS \"users\"" in pg_ddl
+assert "\"id\" SERIAL PRIMARY KEY" in pg_ddl
+assert "\"username\" VARCHAR(64) UNIQUE" in pg_ddl
+assert "\"is_active\" BOOLEAN" in pg_ddl
+assert "\"score\" DOUBLE PRECISION" in pg_ddl
+assert "ENGINE=InnoDB" not in pg_ddl
+print("[PASS] 2. PostgreSQL DDL Generation verified!")
+
+# 4. Test QueryBuilder for MySQL
+q_mysql = Query(user_meta, MYSQL_DIALECT)
+q_mysql.where_gte("age", "18")
+q_mysql.where_like("username", "admin%")
+q_mysql.where_in("id", ["1", "2", "3"])
+q_mysql.order_by("id", desc=True)
+q_mysql.limit(10).offset(20)
+
+sql_my, params_my = q_mysql.to_sql()
+assert sql_my == "SELECT `id`, `username`, `email`, `age`, `is_active`, `score`, `created_at` FROM `users` WHERE `age` >= ? AND `username` LIKE ? AND `id` IN (?, ?, ?) ORDER BY `id` DESC LIMIT 20, 10"
+assert params_my == ["18", "admin%", "1", "2", "3"]
+print("[PASS] 3. MySQL QueryBuilder with WHERE, IN, ORDER BY, LIMIT/OFFSET verified!")
+
+# 5. Test QueryBuilder for PostgreSQL ($1, $2, $3... placeholders and LIMIT OFFSET)
+q_pg = Query(user_meta, POSTGRESQL_DIALECT)
+q_pg.where_gte("age", "18")
+q_pg.where_like("username", "admin%")
+q_pg.where_in("id", ["1", "2", "3"])
+q_pg.order_by("id", desc=True)
+q_pg.limit(10).offset(20)
+
+sql_pg, params_pg = q_pg.to_sql()
+assert sql_pg == "SELECT \"id\", \"username\", \"email\", \"age\", \"is_active\", \"score\", \"created_at\" FROM \"users\" WHERE \"age\" >= $1 AND \"username\" LIKE $2 AND \"id\" IN ($3, $4, $5) ORDER BY \"id\" DESC LIMIT 10 OFFSET 20"
+assert params_pg == ["18", "admin%", "1", "2", "3"]
+print("[PASS] 4. PostgreSQL QueryBuilder with $N placeholders and LIMIT OFFSET verified!")
+
+# 6. Test INSERT SQL for MySQL vs PostgreSQL
+insert_vals = {
+    "username": "alice",
+    "email": "alice@example.com",
+    "age": "25"
+}
+
+q_ins_my = Query(user_meta, MYSQL_DIALECT)
+sql_ins_my, p_ins_my = q_ins_my.to_insert_sql(insert_vals)
+assert "INSERT INTO `users`" in sql_ins_my
+assert "RETURNING" not in sql_ins_my
+assert len(p_ins_my) == 3
+
+q_ins_pg = Query(user_meta, POSTGRESQL_DIALECT)
+sql_ins_pg, p_ins_pg = q_ins_pg.to_insert_sql(insert_vals)
+assert "INSERT INTO \"users\"" in sql_ins_pg
+assert "RETURNING \"id\"" in sql_ins_pg
+assert "$1" in sql_ins_pg and "$2" in sql_ins_pg and "$3" in sql_ins_pg
+print("[PASS] 5. INSERT generation (MySQL standard vs PG RETURNING id) verified!")
+
+# 7. Test UPDATE and DELETE SQL
+update_vals = {"email": "new_alice@example.com"}
+q_up_my = Query(user_meta, MYSQL_DIALECT)
+q_up_my.where_eq("id", "42")
+sql_up_my, p_up_my = q_up_my.to_update_sql(update_vals)
+assert sql_up_my == "UPDATE `users` SET `email` = ? WHERE `id` = ?"
+assert p_up_my == ["new_alice@example.com", "42"]
+
+q_up_pg = Query(user_meta, POSTGRESQL_DIALECT)
+q_up_pg.where_eq("id", "42")
+sql_up_pg, p_up_pg = q_up_pg.to_update_sql(update_vals)
+assert sql_up_pg == "UPDATE \"users\" SET \"email\" = $1 WHERE \"id\" = $2"
+assert p_up_pg == ["new_alice@example.com", "42"]
+
+q_del = Query(user_meta, POSTGRESQL_DIALECT)
+q_del.where_eq("id", "99")
+sql_del, p_del = q_del.to_delete_sql()
+assert sql_del == "DELETE FROM \"users\" WHERE \"id\" = $1"
+assert p_del == ["99"]
+print("[PASS] 6. Parameterized UPDATE and DELETE for both dialects verified!")
+
+print("\n>>> ALL ORM DIALECT & QUERYBUILDER TESTS PASSED! <<<")

@@ -25,6 +25,7 @@ class Epoll:
     epfd: i32
     max_events: int
     raw_event_buf: Ptr[byte]
+    events_list: list[EpollEvent]
     is_closed: bool
 
     def __init__(self, max_events: int = 1024):
@@ -36,7 +37,12 @@ class Epoll:
         self.max_events = max_events if max_events > 0 else 1024
         # 12 bytes per event * max_events
         self.raw_event_buf = Ptr[byte](self.max_events * 12)
+        self.events_list = []
         self.is_closed = False
+
+    @property
+    def fd(self) -> i32:
+        return self.epfd
 
     def add(self, fd: i32, events: u32) -> None:
         ev_buf = Ptr[byte](12)
@@ -92,6 +98,25 @@ class Epoll:
             if err != i32(2): # ENOENT
                 raise OSError("epoll_ctl DEL failed for fd " + str(fd) + ": " + get_error_message(err))
 
+    def wait_raw(self, timeout_ms: int = -1) -> int:
+        num_events = c_epoll_wait(self.epfd, self.raw_event_buf, i32(self.max_events), i32(timeout_ms))
+        if num_events < i32(0):
+            err = get_errno()
+            if err == EINTR:
+                return 0
+            raise OSError("epoll_wait failed: " + get_error_message(err))
+        return int(num_events)
+
+    def get_event(self, idx: int) -> u32:
+        base = idx * 12
+        p_ev = Ptr[u32]((self.raw_event_buf + base).as_byte())
+        return p_ev[0]
+
+    def get_fd(self, idx: int) -> i32:
+        base = idx * 12
+        p_fd = Ptr[i32]((self.raw_event_buf + base + 4).as_byte())
+        return p_fd[0]
+
     def wait(self, timeout_ms: int = -1) -> list[EpollEvent]:
         num_events = c_epoll_wait(self.epfd, self.raw_event_buf, i32(self.max_events), i32(timeout_ms))
         if num_events < i32(0):
@@ -101,25 +126,13 @@ class Epoll:
             raise OSError("epoll_wait failed: " + get_error_message(err))
 
         count = int(num_events)
-        res: list[EpollEvent] = []
+        self.events_list.clear()
         for i in range(count):
             base = i * 12
-            # events (u32 little endian)
-            e0 = u32(self.raw_event_buf[base + 0])
-            e1 = u32(self.raw_event_buf[base + 1]) << u32(8)
-            e2 = u32(self.raw_event_buf[base + 2]) << u32(16)
-            e3 = u32(self.raw_event_buf[base + 3]) << u32(24)
-            ev = e0 | e1 | e2 | e3
-
-            # fd (i32 little endian)
-            f0 = u32(self.raw_event_buf[base + 4])
-            f1 = u32(self.raw_event_buf[base + 5]) << u32(8)
-            f2 = u32(self.raw_event_buf[base + 6]) << u32(16)
-            f3 = u32(self.raw_event_buf[base + 7]) << u32(24)
-            fd = i32(f0 | f1 | f2 | f3)
-
-            res.append(EpollEvent(ev, fd))
-        return res
+            p_ev = Ptr[u32]((self.raw_event_buf + base).as_byte())
+            p_fd = Ptr[i32]((self.raw_event_buf + base + 4).as_byte())
+            self.events_list.append(EpollEvent(p_ev[0], p_fd[0]))
+        return self.events_list
 
     def close(self) -> None:
         if not self.is_closed and self.epfd >= i32(0):

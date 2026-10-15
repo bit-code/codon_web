@@ -1,0 +1,180 @@
+# Industrial Lazy Loading Entity Model
+from typing import Optional, List, Dict
+from src.db.types import Row, FieldInfo
+from src.orm.model import ModelMeta
+
+class LazyModel:
+    _row: Optional[Row] = None
+    _dirty: Dict[str, str] = Dict[str, str]()
+
+    def __init__(self, row: Optional[Row] = None):
+        self._row = row
+        self._dirty = Dict[str, str]()
+
+    def is_dirty(self) -> bool:
+        return len(self._dirty) > 0
+
+    def get_dirty_fields(self) -> Dict[str, str]:
+        return self._dirty
+
+    def clear_dirty(self) -> None:
+        self._dirty = Dict[str, str]()
+
+    # --------------------------------------------------------------------------
+    # 极致性能直通 API（零额外抽象开销，直接访问底层的解析缓存或 dirty 缓存）
+    # --------------------------------------------------------------------------
+    def get_str(self, col: str, default_val: str = "") -> str:
+        if col in self._dirty:
+            return self._dirty[col]
+        r = self._row
+        if r is not None:
+            return r.get_str(col, default_val)
+        return default_val
+
+    def get_int(self, col: str, default_val: int = 0) -> int:
+        if col in self._dirty:
+            try:
+                return int(self._dirty[col])
+            except:
+                return default_val
+        r = self._row
+        if r is not None:
+            return r.get_int(col, default_val)
+        return default_val
+
+    def get_float(self, col: str, default_val: float = 0.0) -> float:
+        if col in self._dirty:
+            try:
+                return float(self._dirty[col])
+            except:
+                return default_val
+        r = self._row
+        if r is not None:
+            return r.get_float(col, default_val)
+        return default_val
+
+    def get_bool(self, col: str, default_val: bool = False) -> bool:
+        if col in self._dirty:
+            v = self._dirty[col].lower()
+            if v == "1" or v == "true" or v == "t":
+                return True
+            if v == "0" or v == "false" or v == "f":
+                return False
+            return default_val
+        r = self._row
+        if r is not None:
+            return r.get_bool(col, default_val)
+        return default_val
+
+    def has(self, col: str) -> bool:
+        if col in self._dirty:
+            return True
+        r = self._row
+        if r is not None:
+            return col in r
+        return False
+
+    def get_opt_str(self, col: str) -> Optional[str]:
+        if not self.has(col):
+            return None
+        v = self.get_str(col)
+        return Optional[str](v) if len(v) > 0 else None
+
+    def get_opt_int(self, col: str) -> Optional[int]:
+        if not self.has(col):
+            return None
+        v = self.get_str(col)
+        if len(v) == 0:
+            return None
+        try:
+            return Optional[int](int(v))
+        except:
+            return None
+
+    def get_opt_float(self, col: str) -> Optional[float]:
+        if not self.has(col):
+            return None
+        v = self.get_str(col)
+        if len(v) == 0:
+            return None
+        try:
+            return Optional[float](float(v))
+        except:
+            return None
+
+    def get_opt_bool(self, col: str) -> Optional[bool]:
+        if not self.has(col):
+            return None
+        v = self.get_str(col).lower()
+        if len(v) == 0:
+            return None
+        if v == "1" or v == "true" or v == "t":
+            return Optional[bool](True)
+        if v == "0" or v == "false" or v == "f":
+            return Optional[bool](False)
+        return None
+
+    # --------------------------------------------------------------------------
+    # 属性更新与脏标记 API
+    # --------------------------------------------------------------------------
+    def set_str(self, col: str, val: str) -> None:
+        self._dirty[col] = val
+
+    def set_int(self, col: str, val: int) -> None:
+        self._dirty[col] = str(val)
+
+    def set_float(self, col: str, val: float) -> None:
+        self._dirty[col] = str(val)
+
+    def set_bool(self, col: str, val: bool) -> None:
+        self._dirty[col] = "1" if val else "0"
+
+    # --------------------------------------------------------------------------
+    # Pythonic 下标字典式访问语法糖（支持 obj["age"] 与 obj["age"] = 42 自动脏追踪）
+    # --------------------------------------------------------------------------
+    def __getitem__(self, col: str) -> str:
+        return self.get_str(col)
+
+    def __setitem__(self, col: str, val: str):
+        self.set_str(col, val)
+
+    def __setitem__(self, col: str, val: float):
+        self.set_float(col, val)
+
+    def __setitem__(self, col: str, val: int):
+        self.set_int(col, val)
+
+    def __setitem__(self, col: str, val: bool):
+        self.set_bool(col, val)
+
+    def from_schema[S](self, schema: S) -> None:
+        """Zero-alloc direct attribute ingestion from Schema DTO (no intermediate Dict)."""
+        schema.copy_to(self)
+
+    # --------------------------------------------------------------------------
+    # 序列化与 Row 互转
+    # --------------------------------------------------------------------------
+    def to_row(self, meta: ModelMeta) -> Row:
+        cols = meta.columns
+        vals = List[Optional[str]]()
+        for col in cols:
+            if col in self._dirty:
+                vals.append(Optional[str](self._dirty[col]))
+            else:
+                r = self._row
+                if r is not None:
+                    try:
+                        vals.append(r[col])
+                    except:
+                        vals.append(None)
+                else:
+                    vals.append(None)
+        return Row(cols, vals, meta.field_infos)
+
+    def to_json(self, meta: ModelMeta) -> str:
+        # 零分配优化：若数据未被修改，直接穿透到底层 Row 原生 SIMD 流式输出
+        if not self.is_dirty():
+            r = self._row
+            if r is not None:
+                return r.to_json()
+        return self.to_row(meta).to_json()

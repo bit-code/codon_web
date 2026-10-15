@@ -1,5 +1,3 @@
-# MySQL Binary Packet Reader and Writer (Wire Framing & Codec)
-
 from src.os.linux import recv as c_recv, send as c_send, get_errno
 from src.db.errors import OperationalError
 
@@ -23,8 +21,8 @@ class PacketReader:
             while new_cap < needed:
                 new_cap *= 2
             new_data = Ptr[byte](new_cap)
-            for i in range(self.length):
-                new_data[i] = self.data[i]
+            if self.length > 0:
+                str.memcpy(new_data.as_byte(), self.data.as_byte(), self.length)
             self.data = new_data
             self.capacity = new_cap
 
@@ -73,9 +71,18 @@ class PacketReader:
         self.length = p_len
         self.offset = 0
         self.seq_id = seq_id
-        p_ptr = payload.c_str()
-        for i in range(p_len):
-            self.data[i] = p_ptr[i]
+        if p_len > 0:
+            str.memcpy(self.data.as_byte(), payload.c_str().as_byte(), p_len)
+        self.data[self.length] = byte(0)
+
+    def load_payload_ptr(self, ptr: Ptr[byte], p_len: int, seq_id: int = 0) -> None:
+        """Loads raw bytes directly into buffer for decoding."""
+        self._ensure_capacity(p_len + 1)
+        self.length = p_len
+        self.offset = 0
+        self.seq_id = seq_id
+        if p_len > 0:
+            str.memcpy(self.data.as_byte(), ptr.as_byte(), p_len)
         self.data[self.length] = byte(0)
 
 
@@ -150,11 +157,17 @@ class PacketReader:
         if self.offset + length > self.length:
             return ""
         p_new = Ptr[byte](length)
-        for i in range(length):
-            p_new[i] = self.data[self.offset + i]
+        str.memcpy(p_new.as_byte(), (self.data + self.offset).as_byte(), length)
         s = str(p_new, length)
         self.offset += length
         return s
+
+    def skip_length_encoded_str(self) -> None:
+        length = self.read_length_encoded_int()
+        if length > 0:
+            self.offset += length
+            if self.offset > self.length:
+                self.offset = self.length
 
     def read_null_terminated_str(self) -> str:
         start = self.offset
@@ -162,8 +175,8 @@ class PacketReader:
             self.offset += 1
         length = self.offset - start
         p_new = Ptr[byte](length)
-        for i in range(length):
-            p_new[i] = self.data[start + i]
+        if length > 0:
+            str.memcpy(p_new.as_byte(), (self.data + start).as_byte(), length)
         s = str(p_new, length)
         if self.offset < self.length:
             self.offset += 1 # skip null byte
@@ -173,8 +186,8 @@ class PacketReader:
         if self.offset + length > self.length:
             length = self.length - self.offset
         p_new = Ptr[byte](length)
-        for i in range(length):
-            p_new[i] = self.data[self.offset + i]
+        if length > 0:
+            str.memcpy(p_new.as_byte(), (self.data + self.offset).as_byte(), length)
         s = str(p_new, length)
         self.offset += length
         return s
@@ -314,4 +327,20 @@ class PacketWriter:
             raw[4 + i] = self.buffer[i]
 
         return str(raw, total_len)
+
+    def write_to_stream(self, writer, seq_id: int) -> None:
+        """Zero-copy transmits MySQL packet directly to stream writer without str or encode allocation."""
+        pay_len = len(self.buffer)
+        total_len = 4 + pay_len
+        raw = Ptr[byte](total_len)
+
+        raw[0] = byte(pay_len & 0xff)
+        raw[1] = byte((pay_len >> 8) & 0xff)
+        raw[2] = byte((pay_len >> 16) & 0xff)
+        raw[3] = byte(seq_id & 0xff)
+
+        for i in range(pay_len):
+            raw[4 + i] = self.buffer[i]
+
+        writer.write_raw(raw, total_len)
 

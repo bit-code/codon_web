@@ -1,0 +1,22 @@
+# SQL AST Compiler for Multi-Dialect Support
+from typing import List, Tuple, Optional
+from src.orm.dialect import Dialect, MYSQL_DIALECT, POSTGRESQL_DIALECT
+from src.orm.sql.expression import (
+    CompileContext, ClauseElement, BinaryClause, UnaryClause, NotClause,
+    InClause, BetweenClause, CompoundClause, RawClause
+)
+from src.orm.sql.column import Column, OrderByClause
+
+class SQLCompiler(CompileContext):
+    def __init__(self, dialect: Dialect = MYSQL_DIALECT):
+        super().__init__(dialect=dialect)
+
+    def compile_column(self, col: Column) -> str:
+        q_name = self.quote_identifier(col.get_qualified_name())
+        if len(col.alias) > 0:
+            return q_name + " AS " + self.dialect.quote_identifier(col.alias)
+        return q_name
+
+    def compile_order_by(self, ob: OrderByClause) -> str:
+        q_col = self.quote_identifier(ob.column_name)
+        return q_col + " " + ob.direction

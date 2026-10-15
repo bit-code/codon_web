@@ -1,0 +1,244 @@
+# ==============================================================================
+# Smart Fulfillment Hub - Real Database ORM Entity Layer
+# Uses Declarative Base & Unified TableSchema Architecture (CodonWeb ORM)
+# Zero-Alloc Direct Attribute Borrowing via Index-Based ORM Adapter
+# ==============================================================================
+
+from typing import List, Optional, Dict
+from src.orm import (
+    Base, tablename, table_args, get_table_schema,
+    IntegerColumn, StringColumn, FloatColumn, BooleanColumn, TextColumn,
+    BigIntegerColumn, SmallIntegerColumn, TinyIntegerColumn, DecimalColumn,
+    DateTimeColumn, JsonColumn,
+    ModelMeta, Model, LazyModel, Session, DatabaseEngine, AsyncSession
+)
+from src.db.types import Row
+from src.schema import ValidationError, ValidationResult
+from examples.smart_fulfillment.schemas import (
+    AddressSchema,
+    FulfillmentItemSchema,
+    FulfillmentRequest,
+    FulfillmentOrderUpdateSchema,
+    WarehouseInventorySchema,
+    InventoryUpdateSchema,
+    LogisticsRoutePointSchema,
+    ShipmentTrackingSchema,
+    ShipmentUpdateSchema
+)
+
+# ==============================================================================
+# 1. 履约发货订单持久化表模型
+# ==============================================================================
+class FulfillmentOrderTable(Base):
+    __tablename__ = tablename('fulfillment_orders')
+    __table_args__ = {
+        'mysql_engine': 'InnoDB',
+        'mysql_charset': 'utf8mb4',
+        'mysql_collate': 'utf8mb4_general_ci',
+        'mysql_row_format': 'Dynamic',
+        'mysql_auto_increment': '1',
+        'comment': 'Enterprise Smart Fulfillment Orders Table',
+    }
+
+    id = IntegerColumn("id", primary_key=True, auto_increment=True)
+    tracking_sn = StringColumn("tracking_sn", max_length=50, unique=True, index=True)
+    customer_email = StringColumn("customer_email", max_length=120)
+    delivery_speed = StringColumn("delivery_speed", max_length=30, default_val="standard")
+    priority = IntegerColumn("priority", default_val="1")
+    fragile = BooleanColumn("fragile", default_val="false")
+    insured_amount = FloatColumn("insured_amount", default_val="0.0")
+    memo = StringColumn("memo", max_length=255, nullable=True, default_val="")
+    discount_code = StringColumn("discount_code", max_length=50, nullable=True, default_val="")
+    tags = StringColumn("tags", max_length=255, default_val="")
+    city = StringColumn("city", max_length=50)
+    detail = StringColumn("detail", max_length=120)
+    zip_code = StringColumn("zip_code", max_length=20)
+    items = TextColumn("items")
+    status_code = SmallIntegerColumn("status_code", default_val="1")
+
+    def __init__(self, row: Optional[Row] = None):
+        self._row = row
+        self._dirty = Dict[str, str]()
+
+    def __init__(self, schema: FulfillmentRequest):
+        self._row = None
+        self._dirty = Dict[str, str]()
+        schema.copy_to(self)
+
+    def __init__(
+        self,
+        tracking_sn: str,
+        customer_email: str = "",
+        delivery_speed: str = "standard",
+        priority: int = 1,
+        fragile: bool = False,
+        insured_amount: float = 0.0,
+        memo: Optional[str] = None,
+        discount_code: Optional[str] = None,
+        tags: str = "",
+        city: str = "",
+        detail: str = "",
+        zip_code: str = "",
+        items: str = "",
+        status_code: int = 1,
+        row: Optional[Row] = None
+    ):
+        self._row = row
+        self._dirty = Dict[str, str]()
+        self["tracking_sn"] = tracking_sn
+        if len(customer_email) > 0: self["customer_email"] = customer_email
+        if len(delivery_speed) > 0 and delivery_speed != "standard": self["delivery_speed"] = delivery_speed
+        if priority != 1: self["priority"] = priority
+        if fragile: self["fragile"] = fragile
+        if insured_amount != 0.0: self["insured_amount"] = insured_amount
+        if memo is not None and len(memo) > 0: self["memo"] = memo
+        if discount_code is not None and len(discount_code) > 0: self["discount_code"] = discount_code
+        if len(tags) > 0: self["tags"] = tags
+        if len(city) > 0: self["city"] = city
+        if len(detail) > 0: self["detail"] = detail
+        if len(zip_code) > 0: self["zip_code"] = zip_code
+        if len(items) > 0: self["items"] = items
+        if status_code != 1: self["status_code"] = status_code
+
+
+# ==============================================================================
+# 2. 仓储库存持久化表模型（覆盖 BigInteger, SmallInteger, Decimal, Json, DateTime）
+# ==============================================================================
+class WarehouseInventoryTable(Base):
+    __tablename__ = tablename('warehouse_inventories')
+    __table_args__ = {
+        'mysql_engine': 'InnoDB',
+        'mysql_charset': 'utf8mb4',
+        'mysql_collate': 'utf8mb4_general_ci',
+        'mysql_row_format': 'Dynamic',
+        'mysql_auto_increment': '1',
+        'comment': 'Warehouse Inventory Allocation Table',
+    }
+
+    id = IntegerColumn("id", primary_key=True, auto_increment=True)
+    sku_id = StringColumn("sku_id", max_length=50, unique=True, index=True)
+    warehouse_code = StringColumn("warehouse_code", max_length=30, index=True)
+    zone_id = SmallIntegerColumn("zone_id", default_val="1")
+    total_stock = BigIntegerColumn("total_stock", default_val="0")
+    reserved_stock = IntegerColumn("reserved_stock", default_val="0")
+    unit_weight_kg = DecimalColumn("unit_weight_kg", precision=8, scale=3, default_val="0.000")
+    temperature_controlled = BooleanColumn("temperature_controlled", default_val="false")
+    target_temperature = FloatColumn("target_temperature", nullable=True, default_val="0.0")
+    min_reorder_level = IntegerColumn("min_reorder_level", nullable=True, default_val="0")
+    is_quarantine = BooleanColumn("is_quarantine", nullable=True, default_val="false")
+    dimensions_cm = StringColumn("dimensions_cm", max_length=60, default_val="")
+    inspection_flags = StringColumn("inspection_flags", max_length=60, default_val="")
+    last_restocked_at = DateTimeColumn("last_restocked_at", nullable=True)
+    attributes_json = JsonColumn("attributes_json")
+
+    def __init__(self, row: Optional[Row] = None):
+        self._row = row
+        self._dirty = Dict[str, str]()
+
+    def __init__(self, schema: WarehouseInventorySchema):
+        self._row = None
+        self._dirty = Dict[str, str]()
+        schema.copy_to(self)
+
+    def __init__(
+        self,
+        sku_id: str,
+        warehouse_code: str = "WH-EAST-01",
+        zone_id: int = 1,
+        total_stock: int = 0,
+        reserved_stock: int = 0,
+        unit_weight_kg: float = 0.0,
+        temperature_controlled: bool = False,
+        target_temperature: Optional[float] = None,
+        min_reorder_level: Optional[int] = None,
+        is_quarantine: Optional[bool] = None,
+        dimensions_cm: str = "",
+        inspection_flags: str = "",
+        attributes_json: str = "",
+        row: Optional[Row] = None
+    ):
+        self._row = row
+        self._dirty = Dict[str, str]()
+        self["sku_id"] = sku_id
+        if len(warehouse_code) > 0 and warehouse_code != "WH-EAST-01": self["warehouse_code"] = warehouse_code
+        if zone_id != 1: self["zone_id"] = zone_id
+        if total_stock != 0: self["total_stock"] = total_stock
+        if reserved_stock != 0: self["reserved_stock"] = reserved_stock
+        if unit_weight_kg != 0.0: self["unit_weight_kg"] = unit_weight_kg
+        if temperature_controlled: self["temperature_controlled"] = temperature_controlled
+        if target_temperature is not None: self["target_temperature"] = target_temperature
+        if min_reorder_level is not None: self["min_reorder_level"] = min_reorder_level
+        if is_quarantine is not None: self["is_quarantine"] = is_quarantine
+        if len(dimensions_cm) > 0: self["dimensions_cm"] = dimensions_cm
+        if len(inspection_flags) > 0: self["inspection_flags"] = inspection_flags
+        if len(attributes_json) > 0: self["attributes_json"] = attributes_json
+
+
+# ==============================================================================
+# 3. 物流轨迹持久化表模型（覆盖 TinyInteger, DateTime, Json, Text）
+# ==============================================================================
+class ShipmentTrackingTable(Base):
+    __tablename__ = tablename('shipment_trackings')
+    __table_args__ = {
+        'mysql_engine': 'InnoDB',
+        'mysql_charset': 'utf8mb4',
+        'mysql_collate': 'utf8mb4_general_ci',
+        'mysql_row_format': 'Dynamic',
+        'mysql_auto_increment': '1',
+        'comment': 'Logistics Waybill Shipment Tracking Table',
+    }
+
+    id = IntegerColumn("id", primary_key=True, auto_increment=True)
+    waybill_no = StringColumn("waybill_no", max_length=50, unique=True, index=True)
+    carrier_code = StringColumn("carrier_code", max_length=30, index=True)
+    status_code = TinyIntegerColumn("status_code", default_val="0")
+    dispatcher_email = StringColumn("dispatcher_email", max_length=120)
+    gross_weight_kg = FloatColumn("gross_weight_kg", default_val="1.0")
+    signature_required = BooleanColumn("signature_required", nullable=True, default_val="false")
+    delivery_deadline_hours = IntegerColumn("delivery_deadline_hours", nullable=True, default_val="48")
+    carbon_footprint_kg = FloatColumn("carbon_footprint_kg", nullable=True, default_val="0.0")
+    gps_coordinates = StringColumn("gps_coordinates", max_length=60, default_val="")
+    route_stations = TextColumn("route_stations")
+    status_remark = StringColumn("status_remark", max_length=255, default_val="")
+    dispatched_at = DateTimeColumn("dispatched_at", nullable=True)
+    meta_payload = JsonColumn("meta_payload")
+
+    def __init__(self, row: Optional[Row] = None):
+        self._row = row
+        self._dirty = Dict[str, str]()
+
+    def __init__(self, schema: ShipmentTrackingSchema):
+        self._row = None
+        self._dirty = Dict[str, str]()
+        schema.copy_to(self)
+
+    def __init__(
+        self,
+        waybill_no: str,
+        carrier_code: str = "SF_EXPRESS",
+        status_code: int = 0,
+        dispatcher_email: str = "",
+        gross_weight_kg: float = 1.0,
+        signature_required: Optional[bool] = None,
+        delivery_deadline_hours: Optional[int] = None,
+        carbon_footprint_kg: Optional[float] = None,
+        gps_coordinates: str = "",
+        route_stations: str = "",
+        status_remark: str = "",
+        meta_payload: str = "",
+        row: Optional[Row] = None
+    ):
+        self._row = row
+        self._dirty = Dict[str, str]()
+        self["waybill_no"] = waybill_no
+        if len(carrier_code) > 0: self["carrier_code"] = carrier_code
+        if status_code != 0: self["status_code"] = status_code
+        if len(dispatcher_email) > 0: self["dispatcher_email"] = dispatcher_email
+        if gross_weight_kg != 1.0: self["gross_weight_kg"] = gross_weight_kg
+        if signature_required is not None: self["signature_required"] = signature_required
+        if delivery_deadline_hours is not None: self["delivery_deadline_hours"] = delivery_deadline_hours
+        if carbon_footprint_kg is not None: self["carbon_footprint_kg"] = carbon_footprint_kg
+        if len(gps_coordinates) > 0: self["gps_coordinates"] = gps_coordinates
+        if len(route_stations) > 0: self["route_stations"] = route_stations
+        if len(status_remark) > 0: self["status_remark"] = status_remark
+        if len(meta_payload) > 0: self["meta_payload"] = meta_payload

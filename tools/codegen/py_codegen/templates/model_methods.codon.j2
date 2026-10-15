@@ -1,0 +1,433 @@
+{% for cls in classes %}
+@extend
+class {{ cls.name }}:
+
+    def to_dict(self) -> Dict[str, str]:
+        d = Dict[str, str]()
+{% for f in cls.fields %}
+{% if f.is_list %}
+{% if f.list_item_type == "str" %}
+        d["{{ f.name }}"] = ",".join(self.{{ f.name }})
+{% elif f.is_submodel %}
+        _sub_items_{{ f.name }} = List[str]()
+        for _x in self.{{ f.name }}:
+            _sub_items_{{ f.name }}.append(_x.to_json())
+        d["{{ f.name }}"] = "[" + ",".join(_sub_items_{{ f.name }}) + "]"
+{% else %}
+        _s_items_{{ f.name }} = List[str]()
+        for _x in self.{{ f.name }}:
+            _s_items_{{ f.name }}.append(str(_x))
+        d["{{ f.name }}"] = ",".join(_s_items_{{ f.name }})
+{% endif %}
+{% elif f.is_submodel %}
+        d["{{ f.name }}"] = self.{{ f.name }}.to_json()
+{% elif f.field_type == "str" %}
+        d["{{ f.name }}"] = self.{{ f.name }}
+{% elif f.field_type == "bool" %}
+        d["{{ f.name }}"] = "true" if self.{{ f.name }} else "false"
+{% else %}
+        d["{{ f.name }}"] = str(self.{{ f.name }})
+{% endif %}
+{% endfor %}
+        return d
+
+    def _write_json_fields(self, w: FastJsonWriter):
+{% for f in cls.fields %}
+{% if f.is_optional %}
+        if self.{{ f.name }} is not None:
+{% if f.inner_type == "str" %}
+            w.write_str("{{ f.lookup_key }}", self.{{ f.name }})
+{% elif f.inner_type == "bool" %}
+            w.write_bool("{{ f.lookup_key }}", self.{{ f.name }})
+{% elif f.inner_type == "int" %}
+            w.write_int("{{ f.lookup_key }}", self.{{ f.name }})
+{% elif f.inner_type == "float" %}
+            w.write_float("{{ f.lookup_key }}", self.{{ f.name }})
+{% elif f.is_submodel %}
+            w.write_raw("{{ f.lookup_key }}", self.{{ f.name }}.to_json())
+{% endif %}
+        else:
+            w.write_null("{{ f.lookup_key }}")
+{% elif f.is_list %}
+        w.begin_array("{{ f.lookup_key }}")
+        for _x in self.{{ f.name }}:
+{% if f.list_item_type == "str" %}
+            w.append_arr_str(_x)
+{% elif f.list_item_type == "int" %}
+            w.append_arr_int(_x)
+{% elif f.list_item_type == "float" %}
+            w.append_arr_float(_x)
+{% elif f.list_item_type == "bool" %}
+            w.append_arr_bool(_x)
+{% elif f.is_submodel %}
+            w.append_arr_raw(_x.to_json())
+{% endif %}
+        w.end_array()
+{% elif f.is_submodel %}
+        w.write_raw("{{ f.lookup_key }}", self.{{ f.name }}.to_json())
+{% elif f.field_type == "int" %}
+        w.write_int("{{ f.lookup_key }}", self.{{ f.name }})
+{% elif f.field_type == "float" %}
+        w.write_float("{{ f.lookup_key }}", self.{{ f.name }})
+{% elif f.field_type == "bool" %}
+        w.write_bool("{{ f.lookup_key }}", self.{{ f.name }})
+{% else %}
+        w.write_str("{{ f.lookup_key }}", self.{{ f.name }})
+{% endif %}
+{% endfor %}
+
+    @staticmethod
+    def from_fast_json(val: FastJsonVal) -> ValidationResult[{{ cls.name }}]:
+        errors = List[ValidationError]()
+        if not val.is_obj():
+            errors.append(ValidationError("", "Expected JSON object", "type_error.object", loc=["body"]))
+            return ValidationResult[{{ cls.name }}](None, errors)
+
+{% for f in cls.fields %}
+{% if f.is_optional %}
+{% if f.inner_type == "int" %}
+        _{{ f.name }} = extract_opt_int_field(val["{{ f.lookup_key }}"], "{{ f.name }}", errors, ge={{ f.ge if f.has_ge else -999999999999 }}, le={{ f.le if f.has_le else 999999999999 }}, gt={{ f.gt if f.has_gt else -999999999999 }}, lt={{ f.lt if f.has_lt else 999999999999 }}, alias="{{ f.alias }}")
+{% elif f.inner_type == "float" %}
+        _{{ f.name }} = extract_opt_float_field(val["{{ f.lookup_key }}"], "{{ f.name }}", errors, ge={{ f.ge_f if f.has_ge_f else -1e18 }}, le={{ f.le_f if f.has_le_f else 1e18 }}, gt={{ f.gt_f if f.has_gt_f else -1e18 }}, lt={{ f.lt_f if f.has_lt_f else 1e18 }}, alias="{{ f.alias }}")
+{% elif f.inner_type == "bool" %}
+        _{{ f.name }} = extract_opt_bool_field(val["{{ f.lookup_key }}"], "{{ f.name }}", errors, alias="{{ f.alias }}")
+{% else %}
+        _{{ f.name }} = extract_opt_str_field(val["{{ f.lookup_key }}"], "{{ f.name }}", errors, min_len={{ f.min_length }}, max_len={{ f.max_length }}, strip_ws={{ "True" if f.strip_whitespace else "False" }}, fmt="{{ f.format }}", pattern=r"{{ f.pattern }}", choices=[{% for c in f.choices %}"{{ c }}"{% if not loop.last %}, {% endif %}{% endfor %}], alias="{{ f.alias }}")
+{% endif %}
+{% elif f.is_list %}
+        _{{ f.name }} = List[{{ f.list_item_type }}]()
+        _v_{{ f.name }} = val["{{ f.lookup_key }}"]
+        if _v_{{ f.name }}.is_null():
+{% if f.has_default %}
+            pass
+{% elif f.required %}
+            errors.append(ValidationError("{{ f.name }}", "Field '{{ f.name }}' is required", "missing", loc=["body", "{{ f.lookup_key }}"]))
+{% endif %}
+        elif not _v_{{ f.name }}.is_arr():
+            errors.append(ValidationError("{{ f.name }}", "Field '{{ f.name }}' must be a list/array", "type_error.list", loc=["body", "{{ f.lookup_key }}"]))
+        else:
+            _n_{{ f.name }} = _v_{{ f.name }}.len()
+{% if f.min_items > 0 %}
+            if _n_{{ f.name }} < {{ f.min_items }}:
+                errors.append(ValidationError("{{ f.name }}", "Field '{{ f.name }}' requires at least {{ f.min_items }} items", "value_error.list.min_items", loc=["body", "{{ f.lookup_key }}"]))
+{% endif %}
+{% if f.max_items > 0 %}
+            if _n_{{ f.name }} > {{ f.max_items }}:
+                errors.append(ValidationError("{{ f.name }}", "Field '{{ f.name }}' must not exceed {{ f.max_items }} items", "value_error.list.max_items", loc=["body", "{{ f.lookup_key }}"]))
+{% endif %}
+            for _idx_{{ f.name }} in range(_n_{{ f.name }}):
+                _item_{{ f.name }} = _v_{{ f.name }}[_idx_{{ f.name }}]
+{% if f.list_item_type == "str" %}
+                if not _item_{{ f.name }}.is_str():
+                    errors.append(ValidationError("{{ f.name }}", "Item at index " + str(_idx_{{ f.name }}) + " must be a string", "type_error.str", loc=["body", "{{ f.lookup_key }}", str(_idx_{{ f.name }})]))
+                else:
+                    _{{ f.name }}.append(_item_{{ f.name }}.as_str())
+{% elif f.list_item_type == "int" %}
+                if not _item_{{ f.name }}.is_int():
+                    errors.append(ValidationError("{{ f.name }}", "Item at index " + str(_idx_{{ f.name }}) + " must be an integer", "type_error.integer", loc=["body", "{{ f.lookup_key }}", str(_idx_{{ f.name }})]))
+                else:
+                    _{{ f.name }}.append(_item_{{ f.name }}.as_int())
+{% elif f.list_item_type == "float" %}
+                if not _item_{{ f.name }}.is_float():
+                    errors.append(ValidationError("{{ f.name }}", "Item at index " + str(_idx_{{ f.name }}) + " must be a float", "type_error.float", loc=["body", "{{ f.lookup_key }}", str(_idx_{{ f.name }})]))
+                else:
+                    _{{ f.name }}.append(_item_{{ f.name }}.as_float())
+{% elif f.list_item_type == "bool" %}
+                if not _item_{{ f.name }}.is_bool():
+                    errors.append(ValidationError("{{ f.name }}", "Item at index " + str(_idx_{{ f.name }}) + " must be a boolean", "type_error.bool", loc=["body", "{{ f.lookup_key }}", str(_idx_{{ f.name }})]))
+                else:
+                    _{{ f.name }}.append(_item_{{ f.name }}.as_bool())
+{% elif f.is_submodel %}
+                _sub_res_{{ f.name }} = {{ f.list_item_type }}.from_fast_json(_item_{{ f.name }})
+                if not _sub_res_{{ f.name }}.is_ok():
+                    for _s_err in _sub_res_{{ f.name }}.errors:
+                        errors.append(_s_err.with_prefix(str(_idx_{{ f.name }})).with_prefix("{{ f.lookup_key }}"))
+                else:
+                    _{{ f.name }}.append(_sub_res_{{ f.name }}.unwrap())
+{% endif %}
+{% elif f.is_submodel %}
+        _v_{{ f.name }} = val["{{ f.lookup_key }}"]
+        if _v_{{ f.name }}.is_null():
+{% if f.has_default %}
+            _{{ f.name }} = {{ f.default_val }}
+{% elif f.required %}
+            errors.append(ValidationError("{{ f.name }}", "Field '{{ f.name }}' is required", "missing", loc=["body", "{{ f.lookup_key }}"]))
+            _{{ f.name }} = {{ f.submodel_name }}()
+{% else %}
+            _{{ f.name }} = {{ f.submodel_name }}()
+{% endif %}
+        elif not _v_{{ f.name }}.is_obj():
+            errors.append(ValidationError("{{ f.name }}", "Field '{{ f.name }}' must be an object", "type_error.object", loc=["body", "{{ f.lookup_key }}"]))
+            _{{ f.name }} = {{ f.submodel_name }}()
+        else:
+            _sub_res_{{ f.name }} = {{ f.submodel_name }}.from_fast_json(_v_{{ f.name }})
+            if not _sub_res_{{ f.name }}.is_ok():
+                for _s_err in _sub_res_{{ f.name }}.errors:
+                    errors.append(_s_err.with_prefix("{{ f.lookup_key }}"))
+                _{{ f.name }} = {{ f.submodel_name }}()
+            else:
+                _{{ f.name }} = _sub_res_{{ f.name }}.unwrap()
+{% elif f.field_type == "int" %}
+        _{{ f.name }} = extract_int_field(val["{{ f.lookup_key }}"], "{{ f.name }}", errors, required={{ "True" if f.required else "False" }}, default={{ f.fallback }}, ge={{ f.ge if f.has_ge else -999999999999 }}, le={{ f.le if f.has_le else 999999999999 }}, gt={{ f.gt if f.has_gt else -999999999999 }}, lt={{ f.lt if f.has_lt else 999999999999 }}, alias="{{ f.alias }}")
+{% elif f.field_type == "float" %}
+        _{{ f.name }} = extract_float_field(val["{{ f.lookup_key }}"], "{{ f.name }}", errors, required={{ "True" if f.required else "False" }}, default={{ f.fallback }}, ge={{ f.ge_f if f.has_ge_f else -1e18 }}, le={{ f.le_f if f.has_le_f else 1e18 }}, gt={{ f.gt_f if f.has_gt_f else -1e18 }}, lt={{ f.lt_f if f.has_lt_f else 1e18 }}, alias="{{ f.alias }}")
+{% elif f.field_type == "bool" %}
+        _{{ f.name }} = extract_bool_field(val["{{ f.lookup_key }}"], "{{ f.name }}", errors, required={{ "True" if f.required else "False" }}, default={{ f.fallback }}, alias="{{ f.alias }}")
+{% else %}
+        _{{ f.name }} = extract_str_field(val["{{ f.lookup_key }}"], "{{ f.name }}", errors, required={{ "True" if f.required else "False" }}, default={{ f.fallback }}, min_len={{ f.min_length }}, max_len={{ f.max_length }}, strip_ws={{ "True" if f.strip_whitespace else "False" }}, fmt="{{ f.format }}", pattern=r"{{ f.pattern }}", choices=[{% for c in f.choices %}"{{ c }}"{% if not loop.last %}, {% endif %}{% endfor %}], alias="{{ f.alias }}")
+{% endif %}
+{% endfor %}
+
+        if len(errors) > 0:
+            return ValidationResult[{{ cls.name }}](None, errors)
+        _inst = {{ cls.name }}({% for f in cls.fields %}_{{ f.name }}{% if not loop.last %}, {% endif %}{% endfor %})
+{% if cls.has_custom_validate %}
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            for _ce in _custom_errs:
+                errors.append(_ce)
+            return ValidationResult[{{ cls.name }}](None, errors)
+{% endif %}
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def from_json(raw: str) -> ValidationResult[{{ cls.name }}]:
+        try:
+            doc = FastJson.loads(raw)
+            res = {{ cls.name }}.from_fast_json(doc.root)
+            doc.close()
+            return res
+        except:
+            errors = List[ValidationError]()
+            errors.append(ValidationError("", "Invalid JSON string", "type_error.json", loc=["body"]))
+            return ValidationResult[{{ cls.name }}](None, errors)
+
+    @staticmethod
+    def model_validate_json(raw: str) -> ValidationResult[{{ cls.name }}]:
+        return {{ cls.name }}.from_json(raw)
+
+    @staticmethod
+    def from_json_doc(doc: FastJsonDoc) -> ValidationResult[{{ cls.name }}]:
+        return {{ cls.name }}.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_dict(d: Dict[str, str]) -> ValidationResult[{{ cls.name }}]:
+        errors = List[ValidationError]()
+{% for f in cls.fields %}
+{% if f.is_optional %}
+{% if f.inner_type == "int" %}
+        _d_{{ f.name }} = extract_dict_opt_int(d, "{{ f.name }}", errors, ge={{ f.ge if f.has_ge else -999999999999 }}, le={{ f.le if f.has_le else 999999999999 }}, gt={{ f.gt if f.has_gt else -999999999999 }}, lt={{ f.lt if f.has_lt else 999999999999 }}, alias="{{ f.alias }}")
+{% elif f.inner_type == "float" %}
+        _d_{{ f.name }} = extract_dict_opt_float(d, "{{ f.name }}", errors, ge={{ f.ge_f if f.has_ge_f else -1e18 }}, le={{ f.le_f if f.has_le_f else 1e18 }}, gt={{ f.gt_f if f.has_gt_f else -1e18 }}, lt={{ f.lt_f if f.has_lt_f else 1e18 }}, alias="{{ f.alias }}")
+{% elif f.inner_type == "bool" %}
+        _d_{{ f.name }} = extract_dict_opt_bool(d, "{{ f.name }}", errors, alias="{{ f.alias }}")
+{% else %}
+        _d_{{ f.name }} = extract_dict_opt_str(d, "{{ f.name }}", errors, min_len={{ f.min_length }}, max_len={{ f.max_length }}, strip_ws={{ "True" if f.strip_whitespace else "False" }}, choices=[{% for c in f.choices %}"{{ c }}"{% if not loop.last %}, {% endif %}{% endfor %}], alias="{{ f.alias }}")
+{% endif %}
+{% elif f.is_list %}
+        _has_{{ f.name }} = ("{{ f.lookup_key }}" in d and len(d["{{ f.lookup_key }}"].strip()) > 0)
+        _d_{{ f.name }} = List[{{ f.list_item_type }}]()
+        if _has_{{ f.name }}:
+            _raw_{{ f.name }} = d["{{ f.lookup_key }}"].strip()
+{% if f.is_submodel %}
+            try:
+                _sub_arr_doc_{{ f.name }} = FastJson.loads(_raw_{{ f.name }})
+                if _sub_arr_doc_{{ f.name }}.root.is_arr():
+                    for _idx_{{ f.name }} in range(_sub_arr_doc_{{ f.name }}.root.len()):
+                        _sub_item_res = {{ f.list_item_type }}.from_fast_json(_sub_arr_doc_{{ f.name }}.root[_idx_{{ f.name }}])
+                        if _sub_item_res.is_ok():
+                            _d_{{ f.name }}.append(_sub_item_res.unwrap())
+                        else:
+                            for _s_err in _sub_item_res.errors:
+                                errors.append(_s_err.with_prefix(str(_idx_{{ f.name }})).with_prefix("{{ f.lookup_key }}"))
+                _sub_arr_doc_{{ f.name }}.close()
+            except:
+                errors.append(ValidationError("{{ f.name }}", "Invalid JSON array", "type_error.list", loc=["query", "{{ f.lookup_key }}"]))
+{% else %}
+            _items_{{ f.name }} = _raw_{{ f.name }}.split(',')
+            for _sub_item in _items_{{ f.name }}:
+                _clean_sub = _sub_item.strip()
+{% if f.list_item_type == "int" %}
+                try: _d_{{ f.name }}.append(int(_clean_sub))
+                except: errors.append(ValidationError("{{ f.name }}", "Item must be integer", "type_error.int", loc=["query", "{{ f.lookup_key }}"]))
+{% elif f.list_item_type == "float" %}
+                try: _d_{{ f.name }}.append(float(_clean_sub))
+                except: errors.append(ValidationError("{{ f.name }}", "Item must be float", "type_error.float", loc=["query", "{{ f.lookup_key }}"]))
+{% else %}
+                _d_{{ f.name }}.append(_clean_sub)
+{% endif %}
+{% endif %}
+{% elif f.is_submodel %}
+        _d_{{ f.name }} = {{ f.submodel_name }}()
+        if "{{ f.lookup_key }}" in d and len(d["{{ f.lookup_key }}"].strip()) > 0:
+            _sub_dict_res_{{ f.name }} = {{ f.submodel_name }}.from_json(d["{{ f.lookup_key }}"])
+            if _sub_dict_res_{{ f.name }}.is_ok():
+                _d_{{ f.name }} = _sub_dict_res_{{ f.name }}.unwrap()
+            else:
+                for _s_err in _sub_dict_res_{{ f.name }}.errors:
+                    errors.append(_s_err.with_prefix("{{ f.lookup_key }}"))
+        elif {{ "True" if f.required else "False" }}:
+            errors.append(ValidationError("{{ f.name }}", "Field '{{ f.name }}' is required", "missing", loc=["query", "{{ f.lookup_key }}"]))
+{% elif f.field_type == "int" %}
+        _d_{{ f.name }} = extract_dict_int(d, "{{ f.name }}", errors, required={{ "True" if f.required else "False" }}, default={{ f.fallback }}, ge={{ f.ge if f.has_ge else -999999999999 }}, le={{ f.le if f.has_le else 999999999999 }}, gt={{ f.gt if f.has_gt else -999999999999 }}, lt={{ f.lt if f.has_lt else 999999999999 }}, alias="{{ f.alias }}")
+{% elif f.field_type == "float" %}
+        _d_{{ f.name }} = extract_dict_float(d, "{{ f.name }}", errors, required={{ "True" if f.required else "False" }}, default={{ f.fallback }}, ge={{ f.ge_f if f.has_ge_f else -1e18 }}, le={{ f.le_f if f.has_le_f else 1e18 }}, gt={{ f.gt_f if f.has_gt_f else -1e18 }}, lt={{ f.lt_f if f.has_lt_f else 1e18 }}, alias="{{ f.alias }}")
+{% elif f.field_type == "bool" %}
+        _d_{{ f.name }} = extract_dict_bool(d, "{{ f.name }}", errors, required={{ "True" if f.required else "False" }}, default={{ f.fallback }}, alias="{{ f.alias }}")
+{% else %}
+        _d_{{ f.name }} = extract_dict_str(d, "{{ f.name }}", errors, required={{ "True" if f.required else "False" }}, default={{ f.fallback }}, min_len={{ f.min_length }}, max_len={{ f.max_length }}, strip_ws={{ "True" if f.strip_whitespace else "False" }}, choices=[{% for c in f.choices %}"{{ c }}"{% if not loop.last %}, {% endif %}{% endfor %}], alias="{{ f.alias }}")
+{% endif %}
+{% endfor %}
+
+        if len(errors) > 0:
+            return ValidationResult[{{ cls.name }}](None, errors)
+        _inst = {{ cls.name }}({% for f in cls.fields %}_d_{{ f.name }}{% if not loop.last %}, {% endif %}{% endfor %})
+{% if cls.has_custom_validate %}
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            for _ce in _custom_errs:
+                errors.append(_ce)
+            return ValidationResult[{{ cls.name }}](None, errors)
+{% endif %}
+        return ValidationResult.ok(_inst)
+
+    @staticmethod
+    def model_validate(d: Dict[str, str]) -> ValidationResult[{{ cls.name }}]:
+        return {{ cls.name }}.from_dict(d)
+
+    @staticmethod
+    def model_validate(val: FastJsonVal) -> ValidationResult[{{ cls.name }}]:
+        return {{ cls.name }}.from_fast_json(val)
+
+    @staticmethod
+    def model_validate(doc: FastJsonDoc) -> ValidationResult[{{ cls.name }}]:
+        return {{ cls.name }}.from_fast_json(doc.root)
+
+    @staticmethod
+    def from_orm[M](entity: M) -> ValidationResult[{{ cls.name }}]:
+        """Zero-alloc direct attribute borrowing from ORM entity (no intermediate Dict)."""
+{% for f in cls.fields %}
+{% if f.is_optional %}
+{% if f.inner_type == "int" %}
+        _raw_{{ f.name }} = entity["{{ f.name }}"].strip()
+        _{{ f.name }} = Optional[int](int(_raw_{{ f.name }})) if len(_raw_{{ f.name }}) > 0 else None
+{% elif f.inner_type == "float" %}
+        _raw_{{ f.name }} = entity["{{ f.name }}"].strip()
+        _{{ f.name }} = Optional[float](float(_raw_{{ f.name }})) if len(_raw_{{ f.name }}) > 0 else None
+{% elif f.inner_type == "bool" %}
+        _raw_{{ f.name }} = entity["{{ f.name }}"].strip()
+        _{{ f.name }} = Optional[bool](_raw_{{ f.name }} == "1" or _raw_{{ f.name }}.lower() == "true") if len(_raw_{{ f.name }}) > 0 else None
+{% elif f.is_submodel %}
+        _sub_res_{{ f.name }} = {{ f.submodel_name }}.from_orm(entity)
+        _{{ f.name }} = Optional[{{ f.submodel_name }}](_sub_res_{{ f.name }}.unwrap()) if _sub_res_{{ f.name }}.is_ok() else None
+{% else %}
+        _raw_{{ f.name }} = entity["{{ f.name }}"].strip()
+        _{{ f.name }} = Optional[str](_raw_{{ f.name }}) if len(_raw_{{ f.name }}) > 0 else None
+{% endif %}
+{% elif f.is_list %}
+        _{{ f.name }} = List[{{ f.list_item_type }}]()
+        _raw_{{ f.name }} = entity["{{ f.name }}"].strip()
+{% if f.is_submodel %}
+        if len(_raw_{{ f.name }}) > 0 and _raw_{{ f.name }}.startswith("["):
+            try:
+                _doc_{{ f.name }} = FastJson.loads(_raw_{{ f.name }})
+                if _doc_{{ f.name }}.root.is_arr():
+                    for _idx_{{ f.name }} in range(_doc_{{ f.name }}.root.len()):
+                        _sub_item_res_{{ f.name }} = {{ f.list_item_type }}.from_fast_json(_doc_{{ f.name }}.root[_idx_{{ f.name }}])
+                        if _sub_item_res_{{ f.name }}.is_ok():
+                            _{{ f.name }}.append(_sub_item_res_{{ f.name }}.unwrap())
+                _doc_{{ f.name }}.close()
+            except:
+                pass
+{% elif f.list_item_type == "int" %}
+        if len(_raw_{{ f.name }}) > 0:
+            for _s in _raw_{{ f.name }}.split(","):
+                _c = _s.strip()
+                if len(_c) > 0:
+                    try: _{{ f.name }}.append(int(_c))
+                    except: pass
+{% elif f.list_item_type == "float" %}
+        if len(_raw_{{ f.name }}) > 0:
+            for _s in _raw_{{ f.name }}.split(","):
+                _c = _s.strip()
+                if len(_c) > 0:
+                    try: _{{ f.name }}.append(float(_c))
+                    except: pass
+{% elif f.list_item_type == "bool" %}
+        if len(_raw_{{ f.name }}) > 0:
+            for _s in _raw_{{ f.name }}.split(","):
+                _c = _s.strip()
+                if len(_c) > 0:
+                    _{{ f.name }}.append(_c == "1" or _c.lower() == "true")
+{% else %}
+        if len(_raw_{{ f.name }}) > 0:
+            for _s in _raw_{{ f.name }}.split(","):
+                _c = _s.strip()
+                if len(_c) > 0:
+                    _{{ f.name }}.append(_c)
+{% endif %}
+{% elif f.is_submodel %}
+        _sub_res_{{ f.name }} = {{ f.submodel_name }}.from_orm(entity)
+        _{{ f.name }} = _sub_res_{{ f.name }}.unwrap() if _sub_res_{{ f.name }}.is_ok() else {{ f.submodel_name }}()
+{% elif f.field_type == "int" %}
+        _raw_{{ f.name }} = entity["{{ f.name }}"].strip()
+        _{{ f.name }} = int(_raw_{{ f.name }}) if len(_raw_{{ f.name }}) > 0 else {{ f.fallback }}
+{% elif f.field_type == "float" %}
+        _raw_{{ f.name }} = entity["{{ f.name }}"].strip()
+        _{{ f.name }} = float(_raw_{{ f.name }}) if len(_raw_{{ f.name }}) > 0 else {{ f.fallback }}
+{% elif f.field_type == "bool" %}
+        _raw_{{ f.name }} = entity["{{ f.name }}"].strip()
+        _{{ f.name }} = (_raw_{{ f.name }} == "1" or _raw_{{ f.name }}.lower() == "true") if len(_raw_{{ f.name }}) > 0 else {{ f.fallback }}
+{% else %}
+        _{{ f.name }} = entity["{{ f.name }}"]
+{% endif %}
+{% endfor %}
+        _inst = {{ cls.name }}({% for f in cls.fields %}_{{ f.name }}{{ "," if not loop.last else "" }}{% endfor %})
+{% if cls.has_custom_validate %}
+        _custom_errs = _inst.custom_validate()
+        if len(_custom_errs) > 0:
+            return ValidationResult[{{ cls.name }}](None, _custom_errs)
+{% endif %}
+        return ValidationResult.ok(_inst)
+
+    def copy_to[T](self, target: T) -> None:
+        """Zero-alloc direct attribute transfer to target entity (no intermediate Dict)."""
+{% for f in cls.fields %}
+{% if f.is_optional %}
+        if self.{{ f.name }} is not None:
+            target["{{ f.name }}"] = self.{{ f.name }}
+{% elif f.is_list %}
+{% if f.is_submodel %}
+        _sub_items_{{ f.name }} = List[str]()
+        for _x in self.{{ f.name }}:
+            _sub_items_{{ f.name }}.append(_x.to_json())
+        target["{{ f.name }}"] = "[" + ",".join(_sub_items_{{ f.name }}) + "]"
+{% elif f.list_item_type == "bool" %}
+        _items_{{ f.name }} = List[str]()
+        for _x in self.{{ f.name }}:
+            _items_{{ f.name }}.append("1" if _x else "0")
+        target["{{ f.name }}"] = ",".join(_items_{{ f.name }})
+{% elif f.list_item_type == "int" or f.list_item_type == "float" %}
+        _items_{{ f.name }} = List[str]()
+        for _x in self.{{ f.name }}:
+            _items_{{ f.name }}.append(str(_x))
+        target["{{ f.name }}"] = ",".join(_items_{{ f.name }})
+{% else %}
+        target["{{ f.name }}"] = ",".join(self.{{ f.name }})
+{% endif %}
+{% elif f.is_submodel %}
+        self.{{ f.name }}.copy_to(target)
+{% else %}
+        target["{{ f.name }}"] = self.{{ f.name }}
+{% endif %}
+{% endfor %}
+
+    @staticmethod
+    def openapi_schema_json() -> str:
+        return '{{ openapi_schemas[cls.name] }}'
+
+    @staticmethod
+    def model_json_schema() -> str:
+        return {{ cls.name }}.openapi_schema_json()
+
+{% endfor %}

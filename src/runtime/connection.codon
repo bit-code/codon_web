@@ -1,6 +1,6 @@
 from src.os.constants import (
     EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP, EPOLLET,
-    EAGAIN, EWOULDBLOCK, EINTR, EPIPE, ECONNRESET
+    EAGAIN, EWOULDBLOCK, EINTR, EPIPE, ECONNRESET, MSG_NOSIGNAL
 )
 from src.os.linux import (
     recv as c_recv,
@@ -13,6 +13,7 @@ from src.http.request import Request
 from src.http.response import Response
 from src.http.parser import HttpParser, PARSE_OK, PARSE_NEED_MORE, PARSE_ERROR
 from src.runtime.epoll import Epoll
+from src.os.socket import Socket
 
 import time
 
@@ -41,6 +42,7 @@ class Connection:
     keep_alive: bool
     last_active_time: float
     has_epollout: bool
+    recv_in_flight: bool
 
     def __init__(self, fd: i32, client_ip: str = "", client_port: int = 0, buffer_size: int = 4096):
         self.fd = fd
@@ -54,9 +56,23 @@ class Connection:
         self.keep_alive = True
         self.last_active_time = time.time()
         self.has_epollout = False
+        self.recv_in_flight = False
 
-    def update_activity(self) -> None:
-        self.last_active_time = time.time()
+    def reset_pool(self, fd: i32, client_ip: str = "", client_port: int = 0, now: float = 0.0) -> None:
+        self.fd = fd
+        self.state = STATE_ACCEPTED
+        self.client_ip = client_ip
+        self.client_port = client_port
+        self.read_buf.reset()
+        self.write_buf.reset()
+        self.request.reset()
+        self.keep_alive = True
+        self.last_active_time = now if now > 0.0 else time.time()
+        self.has_epollout = False
+        self.recv_in_flight = False
+
+    def update_activity(self, now: float = 0.0) -> None:
+        self.last_active_time = now if now > 0.0 else time.time()
 
     def is_idle_timeout(self, now: float, timeout_sec: float) -> bool:
         return (now - self.last_active_time) > timeout_sec
@@ -70,8 +86,8 @@ class Connection:
     def mark_suspended(self) -> None:
         self.state = STATE_SUSPENDED
 
-    def on_readable(self) -> i32:
-        self.update_activity()
+    def on_readable(self, now: float = 0.0) -> i32:
+        self.update_activity(now)
         # Edge-Triggered drain: read until EAGAIN
         while True:
             # Ensure space in read buffer
@@ -111,18 +127,43 @@ class Connection:
 
         return self.state
 
-    def send_response(self, resp: Response, epoll: Epoll) -> None:
+    def send_response(self, resp: Response, epoll: Epoll, now: float = 0.0) -> None:
         self.write_buf.reset()
         resp.serialize(self.write_buf, self.keep_alive)
+        Response.recycle(resp)
         self.state = STATE_WRITING
-        self.on_writable(epoll)
+        self.on_writable(epoll, now)
 
-    def on_writable(self, epoll: Epoll) -> i32:
-        self.update_activity()
+    def append_response(self, resp: Response) -> None:
+        resp.serialize(self.write_buf, self.keep_alive)
+        Response.recycle(resp)
+        self.request.background_tasks.run_all()
+
+    def flush_responses(self, epoll: Epoll, now: float = 0.0) -> i32:
+        if self.write_buf.readable_bytes() == 0:
+            return self.state
+        self.state = STATE_WRITING
+        return self.on_writable(epoll, now)
+
+    def parse_next_pipelined_request(self) -> bool:
+        self.request.reset()
+        self.read_buf.compact()
+        if self.read_buf.readable_bytes() > 0:
+            parse_res, consumed = self.parser.parse(self.read_buf.readable_slice(), self.request)
+            if parse_res == PARSE_OK:
+                self.read_buf.consume(consumed)
+                self.keep_alive = self.request.keep_alive
+                self.state = STATE_REQUEST_READY
+                return True
+        self.state = STATE_KEEP_ALIVE
+        return False
+
+    def on_writable(self, epoll: Epoll, now: float = 0.0) -> i32:
+        self.update_activity(now)
         # Edge-Triggered send: write until EAGAIN or done
         while self.write_buf.readable_bytes() > 0:
             rslice = self.write_buf.readable_slice()
-            nsent = c_send(self.fd, rslice.ptr, rslice.len, i32(0))
+            nsent = c_send(self.fd, rslice.ptr, rslice.len, MSG_NOSIGNAL)
 
             if nsent > 0:
                 self.write_buf.consume(nsent)

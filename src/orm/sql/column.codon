@@ -1,0 +1,189 @@
+# Column and OrderBy Clause Definitions for Codon ORM
+from typing import List, Optional
+from src.orm.sql.expression import (
+    ClauseElement, BinaryClause, UnaryClause, InClause, BetweenClause
+)
+
+class OrderByClause:
+    column_name: str
+    direction: str # "ASC" or "DESC"
+
+    def __init__(self, column_name: str, direction: str = "ASC"):
+        self.column_name = column_name
+        self.direction = direction.strip().upper()
+
+    def to_str(self) -> str:
+        return self.column_name + " " + self.direction
+
+
+class Column:
+    name: str
+    table_name: str
+    alias: str
+    data_type: str
+
+    def __init__(
+        self,
+        name: str,
+        table_name: str = "",
+        alias: str = "",
+        data_type: str = "varchar"
+    ):
+        self.name = name
+        self.table_name = table_name
+        self.alias = alias
+        self.data_type = data_type
+
+    def get_qualified_name(self) -> str:
+        if len(self.table_name) > 0:
+            return self.table_name + "." + self.name
+        return self.name
+
+    def label(self, alias: str) -> Column:
+        return Column(
+            name=self.name,
+            table_name=self.table_name,
+            alias=alias,
+            data_type=self.data_type
+        )
+
+    def as_(self, alias: str) -> Column:
+        return self.label(alias)
+
+    def desc(self) -> OrderByClause:
+        return OrderByClause(self.get_qualified_name(), "DESC")
+
+    def asc(self) -> OrderByClause:
+        return OrderByClause(self.get_qualified_name(), "ASC")
+
+    # Comparisons with string
+    def __eq__(self, other: str) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "=", other)
+
+    def __ne__(self, other: str) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "!=", other)
+
+    def __gt__(self, other: str) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), ">", other)
+
+    def __ge__(self, other: str) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), ">=", other)
+
+    def __lt__(self, other: str) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "<", other)
+
+    def __le__(self, other: str) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "<=", other)
+
+    # Comparisons with float
+    def __eq__(self, other: float) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "=", str(other))
+
+    def __ne__(self, other: float) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "!=", str(other))
+
+    def __gt__(self, other: float) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), ">", str(other))
+
+    def __ge__(self, other: float) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), ">=", str(other))
+
+    def __lt__(self, other: float) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "<", str(other))
+
+    def __le__(self, other: float) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "<=", str(other))
+
+    # Comparisons with int
+    def __eq__(self, other: int) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "=", str(other))
+
+    def __ne__(self, other: int) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "!=", str(other))
+
+    def __gt__(self, other: int) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), ">", str(other))
+
+    def __ge__(self, other: int) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), ">=", str(other))
+
+    def __lt__(self, other: int) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "<", str(other))
+
+    def __le__(self, other: int) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "<=", str(other))
+
+    # Comparisons with bool
+    def __eq__(self, other: bool) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "=", "1" if other else "0")
+
+    def __ne__(self, other: bool) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "!=", "1" if other else "0")
+
+    # Column to Column comparison (for joins and expressions)
+    def __eq__(self, other: Column) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "=", other.get_qualified_name(), is_column_comparison=True)
+
+    def __ne__(self, other: Column) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "!=", other.get_qualified_name(), is_column_comparison=True)
+
+    def __gt__(self, other: Column) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), ">", other.get_qualified_name(), is_column_comparison=True)
+
+    def __ge__(self, other: Column) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), ">=", other.get_qualified_name(), is_column_comparison=True)
+
+    def __lt__(self, other: Column) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "<", other.get_qualified_name(), is_column_comparison=True)
+
+    def __le__(self, other: Column) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "<=", other.get_qualified_name(), is_column_comparison=True)
+
+    # LIKE / ILIKE
+    def like(self, pattern: str) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "LIKE", pattern)
+
+    def not_like(self, pattern: str) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "NOT LIKE", pattern)
+
+    def ilike(self, pattern: str) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "ILIKE", pattern)
+
+    def not_ilike(self, pattern: str) -> BinaryClause:
+        return BinaryClause(self.get_qualified_name(), "NOT ILIKE", pattern)
+
+    # IN / NOT IN
+    def in_(self, values: List[str]) -> InClause:
+        return InClause(self.get_qualified_name(), values, is_not=False)
+
+    def in_(self, values: List[int]) -> InClause:
+        s_vals = List[str]()
+        for v in values:
+            s_vals.append(str(v))
+        return InClause(self.get_qualified_name(), s_vals, is_not=False)
+
+    def not_in(self, values: List[str]) -> InClause:
+        return InClause(self.get_qualified_name(), values, is_not=True)
+
+    def not_in(self, values: List[int]) -> InClause:
+        s_vals = List[str]()
+        for v in values:
+            s_vals.append(str(v))
+        return InClause(self.get_qualified_name(), s_vals, is_not=True)
+
+    # NULL checks
+    def is_null(self) -> UnaryClause:
+        return UnaryClause(self.get_qualified_name(), "IS NULL")
+
+    def is_not_null(self) -> UnaryClause:
+        return UnaryClause(self.get_qualified_name(), "IS NOT NULL")
+
+    # BETWEEN
+    def between(self, low: str, high: str) -> BetweenClause:
+        return BetweenClause(self.get_qualified_name(), low, high)
+
+    def between(self, low: float, high: float) -> BetweenClause:
+        return BetweenClause(self.get_qualified_name(), str(low), str(high))
+
+    def between(self, low: int, high: int) -> BetweenClause:
+        return BetweenClause(self.get_qualified_name(), str(low), str(high))
