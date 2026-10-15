@@ -8,7 +8,7 @@
   <a href="https://github.com/bit-code/codon_web/actions"><img src="https://img.shields.io/badge/CI-Passing-brightgreen?style=flat-square&logo=githubactions" alt="CI Status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
   <a href="https://github.com/exaloop/codon"><img src="https://img.shields.io/badge/compiler-Codon%20(LLVM)-blueviolet?style=flat-square" alt="Codon"></a>
-  <img src="https://img.shields.io/badge/throughput-425k%2B%20QPS-orange?style=flat-square" alt="Throughput">
+  <img src="https://img.shields.io/badge/throughput-455k%2B%20QPS-orange?style=flat-square" alt="Throughput">
   <img src="https://img.shields.io/badge/memory-~18MB%20RSS-green?style=flat-square" alt="Memory">
   <a href="README_zh.md"><img src="https://img.shields.io/badge/docs-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-blue?style=flat-square" alt="Chinese Documentation"></a>
 </p>
@@ -40,7 +40,7 @@ By eliminating the Python Global Interpreter Lock (GIL), dynamic reflection, and
                                              ▼
               ┌─────────────────────────────────────────────────────────────┐
               │                Rust / C++ Execution Velocity                │
-              │        (425,000+ QPS, 0.7ms Latency, 18MB Footprint)        │
+              │        (455,000+ QPS, 0.7ms Latency, 18MB Footprint)        │
               └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -48,7 +48,7 @@ By eliminating the Python Global Interpreter Lock (GIL), dynamic reflection, and
 
 ## 🚀 Key Highlights
 
-- 🏎️ **Bare-Metal Throughput**: Exceeds **425,000 requests/sec** with sub-millisecond P50 latency (~0.78 ms) on standard multi-core hardware.
+- 🏎️ **Bare-Metal Throughput**: Exceeds **455,000 requests/sec** with sub-millisecond P50 latency (~0.78 ms) on standard multi-core hardware.
 - 🧬 **Code-First AOT Schema Engine**: Type-safe request schemas (`BaseModel`) compiled to native deserialization and validation routines with zero runtime reflection.
 - ⚡ **SIMD FastJson (`yyjson`)**: Direct C-ABI SIMD acceleration processing JSON at **2.4 to 3.1 GB/s** (12x faster than Python `json`, 2x faster than `orjson`).
 - 🗄️ **Industrial ORM & SQL Builder**: Dual-dialect (MySQL & PostgreSQL) SQLAlchemy-style expression builder (`select().where().order_by()`) and non-blocking connection pools.

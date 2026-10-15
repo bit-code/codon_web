@@ -8,7 +8,7 @@
   <a href="https://github.com/bit-code/codon_web/actions"><img src="https://img.shields.io/badge/CI-%E6%9E%84%E5%BB%BA%E9%80%9A%E8%BF%87-brightgreen?style=flat-square&logo=githubactions" alt="CI Status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/%E5%BC%80%E6%BA%90%E5%8D%8F%E8%AE%AE-MIT-blue?style=flat-square" alt="License"></a>
   <a href="https://github.com/exaloop/codon"><img src="https://img.shields.io/badge/%E7%BC%96%E8%AF%91%E5%99%A8-Codon%20(LLVM)-blueviolet?style=flat-square" alt="Codon"></a>
-  <img src="https://img.shields.io/badge/%E5%90%9E%E5%90%90%E9%87%8F-425k%2B%20QPS-orange?style=flat-square" alt="Throughput">
+  <img src="https://img.shields.io/badge/throughput-455k%2B%20QPS-orange?style=flat-square" alt="Throughput">
   <img src="https://img.shields.io/badge/%E5%86%85%E5%AD%98%E5%B8%B8%E9%A9%BB-~18MB%20RSS-green?style=flat-square" alt="Memory">
   <a href="README.md"><img src="https://img.shields.io/badge/docs-English-blue?style=flat-square" alt="English Documentation"></a>
 </p>
@@ -40,7 +40,7 @@
                                              ▼
               ┌─────────────────────────────────────────────────────────────┐
               │                Rust / C++ 级极限执行性能                     │
-              │        (425,000+ QPS, 0.7ms 延迟, 仅 ~18MB 内存常驻)          │
+              │        (455,000+ QPS, 0.7ms 延迟, 仅 ~18MB 内存常驻)          │
               └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -48,7 +48,7 @@
 
 ## 🚀 核心亮点
 
-- 🏎️ **机器级原生吞吐**：在普通多核硬件下，吞吐量突破 **425,000+ QPS**，P50 延迟低于 **0.78 毫秒**。
+- 🏎️ **机器级原生吞吐**：在普通多核硬件下，吞吐量突破 **455,000+ QPS**，P50 延迟低于 **0.78 毫秒**。
 - 🧬 **Code-First AOT Schema 校验**：声明式 `BaseModel` 在构建期直接生成 SIMD 反序列化与边界校验机器码，彻底告别运行时反射性能惩罚。
 - ⚡ **SIMD FastJson (`yyjson`)**：直通 C-ABI，以 **2.4 ~ 3.1 GB/s** 的极速吞吐处理 JSON 序列化（比 Python `json` 快 12 倍，比 `orjson` 快 2 倍）。
 - 🗄️ **工业级 ORM 与 SQL 构造器**：支持 MySQL 与 PostgreSQL 双方言，具备 SQLAlchemy 风格流畅构造语法（`select().where().order_by()`）与异步非阻塞连接池。

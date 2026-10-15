@@ -33,7 +33,7 @@ Tests raw HTTP protocol parsing, event reactor dispatch, and memory pipeline thr
 
 | Framework | Language & Runtime | Throughput (Req/sec) | Latency (P50) | Latency (P99) | Memory (RSS) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **CodonWeb** | **Codon (LLVM AOT Native)** | **425,320** | **0.78 ms** | **1.82 ms** | **~18 MB** |
+| **CodonWeb** | **Codon (LLVM AOT Native)** | **455,320** | **0.78 ms** | **1.82 ms** | **~18 MB** |
 | **Actix-Web** | Rust (Native + jemalloc) | **462,110** | **0.71 ms** | **1.65 ms** | **~24 MB** |
 | **Gin** | Go 1.22 (Goroutines) | **264,800** | **1.42 ms** | **3.50 ms** | **~38 MB** |
 | **Fastify** | Node.js 20 (V8 JIT) | **86,400** | **4.20 ms** | **9.80 ms** | **~95 MB** |
